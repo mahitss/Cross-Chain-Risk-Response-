@@ -6,27 +6,33 @@ import {CrossGuardCallback} from "../../src/destination/CrossGuardCallback.sol";
 import {BorrowingController} from "../../src/destination/BorrowingController.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
+/// @title CrossGuardCallbackTest
+/// @notice Unit tests for destination callback adapter verifying Omni injected Reactive contract address semantics.
 contract CrossGuardCallbackTest is Test {
     CrossGuardCallback callbackReceiver;
     BorrowingController borrowingController;
 
     address owner = address(0xAA);
-    address callbackProxy = address(0xBB);
-    address authorizedRvm = address(0xCC);
+    address callbackProxy = address(0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4); // Unichain official proxy
+    address deployedReactiveContract = address(0x5318007001); // Simulated Lasna contract address
+    address forgedReactiveSender = address(0xDEADBEEF);
+    address legacyRvmId = address(uint160(uint256(keccak256("legacy-rvm-id"))));
     address stranger = address(0xDD);
     bytes32 positionId = keccak256("position-1");
 
     function setUp() public {
         vm.startPrank(owner);
         borrowingController = new BorrowingController(owner);
-        callbackReceiver = new CrossGuardCallback(owner, callbackProxy, address(borrowingController), authorizedRvm);
+        callbackReceiver =
+            new CrossGuardCallback(owner, callbackProxy, address(borrowingController), deployedReactiveContract);
         borrowingController.setCallbackAdapter(address(callbackReceiver));
         vm.stopPrank();
     }
 
-    function testHandleRiskBreachSuccess() public {
+    function testHandleRiskBreachSuccessWithOmniReactiveAddress() public {
+        // Omni relayer injects deployed Reactive contract address as reactiveSender
         vm.prank(callbackProxy);
-        callbackReceiver.handleRiskBreach(authorizedRvm, positionId, 1, 8500, block.timestamp);
+        callbackReceiver.handleRiskBreach(deployedReactiveContract, positionId, 1, 8500, block.timestamp);
 
         assertTrue(borrowingController.isBorrowingPaused(positionId));
         assertEq(borrowingController.lastProcessedNonce(positionId), 1);
@@ -36,16 +42,28 @@ contract CrossGuardCallbackTest is Test {
         address fakeProxy = address(0xEE);
         vm.prank(fakeProxy);
         vm.expectRevert("Authorized sender only");
-        callbackReceiver.handleRiskBreach(authorizedRvm, positionId, 1, 8500, block.timestamp);
+        callbackReceiver.handleRiskBreach(deployedReactiveContract, positionId, 1, 8500, block.timestamp);
     }
 
-    function testRevertWhenUnauthorizedRvmCalls() public {
-        address fakeRvm = address(0xEE);
+    function testRevertWhenForgedReactiveSenderCalls() public {
         vm.prank(callbackProxy);
         vm.expectRevert(
-            abi.encodeWithSelector(CrossGuardCallback.UnauthorizedRvmSender.selector, fakeRvm, authorizedRvm)
+            abi.encodeWithSelector(
+                CrossGuardCallback.UnauthorizedReactiveSender.selector, forgedReactiveSender, deployedReactiveContract
+            )
         );
-        callbackReceiver.handleRiskBreach(fakeRvm, positionId, 1, 8500, block.timestamp);
+        callbackReceiver.handleRiskBreach(forgedReactiveSender, positionId, 1, 8500, block.timestamp);
+    }
+
+    function testRevertWhenLegacyRvmIdUsedInsteadOfDeployedContractAddress() public {
+        // Verifies that assumptions based on legacy RVM IDs are rejected when configured for deployed contract address
+        vm.prank(callbackProxy);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CrossGuardCallback.UnauthorizedReactiveSender.selector, legacyRvmId, deployedReactiveContract
+            )
+        );
+        callbackReceiver.handleRiskBreach(legacyRvmId, positionId, 1, 8500, block.timestamp);
     }
 
     function testConstructorRejectsZeroAuthorizedReactiveSender() public {
@@ -60,15 +78,24 @@ contract CrossGuardCallbackTest is Test {
     }
 
     function testSetAuthorizedReactiveSenderSuccess() public {
-        address newRvm = address(0x999);
+        address newReactiveContract = address(0x5318007002);
         vm.prank(owner);
-        callbackReceiver.setAuthorizedReactiveSender(newRvm);
-        assertEq(callbackReceiver.authorizedReactiveSender(), newRvm);
+        callbackReceiver.setAuthorizedReactiveSender(newReactiveContract);
+        assertEq(callbackReceiver.authorizedReactiveSender(), newReactiveContract);
 
-        // Now newRvm succeeds and old fails
+        // New contract succeeds
         vm.prank(callbackProxy);
-        callbackReceiver.handleRiskBreach(newRvm, positionId, 1, 8500, block.timestamp);
+        callbackReceiver.handleRiskBreach(newReactiveContract, positionId, 1, 8500, block.timestamp);
         assertTrue(borrowingController.isBorrowingPaused(positionId));
+
+        // Old contract now reverts
+        vm.prank(callbackProxy);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CrossGuardCallback.UnauthorizedReactiveSender.selector, deployedReactiveContract, newReactiveContract
+            )
+        );
+        callbackReceiver.handleRiskBreach(deployedReactiveContract, positionId, 2, 8500, block.timestamp);
     }
 
     function testSetBorrowingController() public {
@@ -94,9 +121,9 @@ contract CrossGuardCallbackTest is Test {
 
     function testConstructorZeroAddressReverts() public {
         vm.expectRevert(CrossGuardCallback.ZeroAddress.selector);
-        new CrossGuardCallback(owner, address(0), address(borrowingController), authorizedRvm);
+        new CrossGuardCallback(owner, address(0), address(borrowingController), deployedReactiveContract);
 
         vm.expectRevert(CrossGuardCallback.ZeroAddress.selector);
-        new CrossGuardCallback(owner, callbackProxy, address(0), authorizedRvm);
+        new CrossGuardCallback(owner, callbackProxy, address(0), deployedReactiveContract);
     }
 }

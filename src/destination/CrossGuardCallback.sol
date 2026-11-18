@@ -11,9 +11,11 @@ import {ICrossGuardCallback} from "../interfaces/ICrossGuardCallback.sol";
 ///         Enforces dual-layer authentication: official Callback Proxy sender check and authenticated ReactVM ID check.
 contract CrossGuardCallback is ICrossGuardCallback, AbstractCallback, Ownable {
     error ZeroAddress();
+    error UnauthorizedReactiveSender(address receivedSender, address expectedSender);
     error UnauthorizedRvmSender(address receivedSender, address expectedSender);
     error UnconfiguredReactiveSender();
 
+    address public immutable callbackProxy;
     address public borrowingController;
     address public authorizedReactiveSender;
 
@@ -34,6 +36,7 @@ contract CrossGuardCallback is ICrossGuardCallback, AbstractCallback, Ownable {
         }
         borrowingController = _borrowingController;
         authorizedReactiveSender = _authorizedReactiveSender;
+        callbackProxy = _callbackProxy;
         emit AuthorizedReactiveSenderUpdated(address(0), _authorizedReactiveSender);
     }
 
@@ -55,9 +58,9 @@ contract CrossGuardCallback is ICrossGuardCallback, AbstractCallback, Ownable {
 
     /// @notice Receives verified cross-chain callback from the Reactive Network via Callback Proxy.
     /// @dev msg.sender is authenticated via `authorizedSenderOnly` to be the official Callback Proxy.
-    ///      rvmSender is injected into the first 160 bits by the Reactive Network relayer.
+    ///      reactiveSender is injected into the first 160 bits by the Reactive Network relayer (matching deployed Reactive contract address).
     function handleRiskBreach(
-        address rvmSender,
+        address reactiveSender,
         bytes32 positionId,
         uint256 nonce,
         uint256 riskLevel,
@@ -66,11 +69,11 @@ contract CrossGuardCallback is ICrossGuardCallback, AbstractCallback, Ownable {
         if (authorizedReactiveSender == address(0)) {
             revert UnconfiguredReactiveSender();
         }
-        if (rvmSender != authorizedReactiveSender) {
-            revert UnauthorizedRvmSender(rvmSender, authorizedReactiveSender);
+        if (reactiveSender != authorizedReactiveSender) {
+            revert UnauthorizedReactiveSender(reactiveSender, authorizedReactiveSender);
         }
 
-        emit RiskBreachHandled(positionId, rvmSender, nonce, riskLevel, timestamp);
+        emit RiskBreachHandled(positionId, reactiveSender, nonce, riskLevel, timestamp);
         IBorrowingController(borrowingController).pauseBorrowing(positionId, nonce, riskLevel, timestamp);
     }
 }

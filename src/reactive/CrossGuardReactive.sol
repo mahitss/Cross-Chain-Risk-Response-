@@ -57,10 +57,13 @@ contract CrossGuardReactive is IReactive, Ownable {
         uint64 _gasLimit,
         uint256 _minRiskThresholdBps
     ) Ownable(initialOwner) {
-        if (_originRiskController == address(0) || _destCallback == address(0)) {
+        if (_originRiskController == address(0)) {
             revert ZeroAddress();
         }
-        if (_originChainId == 0 || _destChainId == 0) {
+        if (_originChainId == 0) {
+            revert InvalidChainId(0);
+        }
+        if (_destCallback != address(0) && _destChainId == 0) {
             revert InvalidChainId(0);
         }
         if (_minRiskThresholdBps < MIN_VALID_THRESHOLD_BPS || _minRiskThresholdBps > MAX_VALID_THRESHOLD_BPS) {
@@ -135,8 +138,13 @@ contract CrossGuardReactive is IReactive, Ownable {
             return;
         }
 
-        // 5. Build destination callback payload
-        // The first argument address(0) is replaced by Reactive Network with the deployer RVM ID
+        // 5. Ensure destination callback is configured
+        if (destinationCallback == address(0) || destinationChainId == 0) {
+            return;
+        }
+
+        // 6. Build destination callback payload
+        // The first argument address(0) is replaced by the Reactive Network Omni proxy with this Reactive contract address
         bytes memory payload = abi.encodeWithSignature(
             "handleRiskBreach(address,bytes32,uint256,uint256,uint256)",
             address(0),
@@ -148,10 +156,7 @@ contract CrossGuardReactive is IReactive, Ownable {
 
         emit ReactiveBreachProcessed(positionId, nonce, currentLtvBps, timestamp);
 
-        // 6. Emit Callback event for legacy compatibility and simulation harnesses before external call
-        emit Callback(destinationChainId, destinationCallback, callbackGasLimit, payload);
-
-        // 7. Request callback via current Omni System Contract interface
+        // 7. Request callback via current Omni System Contract interface (sole dispatch mechanism)
         systemContract.requestCallbackV_1_0(
             ISystemContract.CallbackConfiguration_V_1_0({
                 chainId: destinationChainId,

@@ -5,8 +5,12 @@ import {Test} from "forge-std/Test.sol";
 import {CrossGuardReactive} from "../../src/reactive/CrossGuardReactive.sol";
 import {IReactive} from "reactive-lib/interfaces/IReactive.sol";
 import {ISystemContract} from "../../src/interfaces/ISystemContract.sol";
+import {ICrossGuardCallback} from "../../src/interfaces/ICrossGuardCallback.sol";
 import {MockOmniSystemContract} from "../mocks/MockOmniSystemContract.sol";
 
+/// @title CrossGuardReactiveTest
+/// @notice Unit tests for CrossGuardReactive verifying Omni system callback dispatch, payload verification,
+///         removal of legacy events, and deployment flexibility.
 contract CrossGuardReactiveTest is Test {
     CrossGuardReactive reactiveContract;
     MockOmniSystemContract mockSystem;
@@ -43,7 +47,6 @@ contract CrossGuardReactiveTest is Test {
     function testDefaultOmniSystemContractAddress() public {
         // When address(0) is passed as _systemContract, it defaults to 0x8888888888888888888888888888888888888888
         address omniSys = 0x8888888888888888888888888888888888888888;
-        // Mock bytecode at omniSys so constructor subscribe doesn't revert
         vm.etch(omniSys, address(mockSystem).code);
 
         CrossGuardReactive defaultContract = new CrossGuardReactive(
@@ -60,8 +63,11 @@ contract CrossGuardReactiveTest is Test {
         assertEq(address(defaultContract.systemContract()), omniSys);
     }
 
-    function testReactEmitsCallbackAndCallsSystemV1() public {
+    function testReactDispatchesOmniCallbackV1WithoutLegacyEvent() public {
         uint256 nonce = 42;
+        uint256 breachedLtv = 8500;
+        uint256 eventTimestamp = block.timestamp;
+
         IReactive.LogRecord memory log = IReactive.LogRecord({
             chain_id: ORIGIN_CHAIN_ID,
             _contract: originRiskController,
@@ -69,7 +75,7 @@ contract CrossGuardReactiveTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(user)),
             topic_3: nonce,
-            data: abi.encode(8500, 8000, block.timestamp),
+            data: abi.encode(breachedLtv, 8000, eventTimestamp),
             block_number: 100,
             op_code: 0,
             block_hash: 0,
@@ -82,12 +88,9 @@ contract CrossGuardReactiveTest is Test {
             address(0),
             positionId,
             nonce,
-            8500,
-            block.timestamp
+            breachedLtv,
+            eventTimestamp
         );
-
-        vm.expectEmit(true, true, true, true);
-        emit IReactive.Callback(DEST_CHAIN_ID, destCallback, GAS_LIMIT, expectedPayload);
 
         // Calling from authorized system contract succeeds
         vm.prank(address(mockSystem));
@@ -96,11 +99,65 @@ contract CrossGuardReactiveTest is Test {
         assertEq(reactiveContract.reactCount(), 1);
         assertEq(mockSystem.requestedCallbackCount(), 1);
 
+        // Verify complete callback request properties
         ISystemContract.CallbackConfiguration_V_1_0 memory recorded = mockSystem.getLastRequestedCallback();
-        assertEq(recorded.chainId, DEST_CHAIN_ID);
-        assertEq(recorded.recipient, destCallback);
-        assertEq(recorded.gasLimit, GAS_LIMIT);
-        assertEq(recorded.payload, expectedPayload);
+        assertEq(recorded.chainId, DEST_CHAIN_ID, "Destination chain mismatch");
+        assertEq(recorded.recipient, destCallback, "Recipient callback mismatch");
+        assertEq(recorded.gasLimit, GAS_LIMIT, "Gas limit mismatch");
+        assertEq(recorded.payload, expectedPayload, "Payload mismatch");
+
+        // Verify payload decoding
+        bytes4 selector;
+        bytes memory p = recorded.payload;
+        assembly {
+            selector := mload(add(p, 32))
+        }
+        assertEq(selector, ICrossGuardCallback.handleRiskBreach.selector, "Selector mismatch");
+    }
+
+    function testDeployWithUnsetDestinationCallbackAndConfigureLater() public {
+        // Allows deploying CrossGuardReactive on Lasna BEFORE destination is deployed on Unichain
+        CrossGuardReactive lazyReactive = new CrossGuardReactive(
+            owner,
+            address(mockSystem),
+            ORIGIN_CHAIN_ID,
+            originRiskController,
+            DEST_CHAIN_ID,
+            address(0), // Destination not yet deployed
+            GAS_LIMIT,
+            MIN_THRESHOLD_BPS
+        );
+
+        assertEq(lazyReactive.destinationCallback(), address(0));
+
+        // When log arrives before destination is set, react() returns early without dispatching
+        IReactive.LogRecord memory log = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(lazyReactive.RISK_BREACH_TOPIC_0()),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: 1,
+            data: abi.encode(8500, 8000, block.timestamp),
+            block_number: 100,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        vm.prank(address(mockSystem));
+        lazyReactive.react(log);
+        assertEq(mockSystem.requestedCallbackCount(), 0);
+
+        // Now link destination callback post-deployment
+        vm.prank(owner);
+        lazyReactive.setDestinationConfig(DEST_CHAIN_ID, destCallback, GAS_LIMIT);
+
+        // Next reactive trigger dispatches callback successfully
+        vm.prank(address(mockSystem));
+        lazyReactive.react(log);
+        assertEq(mockSystem.requestedCallbackCount(), 1);
     }
 
     function testRevertReactUnauthorizedCaller() public {
@@ -247,18 +304,6 @@ contract CrossGuardReactiveTest is Test {
             MIN_THRESHOLD_BPS
         );
 
-        vm.expectRevert(CrossGuardReactive.ZeroAddress.selector);
-        new CrossGuardReactive(
-            owner,
-            address(mockSystem),
-            ORIGIN_CHAIN_ID,
-            originRiskController,
-            DEST_CHAIN_ID,
-            address(0),
-            GAS_LIMIT,
-            MIN_THRESHOLD_BPS
-        );
-
         vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidChainId.selector, 0));
         new CrossGuardReactive(
             owner,
@@ -266,18 +311,6 @@ contract CrossGuardReactiveTest is Test {
             0,
             originRiskController,
             DEST_CHAIN_ID,
-            destCallback,
-            GAS_LIMIT,
-            MIN_THRESHOLD_BPS
-        );
-
-        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidChainId.selector, 0));
-        new CrossGuardReactive(
-            owner,
-            address(mockSystem),
-            ORIGIN_CHAIN_ID,
-            originRiskController,
-            0,
             destCallback,
             GAS_LIMIT,
             MIN_THRESHOLD_BPS
