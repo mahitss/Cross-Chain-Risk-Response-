@@ -18,7 +18,9 @@ contract CollateralVaultTest is Test {
     address stranger = address(0xDD);
 
     address mockWeth = address(0x1111);
+    address mockWbtc = address(0x3333);
     address mockUsdc = address(0x2222);
+    address mockDai = address(0x4444);
 
     bytes32 positionId = keccak256("alice-position");
 
@@ -30,9 +32,11 @@ contract CollateralVaultTest is Test {
         vault = new CollateralVault(owner, address(oracle), address(riskController));
         riskController.setAuthorizedVault(address(vault), true);
 
-        // Prices: WETH = $3,000, USDC = $1
+        // Prices: WETH = $3,000, USDC = $1, WBTC = $60,000, DAI = $1
         oracle.setAssetPrice(mockWeth, 3000e8);
         oracle.setAssetPrice(mockUsdc, 1e8);
+        oracle.setAssetPrice(mockWbtc, 60000e8);
+        oracle.setAssetPrice(mockDai, 1e8);
         vm.stopPrank();
     }
 
@@ -53,26 +57,52 @@ contract CollateralVaultTest is Test {
         assertEq(colAmount, 2e18);
         assertEq(debtAsset, mockUsdc);
         assertEq(debtAmount, 2000e18);
+        assertEq(vault.positionCollateralAsset(positionId), mockWeth);
+        assertEq(vault.positionDebtAsset(positionId), mockUsdc);
+    }
+
+    function testRevertWhenMixedCollateralAsset() public {
+        vm.startPrank(alice);
+        // Initial deposit in WETH
+        vault.depositCollateral(positionId, mockWeth, 2e18);
+
+        // Attempting to deposit WBTC into WETH position must revert
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.AssetMismatch.selector, mockWbtc, mockWeth));
+        vault.depositCollateral(positionId, mockWbtc, 1e18);
+        vm.stopPrank();
+    }
+
+    function testRevertWhenMixedDebtAsset() public {
+        vm.startPrank(alice);
+        vault.depositCollateral(positionId, mockWeth, 2e18);
+        // Initial borrow in USDC
+        vault.recordBorrow(positionId, mockUsdc, 1000e18);
+
+        // Attempting to record borrow in DAI against USDC position must revert
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.AssetMismatch.selector, mockDai, mockUsdc));
+        vault.recordBorrow(positionId, mockDai, 500e18);
+        vm.stopPrank();
     }
 
     function testEvaluatePositionHealthy() public {
         vm.startPrank(alice);
         vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000
-        vault.recordBorrow(positionId, mockUsdc, 2000e18);   // $2,000 -> LTV = 33.33% (3333 bps)
+        vault.recordBorrow(positionId, mockUsdc, 2000e18); // $2,000 -> LTV = 33.33% (3333 bps)
         vm.stopPrank();
 
-        (bool isBreached, uint256 ltvBps) = vault.evaluatePositionRisk(positionId);
+        (bool isBreached, uint256 ltvBps, uint256 nonce) = vault.evaluatePositionRisk(positionId);
         assertFalse(isBreached);
         assertEq(ltvBps, 3333);
+        assertEq(nonce, 0);
     }
 
     function testEvaluatePositionBreachedAfterPriceDrop() public {
         vm.startPrank(alice);
         vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000
-        vault.recordBorrow(positionId, mockUsdc, 4500e18);   // $4,500 -> LTV = 7500 bps (Healthy)
+        vault.recordBorrow(positionId, mockUsdc, 4500e18); // $4,500 -> LTV = 7500 bps (Healthy)
         vm.stopPrank();
 
-        (bool breachedBefore,) = vault.evaluatePositionRisk(positionId);
+        (bool breachedBefore,,) = vault.evaluatePositionRisk(positionId);
         assertFalse(breachedBefore);
 
         // Flash crash: WETH drops to $2,500
@@ -81,9 +111,10 @@ contract CollateralVaultTest is Test {
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 2500e8);
 
-        (bool isBreached, uint256 ltvBps) = vault.evaluatePositionRisk(positionId);
+        (bool isBreached, uint256 ltvBps, uint256 nonce) = vault.evaluatePositionRisk(positionId);
         assertTrue(isBreached);
         assertEq(ltvBps, 9000);
+        assertEq(nonce, 1);
     }
 
     function testRevertWhenUnauthorizedUserModifiesPosition() public {

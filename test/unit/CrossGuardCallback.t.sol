@@ -19,28 +19,24 @@ contract CrossGuardCallbackTest is Test {
     function setUp() public {
         vm.startPrank(owner);
         borrowingController = new BorrowingController(owner);
-        callbackReceiver = new CrossGuardCallback(
-            owner,
-            callbackProxy,
-            address(borrowingController),
-            authorizedRvm
-        );
+        callbackReceiver = new CrossGuardCallback(owner, callbackProxy, address(borrowingController), authorizedRvm);
         borrowingController.setCallbackAdapter(address(callbackReceiver));
         vm.stopPrank();
     }
 
     function testHandleRiskBreachSuccess() public {
         vm.prank(callbackProxy);
-        callbackReceiver.handleRiskBreach(authorizedRvm, positionId, 8500, block.timestamp);
+        callbackReceiver.handleRiskBreach(authorizedRvm, positionId, 1, 8500, block.timestamp);
 
         assertTrue(borrowingController.isBorrowingPaused(positionId));
+        assertEq(borrowingController.lastProcessedNonce(positionId), 1);
     }
 
     function testRevertWhenUnauthorizedProxyCalls() public {
         address fakeProxy = address(0xEE);
         vm.prank(fakeProxy);
         vm.expectRevert("Authorized sender only");
-        callbackReceiver.handleRiskBreach(authorizedRvm, positionId, 8500, block.timestamp);
+        callbackReceiver.handleRiskBreach(authorizedRvm, positionId, 1, 8500, block.timestamp);
     }
 
     function testRevertWhenUnauthorizedRvmCalls() public {
@@ -49,18 +45,30 @@ contract CrossGuardCallbackTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(CrossGuardCallback.UnauthorizedRvmSender.selector, fakeRvm, authorizedRvm)
         );
-        callbackReceiver.handleRiskBreach(fakeRvm, positionId, 8500, block.timestamp);
+        callbackReceiver.handleRiskBreach(fakeRvm, positionId, 1, 8500, block.timestamp);
     }
 
-    function testSetAuthorizedReactiveSender() public {
+    function testConstructorRejectsZeroAuthorizedReactiveSender() public {
+        vm.expectRevert(CrossGuardCallback.ZeroAddress.selector);
+        new CrossGuardCallback(owner, callbackProxy, address(borrowingController), address(0));
+    }
+
+    function testSetAuthorizedReactiveSenderRejectsZero() public {
+        vm.prank(owner);
+        vm.expectRevert(CrossGuardCallback.ZeroAddress.selector);
+        callbackReceiver.setAuthorizedReactiveSender(address(0));
+    }
+
+    function testSetAuthorizedReactiveSenderSuccess() public {
         address newRvm = address(0x999);
         vm.prank(owner);
         callbackReceiver.setAuthorizedReactiveSender(newRvm);
         assertEq(callbackReceiver.authorizedReactiveSender(), newRvm);
 
-        vm.prank(owner);
-        vm.expectRevert(CrossGuardCallback.ZeroAddress.selector);
-        callbackReceiver.setAuthorizedReactiveSender(address(0));
+        // Now newRvm succeeds and old fails
+        vm.prank(callbackProxy);
+        callbackReceiver.handleRiskBreach(newRvm, positionId, 1, 8500, block.timestamp);
+        assertTrue(borrowingController.isBorrowingPaused(positionId));
     }
 
     function testSetBorrowingController() public {

@@ -15,8 +15,12 @@ contract DeployDestination is Script {
         uint256 deployerPrivateKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
+        // Optional pre-configured reactive sender; defaults to deployer until updated
+        address authorizedReactiveSender = vm.envOr("REACTIVE_CROSSGUARD", deployer);
+
         console.log("=== Deploying Destination Contracts to Unichain Sepolia (1301) ===");
         console.log("Deployer Address:", deployer);
+        console.log("Initial Authorized Reactive Sender:", authorizedReactiveSender);
 
         vm.startBroadcast(deployerPrivateKey);
 
@@ -24,12 +28,9 @@ contract DeployDestination is Script {
         BorrowingController borrowingController = new BorrowingController(deployer);
         console.log("BorrowingController deployed at:", address(borrowingController));
 
-        // 2. Deploy CrossGuardCallback Receiver (authorizedReactiveSender will be configured after Reactive deployment)
+        // 2. Deploy CrossGuardCallback Receiver (rejects zero address)
         CrossGuardCallback callbackReceiver = new CrossGuardCallback(
-            deployer,
-            UNICHAIN_CALLBACK_PROXY,
-            address(borrowingController),
-            address(0) // Initially open or updated via setAuthorizedReactiveSender
+            deployer, UNICHAIN_CALLBACK_PROXY, address(borrowingController), authorizedReactiveSender
         );
         console.log("CrossGuardCallback deployed at:", address(callbackReceiver));
 

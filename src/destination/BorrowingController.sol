@@ -5,24 +5,29 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IBorrowingController} from "../interfaces/IBorrowingController.sol";
 
 /// @title BorrowingController
-/// @notice Destination lending controller on Unichain Sepolia enforcing position borrowing pauses.
+/// @notice Destination lending controller on Unichain Sepolia enforcing position borrowing pauses,
+///         trusted ownership mapping, replay protection via nonces, and separate emergency controls.
 contract BorrowingController is IBorrowingController, Ownable {
     error UnauthorizedCallback(address caller);
+    error UnauthorizedBorrower(address caller, address expectedOwner);
+    error UnregisteredPosition(bytes32 positionId);
+    error PositionAlreadyRegistered(bytes32 positionId);
     error BorrowingIsPaused(bytes32 positionId);
-    error StaleRiskBreach(uint256 incomingTimestamp, uint256 lastRecordedTimestamp);
+    error InvalidNonce(uint256 incomingNonce, uint256 lastProcessedNonce);
     error ZeroAmount();
     error ZeroAddress();
 
     event CallbackAdapterUpdated(address indexed oldAdapter, address indexed newAdapter);
 
     address public callbackAdapter;
+    mapping(bytes32 => address) public override positionOwners;
     mapping(bytes32 => bool) public override isBorrowingPaused;
+    mapping(bytes32 => uint256) public override lastProcessedNonce;
     mapping(bytes32 => uint256) public override lastRiskBreachTimestamp;
     mapping(bytes32 => uint256) public positionBorrowDebt;
-    mapping(bytes32 => address) public positionBorrowers;
 
     modifier onlyCallbackAdapter() {
-        if (msg.sender != callbackAdapter && msg.sender != owner()) {
+        if (msg.sender != callbackAdapter) {
             revert UnauthorizedCallback(msg.sender);
         }
         _;
@@ -30,7 +35,7 @@ contract BorrowingController is IBorrowingController, Ownable {
 
     constructor(address initialOwner) Ownable(initialOwner) {}
 
-    /// @notice Sets the authorized callback adapter.
+    /// @notice Sets the authorized cross-chain callback adapter.
     function setCallbackAdapter(address _callbackAdapter) external onlyOwner {
         if (_callbackAdapter == address(0)) revert ZeroAddress();
         address oldAdapter = callbackAdapter;
@@ -38,21 +43,48 @@ contract BorrowingController is IBorrowingController, Ownable {
         emit CallbackAdapterUpdated(oldAdapter, _callbackAdapter);
     }
 
-    /// @notice Pauses additional borrowing for a position upon cross-chain risk condition confirmation.
-    /// @dev Idempotent: repeated calls update the timestamp without reverting if position is already paused.
-    function pauseBorrowing(
-        bytes32 positionId,
-        uint256 riskLevel,
-        uint256 timestamp
-    ) external override onlyCallbackAdapter {
-        if (timestamp < lastRiskBreachTimestamp[positionId]) {
-            revert StaleRiskBreach(timestamp, lastRiskBreachTimestamp[positionId]);
+    /// @notice Registers a position to msg.sender as the trusted position owner.
+    function registerPosition(bytes32 positionId) external override {
+        if (positionOwners[positionId] != address(0)) {
+            revert PositionAlreadyRegistered(positionId);
+        }
+        positionOwners[positionId] = msg.sender;
+        emit PositionRegistered(positionId, msg.sender);
+    }
+
+    /// @notice Administratively registers a position to a specified owner.
+    function registerPositionFor(bytes32 positionId, address positionOwner) external override onlyOwner {
+        if (positionOwner == address(0)) revert ZeroAddress();
+        if (positionOwners[positionId] != address(0)) {
+            revert PositionAlreadyRegistered(positionId);
+        }
+        positionOwners[positionId] = positionOwner;
+        emit PositionRegistered(positionId, positionOwner);
+    }
+
+    /// @notice Pauses borrowing for a position upon receiving an authenticated cross-chain risk callback.
+    /// @dev Strictly callable by the callback adapter only. Rejects duplicate and out-of-order nonces.
+    function pauseBorrowing(bytes32 positionId, uint256 nonce, uint256 riskLevel, uint256 timestamp)
+        external
+        override
+        onlyCallbackAdapter
+    {
+        uint256 lastNonce = lastProcessedNonce[positionId];
+        if (nonce <= lastNonce) {
+            revert InvalidNonce(nonce, lastNonce);
         }
 
-        isBorrowingPaused[positionId] = true;
+        lastProcessedNonce[positionId] = nonce;
         lastRiskBreachTimestamp[positionId] = timestamp;
+        isBorrowingPaused[positionId] = true;
 
-        emit BorrowingPaused(positionId, riskLevel, timestamp);
+        emit BorrowingPaused(positionId, nonce, riskLevel, timestamp);
+    }
+
+    /// @notice Separate administrative emergency circuit breaker to pause borrowing.
+    function emergencyPauseBorrowing(bytes32 positionId) external override onlyOwner {
+        isBorrowingPaused[positionId] = true;
+        emit EmergencyBorrowingPaused(positionId);
     }
 
     /// @notice Unpauses borrowing for a position (administrative or collateral remediation recovery).
@@ -61,17 +93,21 @@ contract BorrowingController is IBorrowingController, Ownable {
         emit BorrowingResumed(positionId);
     }
 
-    /// @notice Simulates borrowing action on Unichain Sepolia.
+    /// @notice Executes borrowing for a position.
+    /// @dev Enforces position registration, position owner authorization, and pause state.
     function borrow(bytes32 positionId, uint256 amount) external override {
+        address posOwner = positionOwners[positionId];
+        if (posOwner == address(0)) {
+            revert UnregisteredPosition(positionId);
+        }
+        if (msg.sender != posOwner) {
+            revert UnauthorizedBorrower(msg.sender, posOwner);
+        }
         if (isBorrowingPaused[positionId]) {
             revert BorrowingIsPaused(positionId);
         }
         if (amount == 0) {
             revert ZeroAmount();
-        }
-
-        if (positionBorrowers[positionId] == address(0)) {
-            positionBorrowers[positionId] = msg.sender;
         }
 
         positionBorrowDebt[positionId] += amount;

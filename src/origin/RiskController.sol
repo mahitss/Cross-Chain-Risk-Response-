@@ -10,10 +10,12 @@ contract RiskController is IRiskController, Ownable {
     error UnauthorizedVault(address caller);
     error InvalidThreshold(uint256 thresholdBps);
 
-    event AuthorizedVaultUpdated(address indexed vault, bool authorized);
     uint256 public constant BPS_SCALE = 10_000;
-    uint256 public override riskThresholdBps;
+    uint256 public constant MIN_VALID_THRESHOLD_BPS = 1;
+    uint256 public constant MAX_VALID_THRESHOLD_BPS = 10_000;
 
+    uint256 public override riskThresholdBps;
+    mapping(bytes32 => uint256) public override positionNonce;
     mapping(address => bool) public authorizedVaults;
 
     modifier onlyAuthorizedVault() {
@@ -24,7 +26,7 @@ contract RiskController is IRiskController, Ownable {
     }
 
     constructor(address initialOwner, uint256 initialThresholdBps) Ownable(initialOwner) {
-        if (initialThresholdBps == 0 || initialThresholdBps > BPS_SCALE) {
+        if (initialThresholdBps < MIN_VALID_THRESHOLD_BPS || initialThresholdBps > MAX_VALID_THRESHOLD_BPS) {
             revert InvalidThreshold(initialThresholdBps);
         }
         riskThresholdBps = initialThresholdBps;
@@ -37,9 +39,9 @@ contract RiskController is IRiskController, Ownable {
     }
 
     /// @notice Updates the maximum safe risk threshold.
-    /// @param newThresholdBps New threshold in basis points (e.g. 8000 = 80%).
+    /// @param newThresholdBps New threshold in basis points (1 - 10,000).
     function setRiskThreshold(uint256 newThresholdBps) external override onlyOwner {
-        if (newThresholdBps == 0 || newThresholdBps > BPS_SCALE) {
+        if (newThresholdBps < MIN_VALID_THRESHOLD_BPS || newThresholdBps > MAX_VALID_THRESHOLD_BPS) {
             revert InvalidThreshold(newThresholdBps);
         }
         uint256 oldThreshold = riskThresholdBps;
@@ -47,13 +49,13 @@ contract RiskController is IRiskController, Ownable {
         emit RiskThresholdUpdated(oldThreshold, newThresholdBps);
     }
 
-    /// @notice Evaluates position risk and emits RiskBreach if LTV exceeds policy threshold.
-    function assessRisk(
-        bytes32 positionId,
-        address user,
-        uint256 collateralValueUsd,
-        uint256 debtValueUsd
-    ) external override onlyAuthorizedVault returns (bool isBreached, uint256 currentLtvBps) {
+    /// @notice Evaluates position risk and emits RiskBreach with monotonic nonce if LTV exceeds policy threshold.
+    function assessRisk(bytes32 positionId, address user, uint256 collateralValueUsd, uint256 debtValueUsd)
+        external
+        override
+        onlyAuthorizedVault
+        returns (bool isBreached, uint256 currentLtvBps, uint256 nonce)
+    {
         if (collateralValueUsd == 0) {
             currentLtvBps = debtValueUsd > 0 ? BPS_SCALE : 0;
         } else {
@@ -62,9 +64,11 @@ contract RiskController is IRiskController, Ownable {
 
         if (currentLtvBps >= riskThresholdBps) {
             isBreached = true;
-            emit RiskBreach(positionId, user, currentLtvBps, riskThresholdBps, block.timestamp);
+            nonce = ++positionNonce[positionId];
+            emit RiskBreach(positionId, user, nonce, currentLtvBps, riskThresholdBps, block.timestamp);
         } else {
             isBreached = false;
+            nonce = positionNonce[positionId];
         }
     }
 }
