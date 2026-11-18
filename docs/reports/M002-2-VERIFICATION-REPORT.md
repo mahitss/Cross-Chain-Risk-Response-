@@ -1,45 +1,55 @@
-# M002.2 / M002.3 / M002.4 — CrossGuard Release Readiness & Verification Report
+# M002 Release Evidence & Lineage Verification Report
 
-**Repository:** `https://github.com/mahitss/Cross-Chain-Risk-Response-`  
-**Active Branch:** `fix/m002-2-omni-callback-correctness`  
-**Base Commit (M002.1 Security Remediation):** `502aa7724813345c369f5d195c188f69240a8314`  
-**Implementation Commit (M002.2 Omni Correctness):** `5f17c9e9d63a25129faf17d0c872af344f62402b`  
-**Initial Verification Commit (M002.3 Report):** `5234357ef2578bfec4b74fba654de2af8bc052f5`  
-**Current Evidence Correction Commit (M002.4):** To be finalized on commit  
-**Author / Implementation Engineer:** Antigravity  
-**Independent Architect / Reviewer:** ChatGPT (External Independent Reviewer — Review Pending)  
-**Product Owner:** Mahit  
-**Implementation Status:** **PASS (SUBMITTED FOR INDEPENDENT ARCHITECT REVIEW)**
+**Repository:** `mahitss/Cross-Chain-Risk-Response-`
+**Active Branch:** `fix/m002-2-omni-callback-correctness`
+**Remote Branch:** `origin/fix/m002-2-omni-callback-correctness`
 
 ---
 
-## 1. Operational Scope & Non-Negotiable Boundaries
+## 1. Commit Lineage & Categorization
 
-* **No Contract Deployment:** No smart contracts were deployed to live testnets (Base Sepolia, Reactive Lasna, Unichain Sepolia) or mainnets.
-* **No Transactions Broadcast:** No transactions were broadcast to any live blockchain network.
-* **No Funds Expended:** No testnet or mainnet funds (ETH, RNK) were spent, transferred, or requested.
-* **No Branch Merging:** The `main` branch remains untouched. Work remains isolated on branch `fix/m002-2-omni-callback-correctness`.
-* **No Live-Network Claims:** All testing and verification was conducted deterministically in local Foundry test environments with mock system and proxy contracts. No live-network finality or relayer confirmation is claimed.
-* **Review Status Clarification:** This report reflects the verified outputs of the implementation engineer and is submitted to ChatGPT (Independent Architect) and Mahit (Product Owner) for external independent review.
+| Milestone | Commit SHA | Category | Description |
+| :--- | :--- | :--- | :--- |
+| **M002.1** | `502aa7724813345c369f5d195c188f69240a8314` | **Implementation** | Base security remediation: Omni system contract integration, replay protection nonces, position ownership access controls. |
+| **M002.2** | `5f17c9e9d63a25129faf17d0c872af344f62402b` | **Implementation** | Omni correctness fix: removed legacy `emit Callback(...)`, enforced `requestCallbackV_1_0`, deployment script validations, configuration consistency test suite. |
+| **M002.3** | `5234357ef2578bfec4b74fba654de2af8bc052f5` | **Documentation** | Initial release readiness verification report generation. |
+| **M002.4** | `f95895e2c5b31f8875b3673192596e7d462fe469` | **Documentation** | Evidence correction: distinguished implementation vs documentation commits, updated actual test outputs. |
+| **M002.5** | *Pending commit* | **Documentation** | Final evidence lineage correction and verification integrity update. |
 
 ---
 
-## 2. Commit Lineage & Branch Comparison
+## 2. Review Roles & Operational Disclaimers
 
-### 2.1. Commit History
+* **Implementation Engineer (Antigravity):** Author of the protocol code, unit & integration test suites, and simulation evidence.
+* **Independent Principal Architect / Reviewer (ChatGPT):** Performing external independent review on GitHub. **Independent review is currently pending; no independent sign-off is claimed by this report.**
+* **Product Owner (Mahit):** Final decision authority on product scope and deployment authorization.
+* **No Deployment Readiness Claim:** This report represents implementation-level local verification evidence. No claim of production or deployment readiness is made.
+* **No Live-Chain Verification Claim:** All results were derived from local Forge execution using mock system contracts (`MockOmniSystemContract`) and mock proxies (`MockCallbackProxy`). No live testnet or mainnet transactions were executed.
+* **Strict Safety Boundaries Maintained:**
+  - Zero contracts deployed to live networks.
+  - Zero transactions broadcast.
+  - Zero funds (ETH, RNK) spent or requested.
+  - No merge to `main` branch.
+
+---
+
+## 3. Verified Commit History & Branch Comparison
+
+### 3.1. Verified Git History (Prior to M002.5 Commit)
 ```
-5234357 (HEAD -> fix/m002-2-omni-callback-correctness, origin/fix/m002-2-omni-callback-correctness) docs(reports): add M002-2-VERIFICATION-REPORT.md detailing reproducible verification and release readiness
+f95895e (HEAD -> fix/m002-2-omni-callback-correctness, origin/fix/m002-2-omni-callback-correctness) docs(reports): correct release evidence and distinguish M002.2 implementation from M002.3 and M002.4 verification records
+5234357 docs(reports): add M002-2-VERIFICATION-REPORT.md detailing reproducible verification and release readiness
 5f17c9e fix(omni): remove legacy callback event, enforce omni requestCallbackV_1_0, fix deployment sequencing, and add configuration consistency tests
 502aa77 fix(security): resolve M002 code review findings with Omni v1 migration, replay protection, and position access control
 c764591 feat(crossguard): implement complete cross-chain risk-response protocol with multi-chain simulation suite
 ```
 
-### 2.2. Changed Files Summary (`git diff --stat 502aa77..HEAD`)
+### 3.2. Changed Files Summary (`git diff --stat 502aa77..HEAD`)
 ```
  .env.example                                       |  17 +-
  .gitignore                                         |   6 +-
  docs/reports/M002-1-SECURITY-REMEDIATION-REPORT.md | 321 +++++++++++++++++++++
- docs/reports/M002-2-VERIFICATION-REPORT.md         | 281 ++++++++++++++++++
+ docs/reports/M002-2-VERIFICATION-REPORT.md         | 267 +++++++++++++++++
  script/ConfigureReactive.s.sol                     |  42 +++
  script/DeployDestination.s.sol                     |  27 +-
  script/DeployReactive.s.sol                        |  30 +-
@@ -49,14 +59,14 @@ c764591 feat(crossguard): implement complete cross-chain risk-response protocol 
  test/unit/ConfigurationConsistency.t.sol           | 152 ++++++++++
  test/unit/CrossGuardCallback.t.sol                 |  61 ++--
  test/unit/CrossGuardReactive.t.sol                 | 105 ++++---
- 13 files changed, 1146 insertions(+), 154 deletions(-)
+ 13 files changed, 1132 insertions(+), 154 deletions(-)
 ```
 
 ---
 
-## 3. Actual Command Executions & Outputs
+## 4. Actual Command Outputs (Implementation-Engineer Evidence)
 
-### 3.1. Repository Status (`git status`)
+### 4.1. `git status`
 ```
 On branch fix/m002-2-omni-callback-correctness
 Your branch is up to date with 'origin/fix/m002-2-omni-callback-correctness'.
@@ -64,20 +74,20 @@ Your branch is up to date with 'origin/fix/m002-2-omni-callback-correctness'.
 nothing to commit, working tree clean
 ```
 
-### 3.2. Recent Commit Log (`git log -3 --oneline`)
+### 4.2. `git log -3 --oneline`
 ```
+f95895e docs(reports): correct release evidence and distinguish M002.2 implementation from M002.3 and M002.4 verification records
 5234357 docs(reports): add M002-2-VERIFICATION-REPORT.md detailing reproducible verification and release readiness
 5f17c9e fix(omni): remove legacy callback event, enforce omni requestCallbackV_1_0, fix deployment sequencing, and add configuration consistency tests
-502aa77 fix(security): resolve M002 code review findings with Omni v1 migration, replay protection, and position access control
 ```
 
-### 3.3. Code Formatting Check (`forge fmt --check`)
+### 4.3. Code Formatting Check (`forge fmt --check`)
 ```
 Exit code: 0
 Output: (all files conform 100% to Foundry formatting standards)
 ```
 
-### 3.4. Contract Runtime Bytecode Sizes (`forge build --sizes`)
+### 4.4. Contract Runtime Bytecode Sizes (`forge build --sizes`)
 ```
 ╭------------------------+------------------+-------------------+--------------------+---------------------╮
 | Contract               | Runtime Size (B) | Initcode Size (B) | Runtime Margin (B) | Initcode Margin (B) |
@@ -93,7 +103,7 @@ Output: (all files conform 100% to Foundry formatting standards)
 ╰------------------------+------------------+-------------------+--------------------+---------------------╯
 ```
 
-### 3.5. Complete Test Suite Execution (`forge test -vvv`)
+### 4.5. Complete Test Suite Execution (`forge test -vvv`)
 ```
 Ran 4 tests for test/unit/TestValuationSource.t.sol:TestValuationSourceTest
 [PASS] testRevertWhenNonOwnerSetsPrice() (gas: 37258)
@@ -186,7 +196,7 @@ Suite result: ok. 2 passed; 0 failed; 0 skipped; finished in 6.41ms (2.98ms CPU 
 Ran 8 test suites in 18.23ms (47.25ms CPU time): 64 tests passed, 0 failed, 0 skipped (64 total tests)
 ```
 
-### 3.6. Code Coverage Output (`forge coverage --ir-minimum`)
+### 4.6. Code Coverage Output (`forge coverage --ir-minimum`)
 ```
 ╭-----------------------------------------+------------------+------------------+----------------+----------------╮
 | File                                    | % Lines          | % Statements     | % Branches     | % Funcs        |
@@ -219,9 +229,9 @@ Ran 8 test suites in 18.23ms (47.25ms CPU time): 64 tests passed, 0 failed, 0 sk
 
 ---
 
-## 4. Verification Checklists & Security Analysis
+## 5. Verification Checklists & Security Analysis
 
-### 4.1. Reactive Integration Invariants
+### 5.1. Reactive Integration Invariants
 * **Event Signature & Topics:** `RiskBreach(bytes32,address,uint256,uint256,uint256,uint256)` indexed layout matches origin emission and reactive decoder.
 * **Origin Filtering:** Origin chain `84532` (Base Sepolia) and emitter contract verified; wrong emitter or chain logs are ignored.
 * **Omni System Contract:** Official address `0x8888888888888888888888888888888888888888` confirmed.
@@ -230,7 +240,7 @@ Ran 8 test suites in 18.23ms (47.25ms CPU time): 64 tests passed, 0 failed, 0 sk
 * **Sender Injection Slot:** `address(0)` in byte offset 4 of payload; replaced by callback proxy with deployed contract address.
 * **Unset Callback Defense:** When destination callback is `address(0)`, `react()` returns early without dispatching.
 
-### 4.2. Callback Security & Replay Defense
+### 5.2. Callback Security & Replay Defense
 * **Proxy Authentication:** Restricted to official Unichain proxy `0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4`. Non-proxy callers revert with `"Authorized sender only"`.
 * **Injected Sender Authentication:** Validates injected sender equals `authorizedReactiveSender`. Forged senders revert with `UnauthorizedReactiveSender`.
 * **Legacy RVM ID Rejection:** Legacy RVM ID assumption reverts with `UnauthorizedReactiveSender`.
@@ -238,7 +248,7 @@ Ran 8 test suites in 18.23ms (47.25ms CPU time): 64 tests passed, 0 failed, 0 sk
 * **Borrowing Lock:** Position borrowing state transitions to paused upon risk callback. Subsequent borrow calls revert with `BorrowingIsPaused`.
 * **Adapter Access Control:** `pauseBorrowing` strictly restricted to `callbackAdapter`. Direct or administrative calls revert with `UnauthorizedCallback`.
 
-### 4.3. Deployment Sequence
+### 5.3. Deployment Sequence
 1. Deploy Origin contracts on Base Sepolia (`script/DeployOrigin.s.sol`).
 2. Deploy Reactive contract on Reactive Lasna (`script/DeployReactive.s.sol`).
 3. Deploy Destination contracts on Unichain Sepolia (`script/DeployDestination.s.sol`) with Lasna address.
@@ -246,22 +256,21 @@ Ran 8 test suites in 18.23ms (47.25ms CPU time): 64 tests passed, 0 failed, 0 sk
 
 ---
 
-## 5. Remaining Risks & Open Items (Pre-Testnet Review)
+## 6. Pre-Testnet Operational Requirements
 
-1. **Medium (Operational): Native Testnet Gas Funding**  
+1. **Native Testnet Gas Funding:**
    Deployer address must be funded with native faucet tokens prior to live execution:
    - Base Sepolia: Sepolia ETH
    - Reactive Lasna: RNK
    - Unichain Sepolia: Unichain Sepolia ETH
-2. **Medium (Network Invariant): Cross-Chain Dispatch Latency**  
-   Time between Base Sepolia breach and Unichain borrowing pause depends on Lasna validator consensus and Unichain Sepolia relayer dispatch queues. Empirical latency will be measured during live testnet evaluation.
-3. **Low (Scope): Valuation Source**  
+2. **Cross-Chain Dispatch Latency Evaluation:**
+   Time between Base Sepolia breach and Unichain borrowing pause depends on Lasna validator consensus and Unichain Sepolia relayer dispatch queues. Empirical latency must be measured during live testnet evaluation.
+3. **Valuation Source Upgrade Plan:**
    `TestValuationSource` is a controlled test harness oracle. In production, a decentralized Chainlink data feed with heartbeat and staleness checks will be integrated.
 
 ---
 
-## 6. Submission Verdict
+## 7. Submission Verdict
 
-* **Implementation Engineer Verdict:** **PASS**
-* **External Review Status:** Submitted to ChatGPT (Independent Architect) and Mahit (Product Owner) for independent verification.
-* **Next Gate:** Await independent architect sign-off before testnet deployment planning.
+* **Implementation Engineer Verdict:** **PASS (LOCAL SIMULATION VERIFIED)**
+* **External Review Status:** Submitted for independent verification by ChatGPT (Principal Architect) and Mahit (Product Owner).
