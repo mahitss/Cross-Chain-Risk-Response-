@@ -114,13 +114,21 @@ contract CrossGuardE2ETest is Test {
         vm.expectRevert(abi.encodeWithSelector(BorrowingController.UnauthorizedBorrower.selector, bob, alice));
         borrowingController.borrow(positionId, 100e18);
 
-        // Step 3: Collateral value drops on Base Sepolia ($3,000 -> $2,300)
-        // Alice borrows another $2,000 USDC on Base -> Collateral: $4,600, Debt: $4,000 -> LTV: 86.95% (breach)
+        // Step 3: Alice borrows safely while collateral is healthy ($4,000 debt on $6,000 collateral -> 66.66% LTV)
+        vm.prank(alice);
+        vault.recordBorrow(positionId, mockUsdc, 2000e18);
+
+        // Market shock: Collateral value drops on Base Sepolia ($3,000 -> $2,300)
+        // Collateral: $4,600, Debt: $4,000 -> LTV: 86.95% (exceeds 80.00% threshold)
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 2300e8);
 
+        // Origin safety policy test: Alice cannot borrow any more debt once position is underwater
         vm.prank(alice);
-        vault.recordBorrow(positionId, mockUsdc, 2000e18);
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 8913, 8000)
+        );
+        vault.recordBorrow(positionId, mockUsdc, 100e18);
 
         // Step 4: Evaluate position risk on Base Sepolia and capture RiskBreach log
         vm.recordLogs();
@@ -215,9 +223,14 @@ contract CrossGuardE2ETest is Test {
             callbackProxy.executeCallback(cbReq.recipient, cbReq.payload, cbReq.gasLimit, legacyRvmId);
         assertFalse(legacySuccess, "Legacy RVM ID assumption must fail when expecting deployed contract address");
 
-        // Step 14: Emergency recovery by authorized owner
+        // Step 14: Ordinary owner resume cannot bypass active risk breach
         vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(BorrowingController.CannotBypassActiveRiskBreach.selector, positionId));
         borrowingController.resumeBorrowing(positionId);
+
+        // Emergency recovery by authorized owner with explicit audit reason
+        vm.prank(owner);
+        borrowingController.emergencyResumeBorrowing(positionId, "Admin emergency override after off-chain remediation");
         assertFalse(borrowingController.isBorrowingPaused(positionId), "Borrowing should be resumed");
 
         // Alice can borrow again

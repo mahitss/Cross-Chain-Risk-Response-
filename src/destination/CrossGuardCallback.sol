@@ -76,4 +76,23 @@ contract CrossGuardCallback is ICrossGuardCallback, AbstractCallback, Ownable {
         emit RiskBreachHandled(positionId, reactiveSender, nonce, riskLevel, timestamp);
         IBorrowingController(borrowingController).pauseBorrowing(positionId, nonce, riskLevel, timestamp);
     }
+
+    /// @notice Receives verified cross-chain recovery callback from the Reactive Network via Callback Proxy.
+    function handleRiskResolved(
+        address reactiveSender,
+        bytes32 positionId,
+        uint256 nonce,
+        uint256 riskLevel,
+        uint256 timestamp
+    ) external override authorizedSenderOnly {
+        if (authorizedReactiveSender == address(0)) {
+            revert UnconfiguredReactiveSender();
+        }
+        if (reactiveSender != authorizedReactiveSender) {
+            revert UnauthorizedReactiveSender(reactiveSender, authorizedReactiveSender);
+        }
+
+        emit RiskResolvedHandled(positionId, reactiveSender, nonce, riskLevel, timestamp);
+        IBorrowingController(borrowingController).resolveBorrowing(positionId, nonce, riskLevel, timestamp);
+    }
 }

@@ -190,4 +190,102 @@ contract CollateralVaultTest is Test {
         vm.expectRevert(CollateralVault.ZeroAddress.selector);
         new CollateralVault(owner, address(oracle), address(0));
     }
+
+    /* -------------------------------------------------------------------------- */
+    /*               M003.1 ORIGIN BORROWING SAFETY & RECOVERY TESTS             */
+    /* -------------------------------------------------------------------------- */
+
+    function testRevertBorrowWhenZeroCollateral() public {
+        vm.prank(alice);
+        vault.depositCollateral(positionId, mockWeth, 1e18);
+
+        // Zero out collateralAmount in storage (mapping at slot 3 + offset 2)
+        bytes32 colAmountSlot = bytes32(uint256(keccak256(abi.encode(positionId, uint256(3)))) + 2);
+        vm.store(address(vault), colAmountSlot, bytes32(0));
+
+        (,, uint256 colAmount,,) = vault.getPosition(positionId);
+        assertEq(colAmount, 0);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionUncollateralized.selector, positionId));
+        vault.recordBorrow(positionId, mockUsdc, 100e18);
+    }
+
+    function testRevertBorrowWhenExceedingRiskThreshold() public {
+        vm.startPrank(alice);
+        // Deposit 2 WETH ($6,000)
+        vault.depositCollateral(positionId, mockWeth, 2e18);
+
+        // At 80% threshold, max safe borrow is strictly < $4,800
+        // Attempting to borrow $4,800 USDC (80.00% LTV) must revert with PositionUnsafeOrBreached
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 8000, 8000)
+        );
+        vault.recordBorrow(positionId, mockUsdc, 4800e18);
+
+        // Attempting to borrow $5,000 USDC (83.33% LTV) must revert
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 8333, 8000)
+        );
+        vault.recordBorrow(positionId, mockUsdc, 5000e18);
+
+        // Safe borrow of $4,000 USDC (66.66% LTV) succeeds
+        vault.recordBorrow(positionId, mockUsdc, 4000e18);
+        vm.stopPrank();
+
+        (,,,, uint256 debt) = vault.getPosition(positionId);
+        assertEq(debt, 4000e18);
+    }
+
+    function testRevertBorrowWhenPositionAlreadyBreached() public {
+        vm.startPrank(alice);
+        // Deposit 2 WETH ($6,000) and borrow $4,500 USDC (75% LTV, healthy)
+        vault.depositCollateral(positionId, mockWeth, 2e18);
+        vault.recordBorrow(positionId, mockUsdc, 4500e18);
+        vm.stopPrank();
+
+        // Collateral crashes to $2,000/WETH -> Collateral: $4,000, Debt: $4,500 -> LTV: 112.5% (Breached!)
+        vm.prank(owner);
+        oracle.setAssetPrice(mockWeth, 2000e8);
+
+        // Any attempt to borrow more debt must revert
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 11500, 8000)
+        );
+        vault.recordBorrow(positionId, mockUsdc, 100e18);
+    }
+
+    function testRecoveryLifecycleOnOrigin() public {
+        vm.startPrank(alice);
+        vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000
+        vault.recordBorrow(positionId, mockUsdc, 4500e18); // $4,500 (LTV = 75%)
+        vm.stopPrank();
+
+        // Step 1: Market shock -> WETH drops to $2,500 ($5,000 col, $4,500 debt -> 90% LTV)
+        vm.prank(owner);
+        oracle.setAssetPrice(mockWeth, 2500e8);
+
+        (bool isBreached, uint256 ltv, uint256 nonce) = vault.evaluatePositionRisk(positionId);
+        assertTrue(isBreached);
+        assertEq(ltv, 9000);
+        assertEq(nonce, 1);
+
+        // Step 2: Alice remedies position by depositing 2 more WETH ($5,000 more collateral)
+        // Total collateral = 4 WETH @ $2,500 = $10,000. Debt = $4,500.
+        // New LTV = 4,500 / 10,000 = 45% (4500 bps) < 80% (Healthy!)
+        vm.prank(alice);
+        vault.depositCollateral(positionId, mockWeth, 2e18);
+
+        (bool recovered, uint256 recLtv, uint256 recNonce) = vault.evaluatePositionRisk(positionId);
+        assertFalse(recovered, "Position must now be recovered");
+        assertEq(recLtv, 4500);
+        assertEq(recNonce, 2, "Recovery must increment monotonic nonce");
+
+        // Step 3: Now Alice can safely borrow again
+        vm.prank(alice);
+        vault.recordBorrow(positionId, mockUsdc, 1000e18); // total debt $5,500 -> 55% LTV
+        (,,,, uint256 newDebt) = vault.getPosition(positionId);
+        assertEq(newDebt, 5500e18);
+    }
 }
