@@ -161,14 +161,30 @@ contract RiskControllerTest is Test {
     }
 
     function testArithmeticOverflowBoundaryHandling() public view {
-        // Massive debt that would cause debtValueUsd * 10,000 to overflow uint256
+        // Full precision: When debt * 10,000 exceeds 256 bits, but quotient fits in uint256:
+        // debtValueUsd = type(uint256).max / 100
+        // Expected quotient = (overflowDebt * 10_000) / 10_000e8 = overflowDebt / 1e8
         uint256 overflowDebt = type(uint256).max / 100;
         uint256 ltvMassive = controller.calculateLtvBps(10_000e8, overflowDebt);
-        assertEq(ltvMassive, type(uint256).max, "Massive debt must return max uint256 without reverting");
+        assertEq(ltvMassive, overflowDebt / 1e8, "Massive debt with representable quotient must be exact");
 
+        // Proportional large values:
+        // Debt = 2 * (type(uint256).max / 10_000), Collateral = 4 * (type(uint256).max / 10_000)
+        // Mathematically: LTV = 50% = 5,000 bps
+        uint256 largeDebt = (type(uint256).max / 10_000) * 2;
+        uint256 largeCol = (type(uint256).max / 10_000) * 4;
+        uint256 ltvProportional = controller.calculateLtvBps(largeCol, largeDebt);
+        assertEq(ltvProportional, 5000, "Proportional large values must compute exact 50% (5000 bps) without overflow");
+
+        // Unrepresentable quotient: debt = type(uint256).max, collateral = 100
+        // (type(uint256).max * 10,000) / 100 > type(uint256).max -> unrepresentable
         uint256 maxDebt = type(uint256).max;
-        uint256 ltvMax = controller.calculateLtvBps(10_000e8, maxDebt);
-        assertEq(ltvMax, type(uint256).max, "Max debt must return max uint256 without reverting");
+        uint256 ltvUnrepresentable = controller.calculateLtvBps(100, maxDebt);
+        assertEq(
+            ltvUnrepresentable,
+            type(uint256).max,
+            "Unrepresentable quotient must deterministically cap at type(uint256).max"
+        );
     }
 
     function testRepeatedHealthyAssessmentsDoNotIncrementNonce() public {

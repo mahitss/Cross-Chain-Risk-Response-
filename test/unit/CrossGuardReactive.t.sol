@@ -333,4 +333,46 @@ contract CrossGuardReactiveTest is Test {
             10_001
         );
     }
+
+    function testReactDispatchesOmniCallbackForRiskResolved() public {
+        uint256 nonce = 43;
+        uint256 recoveredLtv = 4500;
+        uint256 eventTimestamp = block.timestamp;
+
+        IReactive.LogRecord memory log = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(reactiveContract.RISK_RESOLVED_TOPIC_0()),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: nonce,
+            data: abi.encode(recoveredLtv, 8000, eventTimestamp),
+            block_number: 101,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        bytes memory expectedPayload = abi.encodeWithSignature(
+            "handleRiskResolved(address,bytes32,uint256,uint256,uint256)",
+            address(0),
+            positionId,
+            nonce,
+            recoveredLtv,
+            eventTimestamp
+        );
+
+        vm.prank(address(mockSystem));
+        reactiveContract.react(log);
+
+        assertEq(reactiveContract.reactCount(), 1);
+        assertEq(mockSystem.requestedCallbackCount(), 1);
+
+        ISystemContract.CallbackConfiguration_V_1_0 memory cbReq = mockSystem.getLastRequestedCallback();
+        assertEq(cbReq.chainId, DEST_CHAIN_ID);
+        assertEq(cbReq.recipient, destCallback);
+        assertEq(cbReq.gasLimit, GAS_LIMIT);
+        assertEq(cbReq.payload, expectedPayload);
+    }
 }

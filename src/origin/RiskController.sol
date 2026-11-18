@@ -2,6 +2,7 @@
 pragma solidity >=0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IRiskController} from "../interfaces/IRiskController.sol";
 
 /// @title RiskController
@@ -14,7 +15,8 @@ import {IRiskController} from "../interfaces/IRiskController.sol";
 ///      - Zero Collateral & Zero Debt: LTV = 0 bps (Healthy)
 ///      - Zero Collateral & Positive Debt: LTV = 10,000 bps (Max risk / Breached)
 ///      - Positive Collateral & Zero Debt: LTV = 0 bps (Healthy)
-///      - Intermediate overflow is guarded: debtValueUsd > type(uint256).max / BPS_SCALE returns type(uint256).max.
+///      - Full 512-bit intermediate math: (debtValueUsd * BPS_SCALE) / collateralValueUsd
+///      - Unrepresentable quotients (> type(uint256).max) deterministically return type(uint256).max.
 contract RiskController is IRiskController, Ownable {
     error UnauthorizedVault(address caller);
     error InvalidThreshold(uint256 thresholdBps);
@@ -60,6 +62,8 @@ contract RiskController is IRiskController, Ownable {
     }
 
     /// @notice Canonical fixed-point LTV calculation in basis points (10,000 = 100%).
+    /// @dev Full-precision 512-bit calculation: (debtValueUsd * BPS_SCALE) / collateralValueUsd.
+    ///      Quotients exceeding type(uint256).max deterministically return type(uint256).max.
     /// @param collateralValueUsd Position collateral valuation in USD (8 decimals).
     /// @param debtValueUsd Position debt valuation in USD (8 decimals).
     /// @return Calculated LTV in basis points.
@@ -70,10 +74,23 @@ contract RiskController is IRiskController, Ownable {
         if (collateralValueUsd == 0) {
             return BPS_SCALE;
         }
-        if (debtValueUsd > type(uint256).max / BPS_SCALE) {
+
+        // Full-precision 512-bit product [prod1, prod0] = debtValueUsd * BPS_SCALE
+        uint256 prod0;
+        uint256 prod1;
+        assembly {
+            let mm := mulmod(debtValueUsd, BPS_SCALE, not(0))
+            prod0 := mul(debtValueUsd, BPS_SCALE)
+            prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+        }
+
+        // If quotient exceeds type(uint256).max, deterministically cap at type(uint256).max
+        if (prod1 >= collateralValueUsd) {
             return type(uint256).max;
         }
-        return (debtValueUsd * BPS_SCALE) / collateralValueUsd;
+
+        // Exact 512 by 256 division
+        return Math.mulDiv(debtValueUsd, BPS_SCALE, collateralValueUsd);
     }
 
     /// @notice Evaluates position risk and emits RiskBreach (or RiskResolved on recovery) with monotonic nonce.

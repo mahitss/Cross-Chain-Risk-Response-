@@ -23,6 +23,8 @@ contract CrossGuardReactive is IReactive, Ownable {
 
     bytes32 public constant RISK_BREACH_TOPIC_0 =
         keccak256("RiskBreach(bytes32,address,uint256,uint256,uint256,uint256)");
+    bytes32 public constant RISK_RESOLVED_TOPIC_0 =
+        keccak256("RiskResolved(bytes32,address,uint256,uint256,uint256,uint256)");
 
     ISystemContract public systemContract;
     uint256 public originChainId;
@@ -37,6 +39,9 @@ contract CrossGuardReactive is IReactive, Ownable {
     event DestinationConfigUpdated(uint256 chainId, address callbackContract, uint64 gasLimit);
     event MinRiskThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
     event ReactiveBreachProcessed(
+        bytes32 indexed positionId, uint256 indexed nonce, uint256 riskLevel, uint256 timestamp
+    );
+    event ReactiveResolvedProcessed(
         bytes32 indexed positionId, uint256 indexed nonce, uint256 riskLevel, uint256 timestamp
     );
 
@@ -80,11 +85,21 @@ contract CrossGuardReactive is IReactive, Ownable {
         callbackGasLimit = _gasLimit > 0 ? _gasLimit : 300_000;
         minRiskThresholdBps = _minRiskThresholdBps;
 
-        // Current Omni subscription mechanism
+        // 1. Subscribe to RiskBreach events on origin
         systemContract.subscribe(
             _originChainId,
             _originRiskController,
             uint256(RISK_BREACH_TOPIC_0),
+            REACTIVE_IGNORE,
+            REACTIVE_IGNORE,
+            REACTIVE_IGNORE
+        );
+
+        // 2. Subscribe to RiskResolved events on origin
+        systemContract.subscribe(
+            _originChainId,
+            _originRiskController,
+            uint256(RISK_RESOLVED_TOPIC_0),
             REACTIVE_IGNORE,
             REACTIVE_IGNORE,
             REACTIVE_IGNORE
@@ -123,48 +138,69 @@ contract CrossGuardReactive is IReactive, Ownable {
             return;
         }
 
-        // 2. Verify event topic
-        if (log.topic_0 != uint256(RISK_BREACH_TOPIC_0)) {
-            return;
-        }
-
-        // 3. Extract indexed positionId, user, nonce, and decoded data parameters
-        bytes32 positionId = bytes32(log.topic_1);
-        uint256 nonce = log.topic_3;
-        (uint256 currentLtvBps,, uint256 timestamp) = abi.decode(log.data, (uint256, uint256, uint256));
-
-        // 4. Verify risk threshold
-        if (currentLtvBps < minRiskThresholdBps) {
-            return;
-        }
-
-        // 5. Ensure destination callback is configured
+        // 2. Ensure destination callback is configured
         if (destinationCallback == address(0) || destinationChainId == 0) {
             return;
         }
 
-        // 6. Build destination callback payload
-        // The first argument address(0) is replaced by the Reactive Network Omni proxy with this Reactive contract address
-        bytes memory payload = abi.encodeWithSignature(
-            "handleRiskBreach(address,bytes32,uint256,uint256,uint256)",
-            address(0),
-            positionId,
-            nonce,
-            currentLtvBps,
-            timestamp
-        );
+        bytes32 positionId = bytes32(log.topic_1);
+        uint256 nonce = log.topic_3;
 
-        emit ReactiveBreachProcessed(positionId, nonce, currentLtvBps, timestamp);
+        // 3. Handle RiskBreach event
+        if (log.topic_0 == uint256(RISK_BREACH_TOPIC_0)) {
+            (uint256 currentLtvBps,, uint256 timestamp) = abi.decode(log.data, (uint256, uint256, uint256));
 
-        // 7. Request callback via current Omni System Contract interface (sole dispatch mechanism)
-        systemContract.requestCallbackV_1_0(
-            ISystemContract.CallbackConfiguration_V_1_0({
-                chainId: destinationChainId,
-                recipient: destinationCallback,
-                gasLimit: callbackGasLimit,
-                payload: payload
-            })
-        );
+            // Verify risk threshold filter
+            if (currentLtvBps < minRiskThresholdBps) {
+                return;
+            }
+
+            // Build destination callback payload for pause
+            bytes memory payload = abi.encodeWithSignature(
+                "handleRiskBreach(address,bytes32,uint256,uint256,uint256)",
+                address(0),
+                positionId,
+                nonce,
+                currentLtvBps,
+                timestamp
+            );
+
+            emit ReactiveBreachProcessed(positionId, nonce, currentLtvBps, timestamp);
+
+            systemContract.requestCallbackV_1_0(
+                ISystemContract.CallbackConfiguration_V_1_0({
+                    chainId: destinationChainId,
+                    recipient: destinationCallback,
+                    gasLimit: callbackGasLimit,
+                    payload: payload
+                })
+            );
+        }
+        // 4. Handle RiskResolved event
+        else if (log.topic_0 == uint256(RISK_RESOLVED_TOPIC_0)) {
+            (uint256 currentLtvBps,, uint256 timestamp) = abi.decode(log.data, (uint256, uint256, uint256));
+
+            // Build destination callback payload for resolution
+            bytes memory payload = abi.encodeWithSignature(
+                "handleRiskResolved(address,bytes32,uint256,uint256,uint256)",
+                address(0),
+                positionId,
+                nonce,
+                currentLtvBps,
+                timestamp
+            );
+
+            emit ReactiveResolvedProcessed(positionId, nonce, currentLtvBps, timestamp);
+
+            systemContract.requestCallbackV_1_0(
+                ISystemContract.CallbackConfiguration_V_1_0({
+                    chainId: destinationChainId,
+                    recipient: destinationCallback,
+                    gasLimit: callbackGasLimit,
+                    payload: payload
+                })
+            );
+        }
     }
 
     /// @notice Allows owner to withdraw any accidentally sent native tokens.

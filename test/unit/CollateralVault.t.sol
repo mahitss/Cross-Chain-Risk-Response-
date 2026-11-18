@@ -288,4 +288,79 @@ contract CollateralVaultTest is Test {
         (,,,, uint256 newDebt) = vault.getPosition(positionId);
         assertEq(newDebt, 5500e18);
     }
+
+    /* -------------------------------------------------------------------------- */
+    /*               M003.2 STALE BREACH & FULL-PRECISION ARITHMETIC TESTS       */
+    /* -------------------------------------------------------------------------- */
+
+    function testStaleBreachStateBorrowRejectionUntilExplicitEvaluation() public {
+        vm.startPrank(alice);
+        vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000
+        vault.recordBorrow(positionId, mockUsdc, 4500e18); // $4,500 (LTV = 75%)
+        vm.stopPrank();
+
+        // 1. Position breaches: WETH drops to $2,500 (Collateral $5,000, Debt $4,500 -> LTV = 90%)
+        vm.prank(owner);
+        oracle.setAssetPrice(mockWeth, 2500e8);
+
+        (bool isBreached,,) = vault.evaluatePositionRisk(positionId);
+        assertTrue(isBreached);
+        assertTrue(riskController.isPositionBreached(positionId));
+
+        // 2. Oracle recovers: WETH price rebounds to $3,000 (Collateral becomes $6,000 -> LTV would be 75%)
+        vm.prank(owner);
+        oracle.setAssetPrice(mockWeth, 3000e8);
+
+        // 3. Stale breach protection: Alice attempts to borrow BEFORE explicit evaluation
+        // MUST REVERT with PositionInBreachedState even though current pricing would be healthy!
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionInBreachedState.selector, positionId));
+        vault.recordBorrow(positionId, mockUsdc, 100e18);
+
+        // Breach state remains active in RiskController
+        assertTrue(riskController.isPositionBreached(positionId));
+
+        // 4. Explicit healthy risk evaluation is performed
+        (bool recovered, uint256 recLtv, uint256 recNonce) = vault.evaluatePositionRisk(positionId);
+        assertFalse(recovered);
+        assertEq(recLtv, 7500);
+        assertEq(recNonce, 2);
+        assertFalse(riskController.isPositionBreached(positionId));
+
+        // 5. Outcome based on projected LTV:
+        // A) Borrow that pushes position beyond 80% threshold fails
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 8333, 8000)
+        );
+        vault.recordBorrow(positionId, mockUsdc, 500e18); // $4,500 + $500 = $5,000 / $6,000 = 83.33%
+
+        // B) Safe borrow within threshold succeeds
+        vm.prank(alice);
+        vault.recordBorrow(positionId, mockUsdc, 200e18); // $4,500 + $200 = $4,700 / $6,000 = 78.33%
+        (,,,, uint256 finalDebt) = vault.getPosition(positionId);
+        assertEq(finalDebt, 4700e18);
+    }
+
+    function testExtremeValuationMathDoesNotOverflow() public {
+        bytes32 extremePos = keccak256("extreme-pos");
+        address whale = address(0xEEEE);
+
+        // Whale deposits massive amount where amount * price exceeds 2^256 if not handled safely
+        // 1e30 tokens at $3,000 (3000e8) -> 3e41 (fits in 256 bits, but intermediate 512-bit safe)
+        vm.prank(whale);
+        vault.depositCollateral(extremePos, mockWeth, 1e30);
+
+        // Price set to very large number
+        address mockMegaToken = address(0x9999);
+        vm.prank(owner);
+        oracle.setAssetPrice(mockMegaToken, 1e20); // $1 trillion per token
+
+        vm.prank(whale);
+        vault.depositCollateral(extremePos, mockWeth, 1e25);
+
+        (bool isBreached, uint256 ltv,) = vault.evaluatePositionRisk(extremePos);
+        assertFalse(isBreached);
+        assertEq(ltv, 0);
+    }
 }
