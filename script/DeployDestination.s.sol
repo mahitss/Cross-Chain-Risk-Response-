@@ -9,6 +9,8 @@ import {CrossGuardCallback} from "../src/destination/CrossGuardCallback.sol";
 /// @notice Deploys destination borrowing & callback infrastructure to Unichain Sepolia (1301).
 ///         Strictly requires the deployed CrossGuardReactive contract address; rejects zero or EOA fallbacks.
 contract DeployDestination is Script {
+    uint256 constant UNICHAIN_SEPOLIA_CHAIN_ID = 1301;
+
     // Official Callback Proxy on Unichain Sepolia
     address constant UNICHAIN_CALLBACK_PROXY = 0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4;
 
@@ -34,6 +36,12 @@ contract DeployDestination is Script {
         console.log("Deployer Address:", deployer);
         console.log("Configured Reactive Sender (Lasna Contract):", authorizedReactiveSender);
         console.log("Configured Callback Proxy:", UNICHAIN_CALLBACK_PROXY);
+
+        // Fail-closed execution network preflight guard
+        require(
+            block.chainid == UNICHAIN_SEPOLIA_CHAIN_ID,
+            "Unsupported execution network: must run on Unichain Sepolia (1301)"
+        );
 
         vm.startBroadcast(deployerPrivateKey);
 

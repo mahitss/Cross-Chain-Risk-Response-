@@ -1,9 +1,9 @@
-# M003.5 CrossGuard Release-Readiness & Verification Audit Report
+# M003.5 / M003.6 CrossGuard Release-Readiness & Verification Audit Report
 
-**Repository:** `mahitss/Cross-Chain-Risk-Response-`  
-**Active Branch:** `fix/m002-2-omni-callback-correctness`  
-**Baseline Commit:** `76345fd995acd74de74253d8207c970e973c9a97` (M003.4.1)  
-**Report Milestone:** M003.5 Documentation & Release-Readiness Audit  
+**Repository:** `mahitss/Cross-Chain-Risk-Response-`<br>
+**Active Branch:** `fix/m002-2-omni-callback-correctness`<br>
+**Baseline Commit:** `ba54c4aa29ccbde757b215b14dec7ff2bf4e759f` (M003.5)<br>
+**Report Milestone:** M003.6 Complete Multi-Chain Deployment Safety & Audit Alignment<br>
 **Date:** 2026-11-21  
 
 ---
@@ -16,8 +16,9 @@
 | **M003.2** | `a3e5e6b9a7a1d9ce80869b11600f295a3f0d6579` | **Implementation** | Stale breach-state protection on origin (requiring explicit healthy evaluation), automated recovery propagation (`RiskResolved` event and `handleRiskResolved` callback flow). |
 | **M003.3** | `245bf2a7c4b8bd8613a7ab5e8da54142c848e21c` | **Implementation** | Single authoritative origin risk policy (elimination of independent reactive threshold filtering), configuration validations, fail-closed destination checks. |
 | **M003.4** | `589dca26322d0b8dbf37ed75ae56891ca472e2a1` | **Implementation** | Reactive event payload validation (topic0, data length 96 bytes, address encoding, non-zero nonce/timestamp, semantic bounds), topology allowlist (`84532` & `1301`), immutable `riskController` in `CollateralVault`. |
-| **M003.4.1**| `76345fd995acd74de74253d8207c970e973c9a97` | **Implementation** | Consistent position ID invariant (`InvalidPositionId` across origin, destination, and reactive), fail-closed deployment network preflight guards (`DeployReactive.s.sol`, `ConfigureReactive.s.sol` checking `block.chainid == 5318007`). |
-| **M003.5** | *Current* | **Documentation** | Complete codebase audit, comprehensive rewrite of `README.md`, verified test/coverage metrics, and CI evidence reporting. |
+| **M003.4.1**| `76345fd995acd74de74253d8207c970e973c9a97` | **Implementation** | Consistent position ID invariant (`InvalidPositionId` across state-changing functions), fail-closed deployment network preflight guards (`DeployReactive.s.sol`, `ConfigureReactive.s.sol` checking `block.chainid == 5318007`). |
+| **M003.5** | `ba54c4aa29ccbde757b215b14dec7ff2bf4e759f` | **Documentation** | Complete codebase audit, comprehensive rewrite of `README.md`, verified test/coverage metrics, and CI evidence reporting. |
+| **M003.6** | *Current* | **Implementation & Docs** | Comprehensive multi-chain deployment safety: fail-closed `block.chainid` preflight guards added to `DeployOrigin.s.sol` (`84532`) and `DeployDestination.s.sol` (`1301`), expanded `ScriptPreflightTest` suite (115 total tests), and precision corrections in documentation. |
 
 ---
 
@@ -61,10 +62,18 @@
 6. **Separated Emergency Controls:**
    - `resumeBorrowing(positionId)` reverts with `CannotBypassActiveRiskBreach` if position was breached via cross-chain risk.
    - `emergencyResumeBorrowing(positionId, reason)` requires an explicit audit reason string and emits an audit event.
-7. **Position ID Invariant:**
-   - Every creation, registration, borrow, evaluation, or callback path strictly reverts with `InvalidPositionId` on `bytes32(0)`.
-8. **Deployment Script Runtime Network Preflight:**
-   - `DeployReactive.s.sol` and `ConfigureReactive.s.sol` fail closed if `block.chainid != 5318007`.
+7. **Position ID Invariant on State-Changing Functions:**
+   - Every state-changing function across origin and destination that modifies position state reverts with `InvalidPositionId` on `bytes32(0)`. Read-only getters return default empty values as per standard EVM mapping behavior without reverting.
+8. **Deployment Script Runtime Network Preflight (All 4 Scripts):**
+   - Every deployment and configuration script enforces a pre-broadcast `require(block.chainid == EXPECTED_CHAIN_ID, ...)`:
+     - `DeployOrigin.s.sol`: `84532` (Base Sepolia)
+     - `DeployReactive.s.sol`: `5318007` (Reactive Lasna)
+     - `DeployDestination.s.sol`: `1301` (Unichain Sepolia)
+     - `ConfigureReactive.s.sol`: `5318007` (Reactive Lasna)
+9. **Cross-Chain Deployment Limitation:**
+   - `DeployDestination.s.sol` rejects zero address and the deployer's own address for `REACTIVE_CROSSGUARD`. Because `REACTIVE_CROSSGUARD` lives on Reactive Lasna (`5318007`), the Unichain Sepolia RPC cannot inspect code size or bytecode on the remote chain (`extcodesize` is 0 on Unichain). Cross-chain configuration relies on sequential deployment and operational parameter validation.
+10. **Eventual Destination Pause:**
+    - Destination borrowing pause is the eventual outcome of a successful multi-stage cross-chain relay (origin event $\rightarrow$ Reactive log delivery $\rightarrow$ callback request $\rightarrow$ relayer transport $\rightarrow$ destination execution). It is not an instantaneous local action.
 
 ---
 
@@ -107,20 +116,22 @@ Ran 9 test suites:
 - test/unit/CrossGuardCallback.t.sol: 14 passed, 0 failed, 0 skipped
 - test/unit/ConfigurationConsistency.t.sol: 10 passed, 0 failed, 0 skipped
 - test/unit/TestValuationSource.t.sol: 4 passed, 0 failed, 0 skipped
-- test/unit/ScriptPreflight.t.sol: 2 passed, 0 failed, 0 skipped
+- test/unit/ScriptPreflight.t.sol: 4 passed, 0 failed, 0 skipped
 - test/integration/CrossGuardE2E.t.sol: 2 passed, 0 failed, 0 skipped
 
-Total: 113 passed, 0 failed, 0 skipped (113 total tests, 100% pass rate)
+Total: 115 passed, 0 failed, 0 skipped (115 total tests, 100% pass rate)
 ```
 
-### 5.5. Coverage Analysis (`forge coverage --ir-minimum`)
+### 5.5. Local Coverage Analysis (`forge coverage --ir-minimum`)
+*Note: Measured locally using `forge coverage --ir-minimum`. GitHub Actions CI workflow runs automated compilation, formatting, and unit tests, but does not run `forge coverage`.*
+
 ```text
 ╭-----------------------------------------+------------------+------------------+-----------------+-----------------╮
 | File                                    | % Lines          | % Statements     | % Branches      | % Funcs         |
 +===================================================================================================================+
 | script/ConfigureReactive.s.sol          | 55.56% (15/27)   | 60.61% (20/33)   | 0.00% (0/12)    | 100.00% (1/1)   |
-| script/DeployDestination.s.sol          | 0.00% (0/26)     | 0.00% (0/30)     | 0.00% (0/9)     | 0.00% (0/1)     |
-| script/DeployOrigin.s.sol               | 0.00% (0/15)     | 0.00% (0/19)     | N/A (0/0)       | 0.00% (0/1)     |
+| script/DeployDestination.s.sol          | 44.44% (12/27)   | 45.16% (14/31)   | 0.00% (0/11)    | 100.00% (1/1)   |
+| script/DeployOrigin.s.sol               | 37.50% (6/16)    | 35.00% (7/20)    | 0.00% (0/2)     | 100.00% (1/1)   |
 | script/DeployReactive.s.sol             | 43.33% (13/30)   | 50.00% (18/36)   | 0.00% (0/17)    | 100.00% (1/1)   |
 | src/destination/BorrowingController.sol | 96.10% (74/77)   | 93.42% (71/76)   | 79.17% (19/24)  | 100.00% (11/11) |
 | src/destination/CrossGuardCallback.sol  | 94.59% (35/37)   | 94.44% (34/36)   | 77.78% (7/9)    | 100.00% (5/5)   |
@@ -129,7 +140,7 @@ Total: 113 passed, 0 failed, 0 skipped (113 total tests, 100% pass rate)
 | src/origin/TestValuationSource.sol      | 100.00% (10/10)  | 100.00% (9/9)    | 100.00% (2/2)   | 100.00% (3/3)   |
 | src/reactive/CrossGuardReactive.sol     | 94.62% (88/93)   | 96.12% (99/103)  | 78.57% (22/28)  | 85.71% (6/7)    |
 | test/mocks/MockOmniSystemContract.sol   | 20.00% (10/50)   | 8.00% (6/75)     | 0.00% (0/11)    | 36.36% (4/11)   |
-| Total                                   | 73.51% (358/487) | 69.89% (397/568) | 56.76% (84/148) | 81.48% (44/54)  |
+| Total                                   | 76.89% (376/489) | 73.33% (418/570) | 55.26% (84/152) | 85.19% (46/54)  |
 ╰-----------------------------------------+------------------+------------------+-----------------+-----------------╯
 ```
 
@@ -138,25 +149,25 @@ Total: 113 passed, 0 failed, 0 skipped (113 total tests, 100% pass rate)
 ## 6. Continuous Integration (CI) Verification
 
 - **Workflow File:** `.github/workflows/test.yml`
-- **Target Commit SHA:** `76345fd995acd74de74253d8207c970e973c9a97` (M003.4.1)
-- **GitHub Check Run ID:** `136551855949`
-- **GitHub Workflow Run ID:** `44812353299`
+- **M003.5 Commit SHA:** `ba54c4aa29ccbde757b215b14dec7ff2bf4e759f`
+- **GitHub Check Run ID:** `136565661913`
+- **GitHub Workflow Run ID:** `44816371670`
 - **Execution Status:** Completed
 - **Conclusion:** `success`
-- **Public URL:** https://github.com/mahitss/Cross-Chain-Risk-Response-/actions/runs/44812353299/job/136551855949
+- **Public URL:** https://github.com/mahitss/Cross-Chain-Risk-Response-/actions/runs/44816371670/job/136565661913
 
 ---
 
 ## 7. Verification Checklist & Protocol Readiness
 
-- [x] All 113 Foundry tests passing (111 unit, 2 simulation).
+- [x] All 115 Foundry tests passing (113 unit/preflight, 2 simulation).
 - [x] Zero code formatting diffs with `forge fmt --check`.
 - [x] All smart contract bytecode sizes within EIP-170 limit (<24,576 bytes).
 - [x] Core production contract line coverage exceeds 90-100%.
-- [x] Zero-position-ID invariant implemented and tested protocol-wide.
-- [x] Deployment network preflight check implemented and tested.
-- [x] Sole authoritative risk policy verified without secondary suppression.
-- [x] Stale breach protection verified.
-- [x] README rewritten to accurately reflect implementation, architecture, and limitations.
-- [x] Remote CI verified as passed for baseline commit.
+- [x] Script preflight network guards implemented and tested for all 4 deployment/configuration scripts.
+- [x] Zero-position-ID invariant accurately documented for state-changing functions.
+- [x] Reactive origin event checks accurately documented (authenticated Omni System Contract delivery + parameter validation).
+- [x] Destination deployment foreign-chain address validation boundaries documented.
+- [x] Destination pause accurately described as an eventual outcome following cross-chain delivery.
+- [x] Local coverage clearly distinguished from GitHub Actions CI.
 - [x] Zero live deployments, zero transactions broadcast, zero funds spent.

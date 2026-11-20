@@ -9,12 +9,19 @@ import {CollateralVault} from "../src/origin/CollateralVault.sol";
 /// @title DeployOrigin
 /// @notice Deploys origin risk & collateral infrastructure to Base Sepolia (84532).
 contract DeployOrigin is Script {
+    uint256 constant BASE_SEPOLIA_CHAIN_ID = 84532;
+
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
         console.log("=== Deploying Origin Contracts to Base Sepolia (84532) ===");
         console.log("Deployer Address:", deployer);
+
+        // Fail-closed execution network preflight guard
+        require(
+            block.chainid == BASE_SEPOLIA_CHAIN_ID, "Unsupported execution network: must run on Base Sepolia (84532)"
+        );
 
         vm.startBroadcast(deployerPrivateKey);
 

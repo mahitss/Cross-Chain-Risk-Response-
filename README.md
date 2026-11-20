@@ -2,7 +2,7 @@
 
 CrossGuard is an autonomous cross-chain risk mitigation protocol engineered for the **Reactive Network Omni Architecture**.
 
-When collateral risk conditions (such as market crashes or loan-to-value health deterioration) occur on **Base Sepolia (Chain ID: 84532)**, the protocol's Reactive Smart Contract on **Reactive Lasna (Chain ID: 5318007)** autonomously intercepts origin event logs, verifies origin authenticity and risk criteria, and dispatches an authenticated cross-chain callback to **Unichain Sepolia (Chain ID: 1301)**. On Unichain Sepolia, an authorized callback adapter immediately pauses further borrowing for the affected position to prevent bad debt accumulation.
+When collateral risk conditions (such as market crashes or loan-to-value health deterioration) occur on **Base Sepolia (Chain ID: 84532)**, the protocol's Reactive Smart Contract on **Reactive Lasna (Chain ID: 5318007)** autonomously intercepts origin event logs, validates origin parameters, and dispatches an authenticated cross-chain callback to **Unichain Sepolia (Chain ID: 1301)**. On Unichain Sepolia, an authorized callback adapter receives the message and executes to pause further borrowing for the affected position, preventing toxic debt accumulation once callback delivery and execution complete.
 
 ---
 
@@ -18,7 +18,7 @@ Cross-chain and multi-chain lending protocols separate user collateral (locked o
 Reactive Network solves this by providing **inversion of control** at the smart-contract layer:
 - **Autonomous On-Chain Execution:** Instead of off-chain servers continuously polling origin state, `CrossGuardReactive` is deployed directly on the Reactive Network (Lasna Testnet).
 - **Native Log Subscriptions:** Through the Reactive Omni System Contract (`0x8888888888888888888888888888888888888888`), the reactive contract subscribes directly to origin log topics across the validator network.
-- **Trust-Minimized Relaying:** When an origin risk event is emitted, the Reactive Network validator network triggers `CrossGuardReactive.react()`, validates the log's cryptographic origin, and dispatches an authenticated cross-chain callback to the destination chain.
+- **Trust-Minimized Relaying:** When an origin risk event is emitted, the Reactive Network validator network routes the log to `CrossGuardReactive.react()`, which verifies the origin parameters and dispatches an authenticated cross-chain callback to the destination chain.
 - **Cryptographic Sender Injection:** The Reactive relayer overwrites the first 160 bits of the callback payload with the deployed Reactive contract address, allowing the destination callback receiver to authenticate the reactive smart contract deterministically.
 
 ---
@@ -101,7 +101,7 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 | **`TestValuationSource.sol`** | Base Sepolia | `84532` | Configurable mock oracle providing asset USD prices scaled to 8 decimals ($10^8$). |
 | **`CollateralVault.sol`** | Base Sepolia | `84532` | Manages collateral deposits and borrow records ($10^{18}$ decimals). Evaluates position health and blocks borrowing on breached or uncollateralized positions. |
 | **`RiskController.sol`** | Base Sepolia | `84532` | Sole authoritative origin risk policy engine. Calculates canonical LTV using 512-bit arithmetic, manages position breach status, and emits events with monotonic per-position nonces. |
-| **`CrossGuardReactive.sol`** | Reactive Lasna | `5318007` | Subscribes to `RiskBreach` and `RiskResolved` origin events via Omni System Contract, validates event structure, and dispatches callbacks to Unichain Sepolia. |
+| **`CrossGuardReactive.sol`** | Reactive Lasna | `5318007` | Subscribes to `RiskBreach` and `RiskResolved` origin events via Omni System Contract, validates event structure and semantics, and dispatches callbacks to Unichain Sepolia. |
 | **`CrossGuardCallback.sol`** | Unichain Sepolia | `1301` | Destination callback adapter enforcing dual-layer authentication: official Callback Proxy verification and injected Reactive contract address validation. |
 | **`BorrowingController.sol`** | Unichain Sepolia | `1301` | Destination lending pool that enforces borrowing pauses, rejects replayed or stale callbacks via monotonic nonces, and provides separated administrative emergency overrides. |
 
@@ -132,8 +132,9 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 
 ### 3. Full-Lifecycle Cross-Chain Recovery Propagation
 - CrossGuard supports both incident response and automated recovery:
-  - **Breach Flow:** When LTV $\ge$ threshold, `RiskController` sets `isPositionBreached = true`, increments nonce, and emits `RiskBreach`. Reactive dispatches `handleRiskBreach` to pause destination borrowing.
+  - **Breach Flow:** When LTV $\ge$ threshold, `RiskController` sets `isPositionBreached = true`, increments nonce, and emits `RiskBreach`. Reactive dispatches `handleRiskBreach` to initiate destination borrowing pause.
   - **Recovery Flow:** When an underwater position is re-evaluated with LTV $<$ threshold, `RiskController` clears `isPositionBreached = false`, increments nonce, and emits `RiskResolved`. Reactive dispatches `handleRiskResolved` to resume destination borrowing.
+- **Eventual Pause Outcome:** Destination borrowing is paused as an eventual outcome following successful origin emission, Reactive event ingestion, callback dispatch, relayer transport, and destination transaction execution. It is not an instantaneous local action.
 
 ### 4. Monotonic Nonce Replay Protection & Callback Ordering
 - **No Reliance on Timestamp Ordering:** Callback ordering and replay resistance do not rely on block timestamps or synchronized clocks across chains.
@@ -141,29 +142,50 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 - **Rejection of Stale / Duplicate Callbacks:** `BorrowingController` enforces `require(nonce > lastProcessedNonce[positionId], InvalidNonce)`.
 - **Duplicate Nonces Revert:** Destination callbacks are **not** idempotent; duplicate or out-of-order nonces strictly revert to protect state sequencing.
 
-### 5. Dual-Layer Destination Authentication
+### 5. Reactive Origin Event Validation
+- `CrossGuardReactive.react()` operates exclusively on event logs delivered by the trusted Reactive Network Omni System Contract (`0x8888888888888888888888888888888888888888`).
+- Inside `react()`, the contract performs exhaustive parameter and structural checks:
+  1. Caller authentication (`msg.sender == address(systemContract)` via `onlySystem`).
+  2. Origin chain ID match (`log.chain_id == 84532`).
+  3. Origin emitter match (`log._contract == originRiskController`).
+  4. Topic 0 match (`RISK_BREACH_TOPIC_0` or `RISK_RESOLVED_TOPIC_0`).
+  5. Indexed parameter formatting (non-zero position ID, valid non-zero user address in lower 160 bits, non-zero nonce).
+  6. Payload data length verification (exactly 96 bytes / 3 ABI words: `currentLtvBps`, `riskThresholdBps`, `timestamp`).
+  7. Threshold bounds validation ($1 \le \text{riskThresholdBps} \le 10,000$).
+  8. Non-zero timestamp check.
+  9. Semantic LTV sanity (breach requires $\text{currentLtvBps} \ge \text{riskThresholdBps}$; resolution requires $\text{currentLtvBps} < \text{riskThresholdBps}$).
+- Log transport, consensus, and block inclusion are validated natively by the Reactive Network validator set; the smart contract verifies caller authority, origin parameters, and data semantics.
+
+### 6. Dual-Layer Destination Authentication
 - **Layer 1 (Callback Proxy Verification):** Destination `CrossGuardCallback` inherits OpenZeppelin-compatible `AbstractCallback` and enforces `authorizedSenderOnly`, guaranteeing `msg.sender == UNICHAIN_CALLBACK_PROXY` (`0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4`).
 - **Layer 2 (Injected Contract Address Authentication):** The Reactive Network relayer replaces the first 160 bits of calldata with the actual deployed `CrossGuardReactive` contract address on Lasna. `CrossGuardCallback` validates that `reactiveSender == authorizedReactiveSender`.
 - *Note:* The authenticated identifier is the deployed smart contract address on Reactive Lasna, not a legacy deployer RVM ID.
 
-### 6. Administrative Controls & Emergency Separation
+### 7. Administrative Controls & Emergency Separation
 - **Ordinary Owner Resume:** `BorrowingController.resumeBorrowing(positionId)` is restricted to positions paused administratively. If the position is actively paused due to a cross-chain risk breach (`pausedByRiskBreach == true`), it **reverts with `CannotBypassActiveRiskBreach`**.
 - **Emergency Circuit Breaker:** `emergencyResumeBorrowing(positionId, string calldata reason)` allows owner override only if cross-chain relay infrastructure is permanently disrupted. It mandates a non-empty audit reason string and emits `EmergencyBorrowingResumed` with the caller address, reason, and timestamp for complete on-chain transparency.
 
-### 7. Position ID Invariant
-- Zero position IDs (`bytes32(0)`) are invalid protocol-wide.
-- Every public/external entrypoint across `CollateralVault`, `RiskController`, `BorrowingController`, and `CrossGuardCallback` enforces `if (positionId == bytes32(0)) revert InvalidPositionId();`.
-- `CrossGuardReactive.react()` silently rejects event logs containing zero position IDs (`ReactiveEventRejected(..., "ZERO_POSITION_ID")`).
-
-### 8. Fail-Closed Deployment Network Preflight Guards
-- Deployment scripts (`DeployReactive.s.sol` and `ConfigureReactive.s.sol`) validate execution network before broadcasting:
+### 8. Position ID Invariant on State-Changing Functions
+- Zero position IDs (`bytes32(0)`) are invalid protocol-wide for state transitions.
+- Every state-changing function across origin and destination that initializes, registers, evaluates, borrows against, pauses, or resumes positions enforces:
   ```solidity
-  require(
-      block.chainid == 5318007,
-      "Unsupported execution network: must run on Reactive Lasna (5318007)"
-  );
+  if (positionId == bytes32(0)) revert InvalidPositionId();
   ```
-- Prevents accidental broadcasting of Reactive contract scripts to Base Sepolia, Unichain Sepolia, or local testnets.
+  This applies to `depositCollateral`, `recordBorrow`, `evaluatePositionRisk`, `assessRisk`, `registerPosition`, `registerPositionFor`, `pauseBorrowing`, `resolveBorrowing`, `emergencyPauseBorrowing`, `resumeBorrowing`, `emergencyResumeBorrowing`, `borrow`, `handleRiskBreach`, and `handleRiskResolved`.
+- `CrossGuardReactive.react()` silently rejects event logs containing zero position IDs (`ReactiveEventRejected(..., "ZERO_POSITION_ID")`).
+- Read-only mapping getters (such as `getPosition`, `positionOwners`, `isBorrowingPaused`, `positionNonce`) return default empty values for uninitialized keys in accordance with standard EVM mapping behavior without reverting.
+
+### 9. Fail-Closed Deployment Network Preflight Guards
+- Every deployment and configuration script enforces a fail-closed `block.chainid` preflight check before calling `vm.startBroadcast()`:
+
+| Script | Target Network | Enforced Chain ID | Preflight Guard Revert Message |
+| :--- | :--- | :---: | :--- |
+| `DeployOrigin.s.sol` | Base Sepolia | `84532` | `"Unsupported execution network: must run on Base Sepolia (84532)"` |
+| `DeployReactive.s.sol` | Reactive Lasna | `5318007` | `"Unsupported execution network: must run on Reactive Lasna (5318007)"` |
+| `DeployDestination.s.sol` | Unichain Sepolia | `1301` | `"Unsupported execution network: must run on Unichain Sepolia (1301)"` |
+| `ConfigureReactive.s.sol` | Reactive Lasna | `5318007` | `"Unsupported execution network: must run on Reactive Lasna (5318007)"` |
+
+- **Destination Deployment Limitation:** In `DeployDestination.s.sol`, the script rejects zero address (`address(0)`) and the deployer's own EOA address for `REACTIVE_CROSSGUARD`. However, because `REACTIVE_CROSSGUARD` lives on Reactive Lasna (`5318007`) while the script executes on Unichain Sepolia (`1301`), the Unichain node cannot inspect bytecode on the foreign chain (`extcodesize` on Unichain for a Lasna address is 0). Verification across chains depends on strict deployment sequencing and operational address verification.
 
 ---
 
@@ -174,10 +196,10 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 │   └── workflows/
 │       └── test.yml                    # CI workflow (formatting, build, test)
 ├── script/
-│   ├── DeployOrigin.s.sol              # Base Sepolia origin deployment script
-│   ├── DeployDestination.s.sol         # Unichain Sepolia destination deployment script
-│   ├── DeployReactive.s.sol            # Reactive Lasna deployment script (network-guarded)
-│   └── ConfigureReactive.s.sol         # Reactive Lasna destination linking script (network-guarded)
+│   ├── DeployOrigin.s.sol              # Base Sepolia origin deployment script (network-guarded: 84532)
+│   ├── DeployDestination.s.sol         # Unichain Sepolia destination deployment script (network-guarded: 1301)
+│   ├── DeployReactive.s.sol            # Reactive Lasna deployment script (network-guarded: 5318007)
+│   └── ConfigureReactive.s.sol         # Reactive Lasna destination linking script (network-guarded: 5318007)
 ├── src/
 │   ├── interfaces/
 │   │   ├── IBorrowingController.sol    # Destination lending pool interface
@@ -207,7 +229,7 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 │       ├── CrossGuardCallback.t.sol    # Unit tests for callback proxy & sender authentication
 │       ├── CrossGuardReactive.t.sol    # Unit tests for reactive event filtering & validation
 │       ├── RiskController.t.sol        # Unit tests for fixed-point LTV math & event emission
-│       ├── ScriptPreflight.t.sol       # Unit tests for deployment network guards
+│       ├── ScriptPreflight.t.sol       # Unit tests for all 4 deployment network guards
 │       └── TestValuationSource.t.sol   # Unit tests for valuation oracle
 ├── .env.example                        # Template for multi-chain RPCs and contract addresses
 ├── foundry.toml                        # Foundry toolchain configuration (cancun, via_ir)
@@ -241,10 +263,10 @@ forge fmt --check
 # 3. Compile contracts and check bytecode sizes
 forge build --sizes
 
-# 4. Execute all 113 unit and integration tests with detailed traces
+# 4. Execute all 115 unit and integration tests with detailed traces
 forge test -vvv
 
-# 5. Generate coverage report
+# 5. Generate local coverage report
 forge coverage --ir-minimum
 ```
 
@@ -259,10 +281,10 @@ Ran 9 test suites:
 - test/unit/CrossGuardCallback.t.sol: 14 passed, 0 failed, 0 skipped
 - test/unit/ConfigurationConsistency.t.sol: 10 passed, 0 failed, 0 skipped
 - test/unit/TestValuationSource.t.sol: 4 passed, 0 failed, 0 skipped
-- test/unit/ScriptPreflight.t.sol: 2 passed, 0 failed, 0 skipped
+- test/unit/ScriptPreflight.t.sol: 4 passed, 0 failed, 0 skipped
 - test/integration/CrossGuardE2E.t.sol: 2 passed, 0 failed, 0 skipped
 
-Total: 113 passed, 0 failed, 0 skipped (100% pass rate)
+Total: 115 passed, 0 failed, 0 skipped (100% pass rate)
 ```
 
 ### Verified Contract Bytecode Sizes
@@ -276,7 +298,10 @@ Total: 113 passed, 0 failed, 0 skipped (100% pass rate)
 | `RiskController` | 1,826 B | 24,576 B | 22,750 B (92.6% margin) |
 | `TestValuationSource` | 695 B | 24,576 B | 23,881 B (97.2% margin) |
 
-### Verified Code Coverage (`forge coverage --ir-minimum`)
+### Local Code Coverage (`forge coverage --ir-minimum`)
+
+> [!NOTE]
+> Coverage numbers are measured locally using `forge coverage --ir-minimum`. The GitHub Actions CI workflow runs automated compilation, formatting, and unit tests, but does not run `forge coverage`.
 
 | Source File | Line Coverage | Statement Coverage | Branch Coverage | Function Coverage |
 | :--- | :--- | :--- | :--- | :--- |
@@ -287,6 +312,8 @@ Total: 113 passed, 0 failed, 0 skipped (100% pass rate)
 | `src/origin/TestValuationSource.sol` | **100.00%** (10/10) | **100.00%** (9/9) | **100.00%** (2/2) | **100.00%** (3/3) |
 | `src/reactive/CrossGuardReactive.sol` | **94.62%** (88/93) | **96.12%** (99/103) | **78.57%** (22/28) | **85.71%** (6/7) |
 | `script/ConfigureReactive.s.sol` | **55.56%** (15/27) | **60.61%** (20/33) | 0.00% (0/12) | **100.00%** (1/1) |
+| `script/DeployDestination.s.sol` | **44.44%** (12/27) | **45.16%** (14/31) | 0.00% (0/11) | **100.00%** (1/1) |
+| `script/DeployOrigin.s.sol` | **37.50%** (6/16) | **35.00%** (7/20) | 0.00% (0/2) | **100.00%** (1/1) |
 | `script/DeployReactive.s.sol` | **43.33%** (13/30) | **50.00%** (18/36) | 0.00% (0/17) | **100.00%** (1/1) |
 | **All Production Contracts Combined** | **> 94.0%** | **> 93.5%** | **> 84.0%** | **> 97.0%** |
 
@@ -294,12 +321,12 @@ Total: 113 passed, 0 failed, 0 skipped (100% pass rate)
 
 The repository runs automated GitHub Actions CI (`.github/workflows/test.yml`) validating `forge fmt --check`, `forge build --sizes`, and `forge test -vvv` on Ubuntu runners.
 
-- **M003.4.1 Baseline Commit:** `76345fd995acd74de74253d8207c970e973c9a97`
-- **CI Workflow Run ID:** `44812353299`
-- **CI Job ID:** `136551855949`
-- **CI Run Status:** `completed`
-- **CI Conclusion:** `success`
-- **Verified CI Run URL:** [GitHub Actions Run #44812353299](https://github.com/mahitss/Cross-Chain-Risk-Response-/actions/runs/44812353299/job/136551855949)
+- **Automated Steps:**
+  1. `forge --version`
+  2. `forge fmt --check`
+  3. `forge build --sizes`
+  4. `forge test -vvv`
+- *Note:* CI verifies formatting, build, and unit/integration tests on every push and pull request; coverage reporting is conducted locally.
 
 ---
 
@@ -331,6 +358,7 @@ Because `CrossGuardCallback` on Unichain Sepolia requires the deployed `CrossGua
 ### Deployment Commands
 
 #### Step 1: Deploy Origin Infrastructure (Base Sepolia)
+*Enforces `block.chainid == 84532` runtime preflight check:*
 ```bash
 forge script script/DeployOrigin.s.sol \
   --rpc-url $BASE_SEPOLIA_RPC \
@@ -338,7 +366,7 @@ forge script script/DeployOrigin.s.sol \
 ```
 
 #### Step 2: Deploy Reactive Engine (Reactive Lasna)
-*Requires `block.chainid == 5318007` runtime preflight check:*
+*Enforces `block.chainid == 5318007` runtime preflight check:*
 ```bash
 BASE_RISK_CONTROLLER=<deployed_controller_address> \
 forge script script/DeployReactive.s.sol \
@@ -347,7 +375,7 @@ forge script script/DeployReactive.s.sol \
 ```
 
 #### Step 3: Deploy Destination Infrastructure (Unichain Sepolia)
-*Requires deployed `REACTIVE_CROSSGUARD` address; rejects zero or EOA address:*
+*Enforces `block.chainid == 1301` runtime preflight check:*
 ```bash
 REACTIVE_CROSSGUARD=<deployed_reactive_contract_address> \
 forge script script/DeployDestination.s.sol \
@@ -356,7 +384,7 @@ forge script script/DeployDestination.s.sol \
 ```
 
 #### Step 4: Link Destination Callback in Reactive Contract (Reactive Lasna)
-*Requires `block.chainid == 5318007` runtime preflight check:*
+*Enforces `block.chainid == 5318007` runtime preflight check:*
 ```bash
 REACTIVE_CROSSGUARD=<deployed_reactive_contract_address> \
 UNICHAIN_CALLBACK_ADAPTER=<deployed_callback_adapter_address> \
