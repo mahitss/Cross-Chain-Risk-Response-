@@ -37,6 +37,7 @@ contract ConfigureReactive is Script {
 
         require(reactive.destinationCallback() == unichainCallbackAdapter, "Callback linking failed");
         require(reactive.destinationChainId() == UNICHAIN_SEPOLIA_CHAIN_ID, "Chain ID linking failed");
+        require(reactive.callbackGasLimit() == CALLBACK_GAS_LIMIT, "Gas limit linking failed");
         console.log("Successfully linked destination callback to CrossGuardReactive");
     }
 }

@@ -4,6 +4,7 @@ pragma solidity >=0.8.20;
 import {Test} from "forge-std/Test.sol";
 import {CrossGuardCallback} from "../../src/destination/CrossGuardCallback.sol";
 import {BorrowingController} from "../../src/destination/BorrowingController.sol";
+import {ICrossGuardCallback} from "../../src/interfaces/ICrossGuardCallback.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title CrossGuardCallbackTest
@@ -119,11 +120,56 @@ contract CrossGuardCallbackTest is Test {
         callbackReceiver.setBorrowingController(address(0x123));
     }
 
-    function testConstructorZeroAddressReverts() public {
+    function testConstructorZeroAddressRevert() public {
         vm.expectRevert(CrossGuardCallback.ZeroAddress.selector);
         new CrossGuardCallback(owner, address(0), address(borrowingController), deployedReactiveContract);
 
         vm.expectRevert(CrossGuardCallback.ZeroAddress.selector);
         new CrossGuardCallback(owner, callbackProxy, address(0), deployedReactiveContract);
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /*               M003.1 RECOVERY CALLBACK TESTS                               */
+    /* -------------------------------------------------------------------------- */
+
+    function testHandleRiskResolvedSuccessWithOmniReactiveAddress() public {
+        // First pause the borrowing controller
+        vm.prank(callbackProxy);
+        callbackReceiver.handleRiskBreach(deployedReactiveContract, positionId, 1, 8500, block.timestamp);
+        assertTrue(borrowingController.isBorrowingPaused(positionId));
+
+        // Now resolve via callback proxy
+        vm.prank(callbackProxy);
+        vm.expectEmit(true, true, true, true);
+        emit ICrossGuardCallback.RiskResolvedHandled(
+            positionId, deployedReactiveContract, 2, 4500, block.timestamp + 10
+        );
+
+        callbackReceiver.handleRiskResolved(deployedReactiveContract, positionId, 2, 4500, block.timestamp + 10);
+
+        assertFalse(borrowingController.isBorrowingPaused(positionId));
+        assertEq(borrowingController.lastProcessedNonce(positionId), 2);
+    }
+
+    function testRevertWhenUnauthorizedProxyCallsHandleRiskResolved() public {
+        address unauthorizedCaller = address(0x999);
+        vm.prank(unauthorizedCaller);
+        vm.expectRevert("Authorized sender only");
+        callbackReceiver.handleRiskResolved(deployedReactiveContract, positionId, 2, 4500, block.timestamp);
+    }
+
+    function testRevertWhenForgedReactiveSenderCallsHandleRiskResolved() public {
+        // First pause
+        vm.prank(callbackProxy);
+        callbackReceiver.handleRiskBreach(deployedReactiveContract, positionId, 1, 8500, block.timestamp);
+
+        address attackerContract = address(0x666);
+        vm.prank(callbackProxy);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CrossGuardCallback.UnauthorizedReactiveSender.selector, attackerContract, deployedReactiveContract
+            )
+        );
+        callbackReceiver.handleRiskResolved(attackerContract, positionId, 2, 4500, block.timestamp);
     }
 }

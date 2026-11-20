@@ -3,14 +3,15 @@ pragma solidity >=0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {CrossGuardReactive} from "../../src/reactive/CrossGuardReactive.sol";
-import {IReactive} from "reactive-lib/interfaces/IReactive.sol";
+import {MockOmniSystemContract} from "../mocks/MockOmniSystemContract.sol";
 import {ISystemContract} from "../../src/interfaces/ISystemContract.sol";
 import {ICrossGuardCallback} from "../../src/interfaces/ICrossGuardCallback.sol";
-import {MockOmniSystemContract} from "../mocks/MockOmniSystemContract.sol";
+import {IReactive} from "reactive-lib/interfaces/IReactive.sol";
 
 /// @title CrossGuardReactiveTest
-/// @notice Unit tests for CrossGuardReactive verifying Omni system callback dispatch, payload verification,
-///         removal of legacy events, and deployment flexibility.
+/// @notice Comprehensive unit tests for CrossGuardReactive running on Reactive Lasna (5318007).
+///         Validates constructor configuration, log filtering, single authoritative policy
+///         forwarding, zero gas limit rejection, and Omni v1 callback generation.
 contract CrossGuardReactiveTest is Test {
     CrossGuardReactive reactiveContract;
     MockOmniSystemContract mockSystem;
@@ -23,7 +24,6 @@ contract CrossGuardReactiveTest is Test {
     uint256 constant ORIGIN_CHAIN_ID = 84532; // Base Sepolia
     uint256 constant DEST_CHAIN_ID = 1301; // Unichain Sepolia
     uint64 constant GAS_LIMIT = 300_000;
-    uint256 constant MIN_THRESHOLD_BPS = 8000;
 
     bytes32 positionId = keccak256("position-1");
     address user = address(0x1234);
@@ -33,14 +33,7 @@ contract CrossGuardReactiveTest is Test {
 
         vm.prank(owner);
         reactiveContract = new CrossGuardReactive(
-            owner,
-            address(mockSystem),
-            ORIGIN_CHAIN_ID,
-            originRiskController,
-            DEST_CHAIN_ID,
-            destCallback,
-            GAS_LIMIT,
-            MIN_THRESHOLD_BPS
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, destCallback, GAS_LIMIT
         );
     }
 
@@ -50,14 +43,7 @@ contract CrossGuardReactiveTest is Test {
         vm.etch(omniSys, address(mockSystem).code);
 
         CrossGuardReactive defaultContract = new CrossGuardReactive(
-            owner,
-            address(0),
-            ORIGIN_CHAIN_ID,
-            originRiskController,
-            DEST_CHAIN_ID,
-            destCallback,
-            GAS_LIMIT,
-            MIN_THRESHOLD_BPS
+            owner, address(0), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, destCallback, GAS_LIMIT
         );
 
         assertEq(address(defaultContract.systemContract()), omniSys);
@@ -92,23 +78,21 @@ contract CrossGuardReactiveTest is Test {
             eventTimestamp
         );
 
-        // Calling from authorized system contract succeeds
         vm.prank(address(mockSystem));
         reactiveContract.react(log);
 
         assertEq(reactiveContract.reactCount(), 1);
         assertEq(mockSystem.requestedCallbackCount(), 1);
 
-        // Verify complete callback request properties
-        ISystemContract.CallbackConfiguration_V_1_0 memory recorded = mockSystem.getLastRequestedCallback();
-        assertEq(recorded.chainId, DEST_CHAIN_ID, "Destination chain mismatch");
-        assertEq(recorded.recipient, destCallback, "Recipient callback mismatch");
-        assertEq(recorded.gasLimit, GAS_LIMIT, "Gas limit mismatch");
-        assertEq(recorded.payload, expectedPayload, "Payload mismatch");
+        ISystemContract.CallbackConfiguration_V_1_0 memory cbReq = mockSystem.getLastRequestedCallback();
+        assertEq(cbReq.chainId, DEST_CHAIN_ID);
+        assertEq(cbReq.recipient, destCallback);
+        assertEq(cbReq.gasLimit, GAS_LIMIT);
+        assertEq(cbReq.payload, expectedPayload);
 
-        // Verify payload decoding
+        // Verify payload format
         bytes4 selector;
-        bytes memory p = recorded.payload;
+        bytes memory p = cbReq.payload;
         assembly {
             selector := mload(add(p, 32))
         }
@@ -124,8 +108,7 @@ contract CrossGuardReactiveTest is Test {
             originRiskController,
             DEST_CHAIN_ID,
             address(0), // Destination not yet deployed
-            GAS_LIMIT,
-            MIN_THRESHOLD_BPS
+            0
         );
 
         assertEq(lazyReactive.destinationCallback(), address(0));
@@ -236,7 +219,9 @@ contract CrossGuardReactiveTest is Test {
         assertEq(mockSystem.requestedCallbackCount(), 0);
     }
 
-    function testReactIgnoresBelowThreshold() public {
+    function testAuthoritativeOriginBreachDispatchedEvenWithModerateLtv() public {
+        // Origin RiskController is sole authority. If origin emitted RiskBreach,
+        // CrossGuardReactive unconditionally dispatches the callback without secondary threshold filtering.
         IReactive.LogRecord memory log = IReactive.LogRecord({
             chain_id: ORIGIN_CHAIN_ID,
             _contract: originRiskController,
@@ -244,7 +229,7 @@ contract CrossGuardReactiveTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(user)),
             topic_3: 1,
-            data: abi.encode(7000, 8000, block.timestamp), // 70% < 80%
+            data: abi.encode(7000, 8000, block.timestamp),
             block_number: 100,
             op_code: 0,
             block_hash: 0,
@@ -256,7 +241,7 @@ contract CrossGuardReactiveTest is Test {
         reactiveContract.react(log);
 
         assertEq(reactiveContract.reactCount(), 1);
-        assertEq(mockSystem.requestedCallbackCount(), 0);
+        assertEq(mockSystem.requestedCallbackCount(), 1);
     }
 
     function testSetDestinationConfig() public {
@@ -275,62 +260,95 @@ contract CrossGuardReactiveTest is Test {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidChainId.selector, 0));
         reactiveContract.setDestinationConfig(0, newCallback, 500_000);
-    }
-
-    function testSetMinRiskThresholdBpsValidations() public {
-        vm.prank(owner);
-        reactiveContract.setMinRiskThresholdBps(8500);
-        assertEq(reactiveContract.minRiskThresholdBps(), 8500);
 
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidThreshold.selector, 0));
-        reactiveContract.setMinRiskThresholdBps(0);
-
-        vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidThreshold.selector, 10_001));
-        reactiveContract.setMinRiskThresholdBps(10_001);
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidGasLimit.selector, 0));
+        reactiveContract.setDestinationConfig(11155111, newCallback, 0);
     }
 
     function testConstructorValidations() public {
         vm.expectRevert(CrossGuardReactive.ZeroAddress.selector);
         new CrossGuardReactive(
-            owner,
-            address(mockSystem),
-            ORIGIN_CHAIN_ID,
-            address(0),
-            DEST_CHAIN_ID,
-            destCallback,
-            GAS_LIMIT,
-            MIN_THRESHOLD_BPS
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, address(0), DEST_CHAIN_ID, destCallback, GAS_LIMIT
         );
 
         vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidChainId.selector, 0));
         new CrossGuardReactive(
-            owner,
-            address(mockSystem),
-            0,
-            originRiskController,
-            DEST_CHAIN_ID,
-            destCallback,
-            GAS_LIMIT,
-            MIN_THRESHOLD_BPS
+            owner, address(mockSystem), 0, originRiskController, DEST_CHAIN_ID, destCallback, GAS_LIMIT
         );
 
-        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidThreshold.selector, 0));
+        // When destCallback is provided, gasLimit == 0 must revert
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidGasLimit.selector, 0));
         new CrossGuardReactive(
-            owner, address(mockSystem), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, destCallback, GAS_LIMIT, 0
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, destCallback, 0
         );
 
-        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidThreshold.selector, 10_001));
+        // When destCallback is provided, destChainId == 0 must revert
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidChainId.selector, 0));
         new CrossGuardReactive(
-            owner,
-            address(mockSystem),
-            ORIGIN_CHAIN_ID,
-            originRiskController,
-            DEST_CHAIN_ID,
-            destCallback,
-            GAS_LIMIT,
-            10_001
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, originRiskController, 0, destCallback, GAS_LIMIT
         );
+    }
+
+    function testReactDispatchesOmniCallbackForRiskResolved() public {
+        uint256 nonce = 43;
+        uint256 recoveredLtv = 4500;
+        uint256 eventTimestamp = block.timestamp;
+
+        IReactive.LogRecord memory log = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(reactiveContract.RISK_RESOLVED_TOPIC_0()),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: nonce,
+            data: abi.encode(recoveredLtv, 8000, eventTimestamp),
+            block_number: 101,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        bytes memory expectedPayload = abi.encodeWithSignature(
+            "handleRiskResolved(address,bytes32,uint256,uint256,uint256)",
+            address(0),
+            positionId,
+            nonce,
+            recoveredLtv,
+            eventTimestamp
+        );
+
+        vm.prank(address(mockSystem));
+        reactiveContract.react(log);
+
+        assertEq(reactiveContract.reactCount(), 1);
+        assertEq(mockSystem.requestedCallbackCount(), 1);
+
+        ISystemContract.CallbackConfiguration_V_1_0 memory cbReq = mockSystem.getLastRequestedCallback();
+        assertEq(cbReq.chainId, DEST_CHAIN_ID);
+        assertEq(cbReq.recipient, destCallback);
+        assertEq(cbReq.gasLimit, GAS_LIMIT);
+        assertEq(cbReq.payload, expectedPayload);
+    }
+
+    function testReceiveAndWithdraw() public {
+        vm.deal(address(reactiveContract), 1 ether);
+        assertEq(address(reactiveContract).balance, 1 ether);
+
+        address payable payout = payable(address(0x8888));
+        vm.prank(owner);
+        reactiveContract.withdraw(payout, 0.4 ether);
+        assertEq(payout.balance, 0.4 ether);
+        assertEq(address(reactiveContract).balance, 0.6 ether);
+
+        vm.prank(owner);
+        vm.expectRevert(CrossGuardReactive.ZeroAddress.selector);
+        reactiveContract.withdraw(payable(address(0)), 0.1 ether);
+    }
+
+    function testPayReverts() public {
+        vm.expectRevert("Not implemented");
+        reactiveContract.pay(100);
     }
 }

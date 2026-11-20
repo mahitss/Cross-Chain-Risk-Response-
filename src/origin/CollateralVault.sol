@@ -2,6 +2,7 @@
 pragma solidity >=0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ICollateralVault} from "../interfaces/ICollateralVault.sol";
 import {ITestValuationSource} from "../interfaces/ITestValuationSource.sol";
 import {IRiskController} from "../interfaces/IRiskController.sol";
@@ -11,13 +12,16 @@ import {IRiskController} from "../interfaces/IRiskController.sol";
 /// @dev Token Decimal Convention:
 ///      - All collateral and debt asset balances are represented in 18 decimals (1e18).
 ///      - All valuation oracle asset prices are represented in 8 decimals (1e8, Chainlink convention).
-///      - Products are scaled cleanly by 1e18 to avoid precision truncation before ratio calculation.
+///      - Products are scaled cleanly by 1e18 using 512-bit intermediate math to avoid intermediate overflow.
 contract CollateralVault is ICollateralVault, Ownable {
     error ZeroAmount();
     error ZeroAddress();
     error UnauthorizedUser(address caller, address positionOwner);
     error PositionNotInitialized();
     error AssetMismatch(address provided, address expected);
+    error PositionInBreachedState(bytes32 positionId);
+    error PositionUnsafeOrBreached(bytes32 positionId, uint256 projectedLtvBps, uint256 thresholdBps);
+    error PositionUncollateralized(bytes32 positionId);
 
     struct Position {
         address user;
@@ -26,6 +30,9 @@ contract CollateralVault is ICollateralVault, Ownable {
         address debtAsset;
         uint256 debtAmount;
     }
+
+    event ValuationSourceUpdated(address indexed oldOracle, address indexed newOracle);
+    event RiskControllerUpdated(address indexed oldController, address indexed newController);
 
     ITestValuationSource public valuationSource;
     IRiskController public riskController;
@@ -45,13 +52,17 @@ contract CollateralVault is ICollateralVault, Ownable {
     /// @notice Updates the valuation oracle address.
     function setValuationSource(address _newOracle) external onlyOwner {
         if (_newOracle == address(0)) revert ZeroAddress();
+        address oldOracle = address(valuationSource);
         valuationSource = ITestValuationSource(_newOracle);
+        emit ValuationSourceUpdated(oldOracle, _newOracle);
     }
 
     /// @notice Updates the risk controller address.
     function setRiskController(address _newController) external onlyOwner {
         if (_newController == address(0)) revert ZeroAddress();
+        address oldController = address(riskController);
         riskController = IRiskController(_newController);
+        emit RiskControllerUpdated(oldController, _newController);
     }
 
     /// @notice Deposits collateral into a position.
@@ -79,8 +90,9 @@ contract CollateralVault is ICollateralVault, Ownable {
         emit CollateralDeposited(positionId, pos.user, asset, amount);
     }
 
-    /// @notice Records new borrowing against a position.
-    /// @dev Enforces exactly one debt asset per position for MVP.
+    /// @notice Records new borrowing against a position with origin-side safety checks.
+    /// @dev Rejects debt increases if position has zero collateral, is already breached,
+    ///      or if the projected borrow would exceed the risk threshold.
     function recordBorrow(bytes32 positionId, address asset, uint256 amount) external override {
         if (amount == 0) revert ZeroAmount();
         if (asset == address(0)) revert ZeroAddress();
@@ -99,11 +111,37 @@ contract CollateralVault is ICollateralVault, Ownable {
             revert AssetMismatch(asset, expectedAsset);
         }
 
-        pos.debtAmount += amount;
+        // 1. Position must not be in an active breached state
+        if (riskController.isPositionBreached(positionId)) {
+            revert PositionInBreachedState(positionId);
+        }
+
+        // 2. Position must have non-zero collateral to borrow
+        if (pos.collateralAmount == 0) {
+            revert PositionUncollateralized(positionId);
+        }
+
+        // 3. Compute valuations under current oracle pricing with full precision
+        uint256 collateralPrice = valuationSource.getAssetPrice(pos.collateralAsset);
+        uint256 debtPrice = valuationSource.getAssetPrice(asset);
+
+        uint256 collateralValueUsd = _computeValuationUsd(pos.collateralAmount, collateralPrice);
+        uint256 projectedDebtAmount = pos.debtAmount + amount;
+        uint256 projectedDebtValueUsd = _computeValuationUsd(projectedDebtAmount, debtPrice);
+
+        // 4. Prevent unsafe debt increase at origin
+        uint256 projectedLtv = riskController.calculateLtvBps(collateralValueUsd, projectedDebtValueUsd);
+        uint256 threshold = riskController.riskThresholdBps();
+        if (projectedLtv >= threshold) {
+            revert PositionUnsafeOrBreached(positionId, projectedLtv, threshold);
+        }
+
+        pos.debtAmount = projectedDebtAmount;
         emit BorrowRecorded(positionId, pos.user, asset, amount);
     }
 
-    /// @notice Evaluates position health and triggers RiskBreach via RiskController if unhealthy.
+    /// @notice Evaluates position health and triggers RiskBreach (or RiskResolved) via RiskController.
+    /// @dev Uses single canonical RiskController evaluation to guarantee identical LTV and breach state in all events.
     function evaluatePositionRisk(bytes32 positionId)
         external
         override
@@ -112,29 +150,36 @@ contract CollateralVault is ICollateralVault, Ownable {
         Position storage pos = _positions[positionId];
         if (pos.user == address(0)) revert PositionNotInitialized();
 
-        uint256 collateralPrice = valuationSource.getAssetPrice(pos.collateralAsset);
+        uint256 collateralPrice = pos.collateralAmount > 0 ? valuationSource.getAssetPrice(pos.collateralAsset) : 0;
         uint256 debtPrice = pos.debtAmount > 0 ? valuationSource.getAssetPrice(pos.debtAsset) : 0;
 
-        uint256 rawCollateralProduct = pos.collateralAmount * collateralPrice;
-        uint256 rawDebtProduct = pos.debtAmount * debtPrice;
-
-        uint256 calculatedLtv = 0;
-        if (rawCollateralProduct > 0) {
-            calculatedLtv = (rawDebtProduct * 10_000) / rawCollateralProduct;
-        } else if (rawDebtProduct > 0) {
-            calculatedLtv = 10_000;
-        }
-
-        uint256 collateralValueUsd = rawCollateralProduct / 1e18;
-        uint256 debtValueUsd = rawDebtProduct / 1e18;
-
-        bool projectedBreached = calculatedLtv >= riskController.riskThresholdBps();
-        uint256 projectedNonce = riskController.positionNonce(positionId) + (projectedBreached ? 1 : 0);
-        emit PositionEvaluated(
-            positionId, collateralValueUsd, debtValueUsd, calculatedLtv, projectedNonce, projectedBreached
-        );
+        uint256 collateralValueUsd = _computeValuationUsd(pos.collateralAmount, collateralPrice);
+        uint256 debtValueUsd = _computeValuationUsd(pos.debtAmount, debtPrice);
 
         (isBreached, ltvBps, nonce) = riskController.assessRisk(positionId, pos.user, collateralValueUsd, debtValueUsd);
+
+        emit PositionEvaluated(positionId, collateralValueUsd, debtValueUsd, ltvBps, nonce, isBreached);
+    }
+
+    /// @dev Computes full-precision USD valuation in 8 decimals: (amount * price) / 1e18.
+    ///      amount: 18 decimals, price: 8 decimals.
+    ///      If quotient exceeds type(uint256).max, deterministically returns type(uint256).max.
+    function _computeValuationUsd(uint256 amount, uint256 price) internal pure returns (uint256) {
+        if (amount == 0 || price == 0) return 0;
+
+        uint256 prod0;
+        uint256 prod1;
+        assembly {
+            let mm := mulmod(amount, price, not(0))
+            prod0 := mul(amount, price)
+            prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+        }
+
+        if (prod1 >= 1e18) {
+            return type(uint256).max;
+        }
+
+        return Math.mulDiv(amount, price, 1e18);
     }
 
     /// @notice Returns position details.

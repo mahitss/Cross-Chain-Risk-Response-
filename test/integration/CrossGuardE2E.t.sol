@@ -76,8 +76,7 @@ contract CrossGuardE2ETest is Test {
             address(riskController),
             DEST_CHAIN_ID,
             address(0), // Destination not yet deployed
-            CALLBACK_GAS_LIMIT,
-            RISK_THRESHOLD_BPS
+            0
         );
         assertEq(address(crossGuardReactive), predictedReactiveAddress);
 
@@ -114,13 +113,21 @@ contract CrossGuardE2ETest is Test {
         vm.expectRevert(abi.encodeWithSelector(BorrowingController.UnauthorizedBorrower.selector, bob, alice));
         borrowingController.borrow(positionId, 100e18);
 
-        // Step 3: Collateral value drops on Base Sepolia ($3,000 -> $2,300)
-        // Alice borrows another $2,000 USDC on Base -> Collateral: $4,600, Debt: $4,000 -> LTV: 86.95% (breach)
+        // Step 3: Alice borrows safely while collateral is healthy ($4,000 debt on $6,000 collateral -> 66.66% LTV)
+        vm.prank(alice);
+        vault.recordBorrow(positionId, mockUsdc, 2000e18);
+
+        // Market shock: Collateral value drops on Base Sepolia ($3,000 -> $2,300)
+        // Collateral: $4,600, Debt: $4,000 -> LTV: 86.95% (exceeds 80.00% threshold)
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 2300e8);
 
+        // Origin safety policy test: Alice cannot borrow any more debt once position is underwater
         vm.prank(alice);
-        vault.recordBorrow(positionId, mockUsdc, 2000e18);
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 8913, 8000)
+        );
+        vault.recordBorrow(positionId, mockUsdc, 100e18);
 
         // Step 4: Evaluate position risk on Base Sepolia and capture RiskBreach log
         vm.recordLogs();
@@ -215,15 +222,85 @@ contract CrossGuardE2ETest is Test {
             callbackProxy.executeCallback(cbReq.recipient, cbReq.payload, cbReq.gasLimit, legacyRvmId);
         assertFalse(legacySuccess, "Legacy RVM ID assumption must fail when expecting deployed contract address");
 
-        // Step 14: Emergency recovery by authorized owner
+        // Step 14: Verify stale breach protection on origin
+        // Oracle rebounds back to $3,000/WETH
         vm.prank(owner);
-        borrowingController.resumeBorrowing(positionId);
-        assertFalse(borrowingController.isBorrowingPaused(positionId), "Borrowing should be resumed");
+        oracle.setAssetPrice(mockWeth, 3000e8);
 
-        // Alice can borrow again
+        // Alice cannot borrow on origin before explicit risk evaluation clears breach state
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionInBreachedState.selector, positionId));
+        vault.recordBorrow(positionId, mockUsdc, 100e18);
+
+        // Ordinary owner resume cannot bypass active risk breach on destination
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(BorrowingController.CannotBypassActiveRiskBreach.selector, positionId));
+        borrowingController.resumeBorrowing(positionId);
+
+        // Step 15: Explicit origin healthy evaluation emits RiskResolved with monotonic nonce = 2
+        vm.recordLogs();
+        (bool recovered, uint256 recLtv, uint256 recNonce) = vault.evaluatePositionRisk(positionId);
+        assertFalse(recovered, "Position must now be healthy");
+        assertEq(recLtv, 6666, "LTV should be 6666 bps ($4,000 / $6,000)");
+        assertEq(recNonce, 2, "Monotonic nonce must be 2");
+
+        Vm.Log[] memory resolvedEntries = vm.getRecordedLogs();
+        bytes32 riskResolvedTopic0 = crossGuardReactive.RISK_RESOLVED_TOPIC_0();
+        Vm.Log memory resolvedLog;
+        bool foundResolved = false;
+        for (uint256 i = 0; i < resolvedEntries.length; i++) {
+            if (
+                resolvedEntries[i].emitter == address(riskController)
+                    && resolvedEntries[i].topics[0] == riskResolvedTopic0
+            ) {
+                resolvedLog = resolvedEntries[i];
+                foundResolved = true;
+                break;
+            }
+        }
+        assertTrue(foundResolved, "RiskResolved event must be emitted by RiskController");
+
+        // Step 16: Reactive Lasna processes RiskResolved and dispatches resolution callback
+        IReactive.LogRecord memory reactiveResolvedLog = IReactive.LogRecord({
+            chain_id: 84532,
+            _contract: address(riskController),
+            topic_0: uint256(resolvedLog.topics[0]),
+            topic_1: uint256(resolvedLog.topics[1]),
+            topic_2: uint256(resolvedLog.topics[2]),
+            topic_3: uint256(resolvedLog.topics[3]),
+            data: resolvedLog.data,
+            block_number: block.number,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        vm.prank(address(omniSys));
+        crossGuardReactive.react(reactiveResolvedLog);
+
+        assertEq(omniSys.requestedCallbackCount(), 2, "Omni system contract must have 2 callback requests");
+        ISystemContract.CallbackConfiguration_V_1_0 memory resCbReq = omniSys.getLastRequestedCallback();
+        assertEq(resCbReq.recipient, address(crossGuardCallback));
+
+        // Step 17: Destination Callback Proxy executes handleRiskResolved
+        (bool resCallbackSuccess,) = callbackProxy.executeCallback(
+            resCbReq.recipient, resCbReq.payload, resCbReq.gasLimit, address(crossGuardReactive)
+        );
+        assertTrue(resCallbackSuccess, "Destination resolution callback execution must succeed");
+
+        // Step 18: Destination borrowing is resumed and nonce is updated to 2
+        assertFalse(borrowingController.isBorrowingPaused(positionId), "Borrowing must be resumed");
+        assertEq(borrowingController.lastProcessedNonce(positionId), 2, "Processed nonce must equal 2");
+
+        // Step 19: Alice can borrow on Unichain again
         vm.prank(alice);
         borrowingController.borrow(positionId, 100e18);
         assertEq(borrowingController.positionBorrowDebt(positionId), 600e18);
+
+        // Step 20: Alice can borrow on Base again
+        vm.prank(alice);
+        vault.recordBorrow(positionId, mockUsdc, 100e18);
     }
 
     function testNoOmniCallbackWhenRiskIsWithinThreshold() public {
