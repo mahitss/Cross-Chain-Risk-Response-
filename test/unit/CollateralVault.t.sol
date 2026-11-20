@@ -25,7 +25,6 @@ contract CollateralVaultTest is Test {
     bytes32 positionId = keccak256("alice-position");
 
     event ValuationSourceUpdated(address indexed oldOracle, address indexed newOracle);
-    event RiskControllerUpdated(address indexed oldController, address indexed newController);
 
     function setUp() public {
         vm.startPrank(owner);
@@ -165,10 +164,10 @@ contract CollateralVaultTest is Test {
 
     function testSettersAndAdminControl() public {
         address newOracle = address(0x777);
-        address newRiskController = address(0x888);
-
         address oldOracle = address(vault.valuationSource());
-        address oldController = address(vault.riskController());
+
+        // RiskController is immutable to guarantee breach state continuity
+        assertEq(address(vault.riskController()), address(riskController));
 
         vm.startPrank(owner);
         vm.expectEmit(true, true, false, true);
@@ -176,21 +175,59 @@ contract CollateralVaultTest is Test {
         vault.setValuationSource(newOracle);
         assertEq(address(vault.valuationSource()), newOracle);
 
-        vm.expectEmit(true, true, false, true);
-        emit RiskControllerUpdated(oldController, newRiskController);
-        vault.setRiskController(newRiskController);
-        assertEq(address(vault.riskController()), newRiskController);
-
         vm.expectRevert(CollateralVault.ZeroAddress.selector);
         vault.setValuationSource(address(0));
-
-        vm.expectRevert(CollateralVault.ZeroAddress.selector);
-        vault.setRiskController(address(0));
         vm.stopPrank();
 
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
         vault.setValuationSource(newOracle);
+    }
+
+    function testRiskControllerImmutabilityPreservesBreachContinuity() public {
+        // 1. Establish position and deposit collateral
+        vm.startPrank(alice);
+        vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000 collateral
+        vault.recordBorrow(positionId, mockUsdc, 4000e18); // $4,000 debt (66.66% LTV)
+        vm.stopPrank();
+
+        // 2. Market shock causes breach (WETH drops from $3,000 to $2,000 -> $4,000 collateral, $4,000 debt = 100% LTV)
+        vm.prank(owner);
+        oracle.setAssetPrice(mockWeth, 2000e8);
+
+        (bool isBreached,,) = vault.evaluatePositionRisk(positionId);
+        assertTrue(isBreached, "Position must be breached");
+        assertTrue(riskController.isPositionBreached(positionId), "Breach recorded in risk controller");
+
+        // 3. Immutability guarantee: risk controller reference cannot be manipulated or swapped
+        assertEq(address(vault.riskController()), address(riskController));
+
+        // 4. Further borrowing is strictly rejected while breach is active
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionInBreachedState.selector, positionId));
+        vault.recordBorrow(positionId, mockUsdc, 100e18);
+
+        // 5. Oracle price recovers (WETH goes to $4,000 -> $8,000 collateral, $4,000 debt = 50% LTV)
+        vm.prank(owner);
+        oracle.setAssetPrice(mockWeth, 4000e8);
+
+        // 6. Stale breach protection: borrow still rejected until explicit evaluation
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionInBreachedState.selector, positionId));
+        vault.recordBorrow(positionId, mockUsdc, 100e18);
+
+        // 7. Explicit evaluation clears breach in the immutable controller
+        (bool recoveredBreached, uint256 newLtv,) = vault.evaluatePositionRisk(positionId);
+        assertFalse(recoveredBreached, "Breach cleared after explicit evaluation");
+        assertEq(newLtv, 5000);
+        assertFalse(riskController.isPositionBreached(positionId), "Breach cleared in controller");
+
+        // 8. Borrowing is now successfully permitted
+        vm.prank(alice);
+        vault.recordBorrow(positionId, mockUsdc, 500e18);
+        (,,, address debtAsset, uint256 debtAmount) = vault.getPosition(positionId);
+        assertEq(debtAsset, mockUsdc);
+        assertEq(debtAmount, 4500e18);
     }
 
     function testConstructorZeroAddressRevert() public {
@@ -209,8 +246,8 @@ contract CollateralVaultTest is Test {
         vm.prank(alice);
         vault.depositCollateral(positionId, mockWeth, 1e18);
 
-        // Zero out collateralAmount in storage (mapping at slot 3 + offset 2)
-        bytes32 colAmountSlot = bytes32(uint256(keccak256(abi.encode(positionId, uint256(3)))) + 2);
+        // Zero out collateralAmount in storage (_positions mapping at slot 2 since riskController is immutable)
+        bytes32 colAmountSlot = bytes32(uint256(keccak256(abi.encode(positionId, uint256(2)))) + 2);
         vm.store(address(vault), colAmountSlot, bytes32(0));
 
         (,, uint256 colAmount,,) = vault.getPosition(positionId);

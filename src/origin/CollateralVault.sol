@@ -32,10 +32,10 @@ contract CollateralVault is ICollateralVault, Ownable {
     }
 
     event ValuationSourceUpdated(address indexed oldOracle, address indexed newOracle);
-    event RiskControllerUpdated(address indexed oldController, address indexed newController);
 
     ITestValuationSource public valuationSource;
-    IRiskController public riskController;
+    /// @notice Authoritative risk controller, configured immutably at deployment to preserve breach state continuity.
+    IRiskController public immutable riskController;
 
     mapping(bytes32 => Position) private _positions;
     mapping(bytes32 => address) public override positionCollateralAsset;
@@ -55,14 +55,6 @@ contract CollateralVault is ICollateralVault, Ownable {
         address oldOracle = address(valuationSource);
         valuationSource = ITestValuationSource(_newOracle);
         emit ValuationSourceUpdated(oldOracle, _newOracle);
-    }
-
-    /// @notice Updates the risk controller address.
-    function setRiskController(address _newController) external onlyOwner {
-        if (_newController == address(0)) revert ZeroAddress();
-        address oldController = address(riskController);
-        riskController = IRiskController(_newController);
-        emit RiskControllerUpdated(oldController, _newController);
     }
 
     /// @notice Deposits collateral into a position.

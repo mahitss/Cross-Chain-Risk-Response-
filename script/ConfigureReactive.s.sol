@@ -20,13 +20,23 @@ contract ConfigureReactive is Script {
         if (reactiveContractAddress == address(0) || unichainCallbackAdapter == address(0)) {
             revert("Target addresses cannot be zero");
         }
+        if (reactiveContractAddress == deployer) {
+            revert("REACTIVE_CROSSGUARD cannot be deployer EOA: must be deployed CrossGuardReactive contract address");
+        }
         if (unichainCallbackAdapter == deployer) {
-            revert("UNICHAIN_CALLBACK_ADAPTER cannot be deployer EOA");
+            revert(
+                "UNICHAIN_CALLBACK_ADAPTER cannot be deployer EOA: must be deployed CrossGuardCallback contract address"
+            );
+        }
+        if (CALLBACK_GAS_LIMIT == 0) {
+            revert("CALLBACK_GAS_LIMIT cannot be zero");
         }
 
         console.log("=== Linking Destination Callback to CrossGuardReactive on Lasna ===");
         console.log("Reactive Contract:", reactiveContractAddress);
         console.log("Destination Callback Adapter:", unichainCallbackAdapter);
+        console.log("Destination Chain ID:", UNICHAIN_SEPOLIA_CHAIN_ID);
+        console.log("Callback Gas Limit:", CALLBACK_GAS_LIMIT);
 
         vm.startBroadcast(deployerPrivateKey);
 
@@ -35,9 +45,10 @@ contract ConfigureReactive is Script {
 
         vm.stopBroadcast();
 
-        require(reactive.destinationCallback() == unichainCallbackAdapter, "Callback linking failed");
-        require(reactive.destinationChainId() == UNICHAIN_SEPOLIA_CHAIN_ID, "Chain ID linking failed");
-        require(reactive.callbackGasLimit() == CALLBACK_GAS_LIMIT, "Gas limit linking failed");
+        // Independent state confirmation
+        require(reactive.destinationCallback() == unichainCallbackAdapter, "Callback linking failed: mismatch");
+        require(reactive.destinationChainId() == UNICHAIN_SEPOLIA_CHAIN_ID, "Chain ID linking failed: mismatch");
+        require(reactive.callbackGasLimit() == CALLBACK_GAS_LIMIT, "Gas limit linking failed: mismatch");
         console.log("Successfully linked destination callback to CrossGuardReactive");
     }
 }

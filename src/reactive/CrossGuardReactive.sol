@@ -8,16 +8,21 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 /// @title CrossGuardReactive
 /// @notice Autonomous Reactive Contract deployed on Reactive Lasna (5318007).
 ///         Uses current Reactive Omni system interface (0x8888888888888888888888888888888888888888)
-///         to detect RiskBreach on Base Sepolia (84532) and request callback to Unichain Sepolia (1301).
-///         The origin RiskController is the sole authoritative policy engine for risk decisions.
+///         to intercept RiskBreach and RiskResolved events on Base Sepolia (84532) and request callbacks
+///         to Unichain Sepolia (1301).
+///         Enforces single authoritative risk policy from origin, strict event payload integrity,
+///         and supported-chain topology allowlisting.
 contract CrossGuardReactive is IReactive, Ownable {
     error ZeroAddress();
     error UnauthorizedCaller(address caller);
-    error InvalidChainId(uint256 chainId);
+    error UnsupportedChainId(uint256 chainId);
     error InvalidGasLimit(uint64 gasLimit);
 
     address public constant OMNI_SYSTEM_CONTRACT = 0x8888888888888888888888888888888888888888;
     uint256 internal constant REACTIVE_IGNORE = 0xa65f96fc951c35ead38878e0f0b7a3c744a6f5ccc1476b313353ce31712313ad;
+
+    uint256 public constant BASE_SEPOLIA_CHAIN_ID = 84532;
+    uint256 public constant UNICHAIN_SEPOLIA_CHAIN_ID = 1301;
 
     bytes32 public constant RISK_BREACH_TOPIC_0 =
         keccak256("RiskBreach(bytes32,address,uint256,uint256,uint256,uint256)");
@@ -40,6 +45,9 @@ contract CrossGuardReactive is IReactive, Ownable {
     event ReactiveResolvedProcessed(
         bytes32 indexed positionId, uint256 indexed nonce, uint256 riskLevel, uint256 timestamp
     );
+    event ReactiveEventRejected(
+        bytes32 indexed topic0, bytes32 indexed positionId, uint256 indexed nonce, string reason
+    );
 
     modifier onlySystem() {
         if (msg.sender != address(systemContract)) {
@@ -60,15 +68,21 @@ contract CrossGuardReactive is IReactive, Ownable {
         if (_originRiskController == address(0)) {
             revert ZeroAddress();
         }
-        if (_originChainId == 0) {
-            revert InvalidChainId(0);
+        if (_originChainId != BASE_SEPOLIA_CHAIN_ID) {
+            revert UnsupportedChainId(_originChainId);
         }
+
         if (_destCallback != address(0)) {
-            if (_destChainId == 0) {
-                revert InvalidChainId(0);
+            if (_destChainId != UNICHAIN_SEPOLIA_CHAIN_ID) {
+                revert UnsupportedChainId(_destChainId);
             }
             if (_gasLimit == 0) {
                 revert InvalidGasLimit(0);
+            }
+        } else {
+            // Stage 1 of two-stage deployment: destCallback is address(0)
+            if (_destChainId != 0 && _destChainId != UNICHAIN_SEPOLIA_CHAIN_ID) {
+                revert UnsupportedChainId(_destChainId);
             }
         }
 
@@ -77,7 +91,7 @@ contract CrossGuardReactive is IReactive, Ownable {
 
         originChainId = _originChainId;
         originRiskController = _originRiskController;
-        destinationChainId = _destChainId;
+        destinationChainId = _destCallback == address(0) ? 0 : _destChainId;
         destinationCallback = _destCallback;
         callbackGasLimit = _destCallback == address(0) ? 0 : _gasLimit;
 
@@ -102,10 +116,10 @@ contract CrossGuardReactive is IReactive, Ownable {
         );
     }
 
-    /// @notice Updates destination callback configuration.
+    /// @notice Updates destination callback configuration strictly within MVP supported topology.
     function setDestinationConfig(uint256 _destChainId, address _destCallback, uint64 _gasLimit) external onlyOwner {
         if (_destCallback == address(0)) revert ZeroAddress();
-        if (_destChainId == 0) revert InvalidChainId(0);
+        if (_destChainId != UNICHAIN_SEPOLIA_CHAIN_ID) revert UnsupportedChainId(_destChainId);
         if (_gasLimit == 0) revert InvalidGasLimit(0);
 
         destinationChainId = _destChainId;
@@ -120,27 +134,89 @@ contract CrossGuardReactive is IReactive, Ownable {
     function react(LogRecord calldata log) external override onlySystem {
         reactCount++;
 
-        // 1. Verify origin chain and emitter contract
-        if (log.chain_id != originChainId || log._contract != originRiskController) {
-            return;
-        }
-
-        // 2. Ensure destination callback is configured
-        if (destinationCallback == address(0) || destinationChainId == 0 || callbackGasLimit == 0) {
-            return;
-        }
-
+        bytes32 topic0 = bytes32(log.topic_0);
         bytes32 positionId = bytes32(log.topic_1);
         uint256 nonce = log.topic_3;
 
-        // 3. Handle RiskBreach event
-        if (log.topic_0 == uint256(RISK_BREACH_TOPIC_0)) {
-            (uint256 currentLtvBps,, uint256 timestamp) = abi.decode(log.data, (uint256, uint256, uint256));
+        // 1. Origin Chain ID validation
+        if (log.chain_id != originChainId) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "WRONG_CHAIN_ID");
+            return;
+        }
 
-            // Origin RiskController is the sole authority for threshold breach decisions.
-            // Valid origin RiskBreach events are dispatched unconditionally to destination.
+        // 2. Origin Emitter validation
+        if (log._contract != originRiskController) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "WRONG_EMITTER");
+            return;
+        }
 
-            // Build destination callback payload for pause
+        // 3. Destination Configuration check (fail-closed if unconfigured)
+        if (
+            destinationCallback == address(0) || destinationChainId != UNICHAIN_SEPOLIA_CHAIN_ID
+                || callbackGasLimit == 0
+        ) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "DESTINATION_NOT_CONFIGURED");
+            return;
+        }
+
+        // 4. Topic 0 validation (must be either RiskBreach or RiskResolved)
+        bool isBreach = (topic0 == RISK_BREACH_TOPIC_0);
+        bool isResolved = (topic0 == RISK_RESOLVED_TOPIC_0);
+
+        if (!isBreach && !isResolved) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "WRONG_EVENT_TOPIC");
+            return;
+        }
+
+        // 5. Indexed Position ID validation
+        if (positionId == bytes32(0)) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "ZERO_POSITION_ID");
+            return;
+        }
+
+        // 6. Indexed User Address validation (upper 12 bytes must be 0, address non-zero)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if ((log.topic_2 >> 160) != 0 || address(uint160(log.topic_2)) == address(0)) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "INVALID_INDEXED_USER");
+            return;
+        }
+
+        // 7. Indexed Nonce validation (RiskController nonces start at 1)
+        if (nonce == 0) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "ZERO_NONCE");
+            return;
+        }
+
+        // 8. Event Data Length validation: exactly 3 ABI-encoded uint256 words = 96 bytes
+        // (currentLtvBps, riskThresholdBps, timestamp)
+        if (log.data.length != 96) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "INVALID_DATA_LENGTH");
+            return;
+        }
+
+        (uint256 currentLtvBps, uint256 riskThresholdBps, uint256 timestamp) =
+            abi.decode(log.data, (uint256, uint256, uint256));
+
+        // 9. Threshold range validation (1 bps to 10,000 bps)
+        if (riskThresholdBps == 0 || riskThresholdBps > 10_000) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "INVALID_THRESHOLD");
+            return;
+        }
+
+        // 10. Timestamp validation
+        if (timestamp == 0) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "INVALID_TIMESTAMP");
+            return;
+        }
+
+        // 11. Semantic validation of risk evaluation
+        if (isBreach) {
+            // For a breach, current LTV must be >= threshold
+            if (currentLtvBps < riskThresholdBps) {
+                emit ReactiveEventRejected(topic0, positionId, nonce, "BREACH_BELOW_THRESHOLD");
+                return;
+            }
+
             bytes memory payload = abi.encodeWithSignature(
                 "handleRiskBreach(address,bytes32,uint256,uint256,uint256)",
                 address(0),
@@ -160,12 +236,13 @@ contract CrossGuardReactive is IReactive, Ownable {
                     payload: payload
                 })
             );
-        }
-        // 4. Handle RiskResolved event
-        else if (log.topic_0 == uint256(RISK_RESOLVED_TOPIC_0)) {
-            (uint256 currentLtvBps,, uint256 timestamp) = abi.decode(log.data, (uint256, uint256, uint256));
+        } else {
+            // For resolution, current LTV must be < threshold
+            if (currentLtvBps >= riskThresholdBps) {
+                emit ReactiveEventRejected(topic0, positionId, nonce, "RESOLVED_NOT_BELOW_THRESHOLD");
+                return;
+            }
 
-            // Build destination callback payload for resolution
             bytes memory payload = abi.encodeWithSignature(
                 "handleRiskResolved(address,bytes32,uint256,uint256,uint256)",
                 address(0),
