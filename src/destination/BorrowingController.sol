@@ -10,6 +10,7 @@ import {IBorrowingController} from "../interfaces/IBorrowingController.sol";
 contract BorrowingController is IBorrowingController, Ownable {
     error UnauthorizedCallback(address caller);
     error UnauthorizedBorrower(address caller, address expectedOwner);
+    error InvalidPositionId();
     error UnregisteredPosition(bytes32 positionId);
     error PositionAlreadyRegistered(bytes32 positionId);
     error BorrowingIsPaused(bytes32 positionId);
@@ -49,6 +50,7 @@ contract BorrowingController is IBorrowingController, Ownable {
 
     /// @notice Registers a position to msg.sender as the trusted position owner.
     function registerPosition(bytes32 positionId) external override {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         if (positionOwners[positionId] != address(0)) {
             revert PositionAlreadyRegistered(positionId);
         }
@@ -58,6 +60,7 @@ contract BorrowingController is IBorrowingController, Ownable {
 
     /// @notice Administratively registers a position to a specified owner.
     function registerPositionFor(bytes32 positionId, address positionOwner) external override onlyOwner {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         if (positionOwner == address(0)) revert ZeroAddress();
         if (positionOwners[positionId] != address(0)) {
             revert PositionAlreadyRegistered(positionId);
@@ -73,6 +76,7 @@ contract BorrowingController is IBorrowingController, Ownable {
         override
         onlyCallbackAdapter
     {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         uint256 lastNonce = lastProcessedNonce[positionId];
         if (nonce <= lastNonce) {
             revert InvalidNonce(nonce, lastNonce);
@@ -93,6 +97,7 @@ contract BorrowingController is IBorrowingController, Ownable {
         override
         onlyCallbackAdapter
     {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         uint256 lastNonce = lastProcessedNonce[positionId];
         if (nonce <= lastNonce) {
             revert InvalidNonce(nonce, lastNonce);
@@ -111,6 +116,7 @@ contract BorrowingController is IBorrowingController, Ownable {
 
     /// @notice Separate administrative emergency circuit breaker to pause borrowing.
     function emergencyPauseBorrowing(bytes32 positionId) external override onlyOwner {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         isBorrowingPaused[positionId] = true;
         emit EmergencyBorrowingPaused(positionId);
     }
@@ -119,6 +125,7 @@ contract BorrowingController is IBorrowingController, Ownable {
     /// @dev Strictly reverts if the position was paused due to an active risk breach,
     ///      preventing ordinary owner actions from silently bypassing unresolved risk conditions.
     function resumeBorrowing(bytes32 positionId) external override onlyOwner {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         if (pausedByRiskBreach[positionId]) {
             revert CannotBypassActiveRiskBreach(positionId);
         }
@@ -132,6 +139,7 @@ contract BorrowingController is IBorrowingController, Ownable {
     /// @notice Emergency administrative override to resume borrowing with an explicit reason and audit event.
     /// @dev Used only when cross-chain relay is permanently unavailable and remediation has been attested.
     function emergencyResumeBorrowing(bytes32 positionId, string calldata reason) external override onlyOwner {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         if (bytes(reason).length == 0) revert EmptyEmergencyReason();
         if (!isBorrowingPaused[positionId]) revert PositionNotPaused(positionId);
 
@@ -145,6 +153,7 @@ contract BorrowingController is IBorrowingController, Ownable {
     /// @notice Executes borrowing for a position.
     /// @dev Enforces position registration, position owner authorization, and pause state.
     function borrow(bytes32 positionId, uint256 amount) external override {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         address posOwner = positionOwners[positionId];
         if (posOwner == address(0)) {
             revert UnregisteredPosition(positionId);

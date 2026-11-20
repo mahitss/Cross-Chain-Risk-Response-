@@ -7,6 +7,7 @@ import {CrossGuardReactive} from "../src/reactive/CrossGuardReactive.sol";
 /// @title ConfigureReactive
 /// @notice Links the deployed Unichain Sepolia destination callback adapter into CrossGuardReactive on Lasna.
 contract ConfigureReactive is Script {
+    uint256 constant REACTIVE_LASNA_CHAIN_ID = 5318007;
     uint256 constant UNICHAIN_SEPOLIA_CHAIN_ID = 1301;
     uint64 constant CALLBACK_GAS_LIMIT = 300_000;
 
@@ -37,6 +38,12 @@ contract ConfigureReactive is Script {
         console.log("Destination Callback Adapter:", unichainCallbackAdapter);
         console.log("Destination Chain ID:", UNICHAIN_SEPOLIA_CHAIN_ID);
         console.log("Callback Gas Limit:", CALLBACK_GAS_LIMIT);
+
+        // Fail-closed execution network preflight guard
+        require(
+            block.chainid == REACTIVE_LASNA_CHAIN_ID,
+            "Unsupported execution network: must run on Reactive Lasna (5318007)"
+        );
 
         vm.startBroadcast(deployerPrivateKey);
 

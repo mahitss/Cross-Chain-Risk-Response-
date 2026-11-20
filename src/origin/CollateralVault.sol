@@ -16,6 +16,7 @@ import {IRiskController} from "../interfaces/IRiskController.sol";
 contract CollateralVault is ICollateralVault, Ownable {
     error ZeroAmount();
     error ZeroAddress();
+    error InvalidPositionId();
     error UnauthorizedUser(address caller, address positionOwner);
     error PositionNotInitialized();
     error AssetMismatch(address provided, address expected);
@@ -60,6 +61,7 @@ contract CollateralVault is ICollateralVault, Ownable {
     /// @notice Deposits collateral into a position.
     /// @dev Enforces exactly one collateral asset per position for MVP.
     function depositCollateral(bytes32 positionId, address asset, uint256 amount) external override {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         if (amount == 0) revert ZeroAmount();
         if (asset == address(0)) revert ZeroAddress();
 
@@ -86,6 +88,7 @@ contract CollateralVault is ICollateralVault, Ownable {
     /// @dev Rejects debt increases if position has zero collateral, is already breached,
     ///      or if the projected borrow would exceed the risk threshold.
     function recordBorrow(bytes32 positionId, address asset, uint256 amount) external override {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         if (amount == 0) revert ZeroAmount();
         if (asset == address(0)) revert ZeroAddress();
 
@@ -139,6 +142,7 @@ contract CollateralVault is ICollateralVault, Ownable {
         override
         returns (bool isBreached, uint256 ltvBps, uint256 nonce)
     {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         Position storage pos = _positions[positionId];
         if (pos.user == address(0)) revert PositionNotInitialized();
 

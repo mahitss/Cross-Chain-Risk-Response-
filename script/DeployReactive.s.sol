@@ -9,6 +9,7 @@ import {CrossGuardReactive} from "../src/reactive/CrossGuardReactive.sol";
 ///         Subscribes to Base Sepolia RiskController (84532); destination callback can be configured
 ///         at deployment or linked post-destination deployment via setDestinationConfig for Unichain Sepolia (1301).
 contract DeployReactive is Script {
+    uint256 constant REACTIVE_LASNA_CHAIN_ID = 5318007;
     uint256 constant BASE_SEPOLIA_CHAIN_ID = 84532;
     uint256 constant UNICHAIN_SEPOLIA_CHAIN_ID = 1301;
     uint64 constant CALLBACK_GAS_LIMIT = 300_000;
@@ -38,6 +39,12 @@ contract DeployReactive is Script {
         console.log("Deployer Address:", deployer);
         console.log("Subscribing to RiskController on Base Sepolia (84532):", baseRiskController);
         console.log("Initial Callback on Unichain Sepolia (1301):", unichainCallbackAdapter);
+
+        // Fail-closed execution network preflight guard
+        require(
+            block.chainid == REACTIVE_LASNA_CHAIN_ID,
+            "Unsupported execution network: must run on Reactive Lasna (5318007)"
+        );
 
         vm.startBroadcast(deployerPrivateKey);
 

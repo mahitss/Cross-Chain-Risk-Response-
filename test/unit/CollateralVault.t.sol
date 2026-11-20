@@ -410,4 +410,20 @@ contract CollateralVaultTest is Test {
         assertFalse(isBreached);
         assertEq(ltv, 0);
     }
+
+    function testRevertWhenZeroPositionIdUsed() public {
+        // Zero position ID rejected on depositCollateral
+        vm.prank(alice);
+        vm.expectRevert(CollateralVault.InvalidPositionId.selector);
+        vault.depositCollateral(bytes32(0), mockWeth, 1e18);
+
+        // Zero position ID rejected on recordBorrow
+        vm.prank(alice);
+        vm.expectRevert(CollateralVault.InvalidPositionId.selector);
+        vault.recordBorrow(bytes32(0), mockUsdc, 100e18);
+
+        // Zero position ID rejected on evaluatePositionRisk
+        vm.expectRevert(CollateralVault.InvalidPositionId.selector);
+        vault.evaluatePositionRisk(bytes32(0));
+    }
 }

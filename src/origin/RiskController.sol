@@ -19,6 +19,7 @@ import {IRiskController} from "../interfaces/IRiskController.sol";
 ///      - Unrepresentable quotients (> type(uint256).max) deterministically return type(uint256).max.
 contract RiskController is IRiskController, Ownable {
     error ZeroAddress();
+    error InvalidPositionId();
     error UnauthorizedVault(address caller);
     error InvalidThreshold(uint256 thresholdBps);
 
@@ -103,6 +104,7 @@ contract RiskController is IRiskController, Ownable {
         onlyAuthorizedVault
         returns (bool isBreached, uint256 currentLtvBps, uint256 nonce)
     {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         currentLtvBps = calculateLtvBps(collateralValueUsd, debtValueUsd);
 
         if (currentLtvBps >= riskThresholdBps) {

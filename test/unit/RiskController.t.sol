@@ -248,4 +248,10 @@ contract RiskControllerTest is Test {
             assertEq(ltv, 10_000);
         }
     }
+
+    function testRevertAssessRiskZeroPositionId() public {
+        vm.prank(vault);
+        vm.expectRevert(RiskController.InvalidPositionId.selector);
+        controller.assessRisk(bytes32(0), user, 10_000e8, 5000e8);
+    }
 }

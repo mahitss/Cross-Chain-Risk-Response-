@@ -172,4 +172,14 @@ contract CrossGuardCallbackTest is Test {
         );
         callbackReceiver.handleRiskResolved(attackerContract, positionId, 2, 4500, block.timestamp);
     }
+
+    function testRevertWhenZeroPositionIdUsed() public {
+        vm.prank(callbackProxy);
+        vm.expectRevert(CrossGuardCallback.InvalidPositionId.selector);
+        callbackReceiver.handleRiskBreach(deployedReactiveContract, bytes32(0), 1, 8500, block.timestamp);
+
+        vm.prank(callbackProxy);
+        vm.expectRevert(CrossGuardCallback.InvalidPositionId.selector);
+        callbackReceiver.handleRiskResolved(deployedReactiveContract, bytes32(0), 2, 4500, block.timestamp);
+    }
 }
