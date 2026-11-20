@@ -24,6 +24,9 @@ contract CollateralVaultTest is Test {
 
     bytes32 positionId = keccak256("alice-position");
 
+    event ValuationSourceUpdated(address indexed oldOracle, address indexed newOracle);
+    event RiskControllerUpdated(address indexed oldController, address indexed newController);
+
     function setUp() public {
         vm.startPrank(owner);
         oracle = new TestValuationSource(owner);
@@ -164,10 +167,17 @@ contract CollateralVaultTest is Test {
         address newOracle = address(0x777);
         address newRiskController = address(0x888);
 
+        address oldOracle = address(vault.valuationSource());
+        address oldController = address(vault.riskController());
+
         vm.startPrank(owner);
+        vm.expectEmit(true, true, false, true);
+        emit ValuationSourceUpdated(oldOracle, newOracle);
         vault.setValuationSource(newOracle);
         assertEq(address(vault.valuationSource()), newOracle);
 
+        vm.expectEmit(true, true, false, true);
+        emit RiskControllerUpdated(oldController, newRiskController);
         vault.setRiskController(newRiskController);
         assertEq(address(vault.riskController()), newRiskController);
 

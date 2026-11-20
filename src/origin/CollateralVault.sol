@@ -31,6 +31,9 @@ contract CollateralVault is ICollateralVault, Ownable {
         uint256 debtAmount;
     }
 
+    event ValuationSourceUpdated(address indexed oldOracle, address indexed newOracle);
+    event RiskControllerUpdated(address indexed oldController, address indexed newController);
+
     ITestValuationSource public valuationSource;
     IRiskController public riskController;
 
@@ -49,13 +52,17 @@ contract CollateralVault is ICollateralVault, Ownable {
     /// @notice Updates the valuation oracle address.
     function setValuationSource(address _newOracle) external onlyOwner {
         if (_newOracle == address(0)) revert ZeroAddress();
+        address oldOracle = address(valuationSource);
         valuationSource = ITestValuationSource(_newOracle);
+        emit ValuationSourceUpdated(oldOracle, _newOracle);
     }
 
     /// @notice Updates the risk controller address.
     function setRiskController(address _newController) external onlyOwner {
         if (_newController == address(0)) revert ZeroAddress();
+        address oldController = address(riskController);
         riskController = IRiskController(_newController);
+        emit RiskControllerUpdated(oldController, _newController);
     }
 
     /// @notice Deposits collateral into a position.

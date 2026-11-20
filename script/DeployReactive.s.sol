@@ -12,7 +12,6 @@ contract DeployReactive is Script {
     uint256 constant BASE_SEPOLIA_CHAIN_ID = 84532;
     uint256 constant UNICHAIN_SEPOLIA_CHAIN_ID = 1301;
     uint64 constant CALLBACK_GAS_LIMIT = 300_000;
-    uint256 constant DEFAULT_RISK_THRESHOLD_BPS = 8000; // 80%
 
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -43,8 +42,7 @@ contract DeployReactive is Script {
             baseRiskController,
             UNICHAIN_SEPOLIA_CHAIN_ID,
             unichainCallbackAdapter,
-            CALLBACK_GAS_LIMIT,
-            DEFAULT_RISK_THRESHOLD_BPS
+            unichainCallbackAdapter == address(0) ? 0 : CALLBACK_GAS_LIMIT
         );
 
         console.log("CrossGuardReactive successfully deployed at:", address(reactiveContract));
@@ -54,7 +52,6 @@ contract DeployReactive is Script {
         // Verification
         require(reactiveContract.originRiskController() == baseRiskController, "Origin controller mismatch");
         require(reactiveContract.originChainId() == BASE_SEPOLIA_CHAIN_ID, "Origin chain mismatch");
-        require(reactiveContract.minRiskThresholdBps() == DEFAULT_RISK_THRESHOLD_BPS, "Threshold mismatch");
 
         if (unichainCallbackAdapter == address(0)) {
             console.log("NOTE: UNICHAIN_CALLBACK_ADAPTER is address(0).");
@@ -62,6 +59,7 @@ contract DeployReactive is Script {
             console.log("then call ConfigureReactive script to link the destination callback.");
         } else {
             require(reactiveContract.destinationCallback() == unichainCallbackAdapter, "Destination callback mismatch");
+            require(reactiveContract.callbackGasLimit() == CALLBACK_GAS_LIMIT, "Gas limit mismatch");
             console.log("Destination callback configured and verified.");
         }
     }

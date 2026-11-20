@@ -9,8 +9,8 @@ import {IReactive} from "reactive-lib/interfaces/IReactive.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title ConfigurationConsistencyTest
-/// @notice Tests verifying threshold alignment, configuration parity, mismatch handling,
-///         and boundary validation between origin RiskController and CrossGuardReactive.
+/// @notice Tests verifying single authoritative risk policy enforcement, configuration parity,
+///         elimination of dual-threshold split-brain bugs, and configuration hardening.
 contract ConfigurationConsistencyTest is Test {
     RiskController riskController;
     CrossGuardReactive reactiveContract;
@@ -31,58 +31,40 @@ contract ConfigurationConsistencyTest is Test {
         mockSystem = new MockOmniSystemContract();
 
         vm.startPrank(owner);
-        riskController = new RiskController(owner, 8000); // 80% default
+        riskController = new RiskController(owner, 8000); // 80% default authoritative threshold
         riskController.setAuthorizedVault(authorizedVault, true);
 
         reactiveContract = new CrossGuardReactive(
-            owner,
-            address(mockSystem),
-            ORIGIN_CHAIN_ID,
-            address(riskController),
-            DEST_CHAIN_ID,
-            destCallback,
-            GAS_LIMIT,
-            8000 // 80% default
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, address(riskController), DEST_CHAIN_ID, destCallback, GAS_LIMIT
         );
         vm.stopPrank();
     }
 
-    function testInitialConfigurationParity() public view {
-        assertEq(
-            riskController.riskThresholdBps(),
-            reactiveContract.minRiskThresholdBps(),
-            "Initial threshold mismatch between origin and reactive"
-        );
-        assertEq(riskController.riskThresholdBps(), 8000);
+    function testOriginIsSoleAuthoritativeRiskPolicy() public view {
+        assertEq(riskController.riskThresholdBps(), 8000, "Authoritative origin threshold should be 8000 bps");
+        assertEq(reactiveContract.originRiskController(), address(riskController));
+        assertEq(reactiveContract.originChainId(), ORIGIN_CHAIN_ID);
+        assertEq(reactiveContract.destinationChainId(), DEST_CHAIN_ID);
+        assertEq(reactiveContract.destinationCallback(), destCallback);
+        assertEq(reactiveContract.callbackGasLimit(), GAS_LIMIT);
     }
 
-    function testSynchronizedPolicyUpdate() public {
-        uint256 newThreshold = 7500; // 75%
+    function testAuthoritativeOriginBreachDispatchedWithoutSecondaryFilterSuppression() public {
+        // Origin threshold: 8,000 BPS.
+        // Previously, if Reactive had an independent 9,000 BPS threshold,
+        // a breach at 8,500 BPS was suppressed.
+        // Under M003.3 single authoritative policy: a valid origin breach at 8,500 BPS
+        // MUST dispatch the destination callback.
 
-        vm.startPrank(owner);
-        riskController.setRiskThreshold(newThreshold);
-        reactiveContract.setMinRiskThresholdBps(newThreshold);
-        vm.stopPrank();
-
-        assertEq(riskController.riskThresholdBps(), newThreshold);
-        assertEq(reactiveContract.minRiskThresholdBps(), newThreshold);
-    }
-
-    function testMismatchReactiveHigherThanOriginIgnoresModerateBreach() public {
-        // Origin set to 8000 bps, Reactive updated to 8500 bps
-        vm.prank(owner);
-        reactiveContract.setMinRiskThresholdBps(8500);
-
-        // Origin triggers breach at 8200 bps
-        // Collateral = $10,000 (10000e8), Debt = $8,200 (8200e8) -> LTV = 8200 bps
+        // Collateral = $10,000 (10000e8), Debt = $8,500 (8500e8) -> LTV = 8500 bps (85%)
         vm.prank(authorizedVault);
         (bool isBreached, uint256 currentLtvBps, uint256 nonce) =
-            riskController.assessRisk(positionId, user, 10_000e8, 8200e8);
+            riskController.assessRisk(positionId, user, 10_000e8, 8500e8);
 
-        assertTrue(isBreached, "Origin should consider 8200 bps breached against 8000 threshold");
-        assertEq(currentLtvBps, 8200);
+        assertTrue(isBreached, "Origin should identify 8500 bps as breached against 8000 threshold");
+        assertEq(currentLtvBps, 8500);
 
-        // System contract delivers log to CrossGuardReactive
+        // System contract delivers intercepted RiskBreach log to CrossGuardReactive
         IReactive.LogRecord memory log = IReactive.LogRecord({
             chain_id: ORIGIN_CHAIN_ID,
             _contract: address(riskController),
@@ -101,52 +83,66 @@ contract ConfigurationConsistencyTest is Test {
         vm.prank(address(mockSystem));
         reactiveContract.react(log);
 
-        // Because reactive threshold is 8500, it filters out 8200 bps -> 0 callbacks requested
-        assertEq(mockSystem.requestedCallbackCount(), 0, "Reactive should have ignored breach below its 8500 threshold");
+        // Callback must be requested immediately without suppression
+        assertEq(mockSystem.requestedCallbackCount(), 1, "Valid origin breach must dispatch destination callback");
     }
 
-    function testMismatchReactiveLowerThanOriginDoesNotTriggerPrematurely() public {
-        // Origin set to 8500 bps, Reactive set to 8000 bps
-        vm.prank(owner);
-        riskController.setRiskThreshold(8500);
-
-        // Origin evaluates LTV = 8200 bps (below 8500 bps origin threshold)
+    function testSafeOriginStateDoesNotEmitBreach() public {
+        // Position is safe: Collateral = $10,000 (10000e8), Debt = $7,500 (7500e8) -> 75% LTV < 80%
         vm.prank(authorizedVault);
-        (bool isBreached, uint256 currentLtvBps,) = riskController.assessRisk(positionId, user, 10_000e8, 8200e8);
+        (bool isBreached, uint256 currentLtvBps,) = riskController.assessRisk(positionId, user, 10_000e8, 7500e8);
 
-        // Origin does not breach, so no event is emitted on Base Sepolia
-        assertFalse(isBreached, "Origin should NOT breach when LTV is below 8500 bps");
-        assertEq(currentLtvBps, 8200);
-
-        // Reactive never receives an event, requestedCallbackCount remains 0
-        assertEq(mockSystem.requestedCallbackCount(), 0);
+        assertFalse(isBreached, "Origin should NOT breach when LTV is below 8000 bps");
+        assertEq(currentLtvBps, 7500);
+        assertEq(mockSystem.requestedCallbackCount(), 0, "No callback requested when safe");
     }
 
-    function testConsistentBoundaryValidation() public {
-        // Both contracts reject threshold = 0
+    function testSingleAuthoritativePolicyUpdate() public {
+        uint256 newThreshold = 7500; // 75%
+
+        vm.prank(owner);
+        riskController.setRiskThreshold(newThreshold);
+
+        assertEq(riskController.riskThresholdBps(), newThreshold);
+    }
+
+    function testDestinationConfigRejectsZeroGasLimit() public {
         vm.startPrank(owner);
-        vm.expectRevert(abi.encodeWithSelector(RiskController.InvalidThreshold.selector, 0));
-        riskController.setRiskThreshold(0);
-
-        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidThreshold.selector, 0));
-        reactiveContract.setMinRiskThresholdBps(0);
-
-        // Both contracts reject threshold > 10,000 (100% LTV)
-        vm.expectRevert(abi.encodeWithSelector(RiskController.InvalidThreshold.selector, 10_001));
-        riskController.setRiskThreshold(10_001);
-
-        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidThreshold.selector, 10_001));
-        reactiveContract.setMinRiskThresholdBps(10_001);
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidGasLimit.selector, 0));
+        reactiveContract.setDestinationConfig(DEST_CHAIN_ID, destCallback, 0);
         vm.stopPrank();
     }
 
-    function testUnauthorizedThresholdChangesRevert() public {
+    function testDestinationConfigRejectsZeroChainId() public {
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidChainId.selector, 0));
+        reactiveContract.setDestinationConfig(0, destCallback, GAS_LIMIT);
+        vm.stopPrank();
+    }
+
+    function testDestinationConfigRejectsZeroCallbackAddress() public {
+        vm.startPrank(owner);
+        vm.expectRevert(CrossGuardReactive.ZeroAddress.selector);
+        reactiveContract.setDestinationConfig(DEST_CHAIN_ID, address(0), GAS_LIMIT);
+        vm.stopPrank();
+    }
+
+    function testUnauthorizedConfigChangesRevert() public {
         vm.startPrank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
         riskController.setRiskThreshold(7000);
 
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
-        reactiveContract.setMinRiskThresholdBps(7000);
+        riskController.setAuthorizedVault(stranger, true);
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        reactiveContract.setDestinationConfig(DEST_CHAIN_ID, destCallback, GAS_LIMIT);
         vm.stopPrank();
+    }
+
+    function testOriginRiskControllerRejectsZeroAddressVault() public {
+        vm.prank(owner);
+        vm.expectRevert(RiskController.ZeroAddress.selector);
+        riskController.setAuthorizedVault(address(0), true);
     }
 }

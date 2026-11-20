@@ -76,8 +76,7 @@ contract CrossGuardE2ETest is Test {
             address(riskController),
             DEST_CHAIN_ID,
             address(0), // Destination not yet deployed
-            CALLBACK_GAS_LIMIT,
-            RISK_THRESHOLD_BPS
+            0
         );
         assertEq(address(crossGuardReactive), predictedReactiveAddress);
 

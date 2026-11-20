@@ -18,6 +18,7 @@ import {IRiskController} from "../interfaces/IRiskController.sol";
 ///      - Full 512-bit intermediate math: (debtValueUsd * BPS_SCALE) / collateralValueUsd
 ///      - Unrepresentable quotients (> type(uint256).max) deterministically return type(uint256).max.
 contract RiskController is IRiskController, Ownable {
+    error ZeroAddress();
     error UnauthorizedVault(address caller);
     error InvalidThreshold(uint256 thresholdBps);
 
@@ -46,6 +47,7 @@ contract RiskController is IRiskController, Ownable {
 
     /// @notice Configures authorized caller vault contracts.
     function setAuthorizedVault(address vault, bool authorized) external onlyOwner {
+        if (vault == address(0)) revert ZeroAddress();
         authorizedVaults[vault] = authorized;
         emit AuthorizedVaultUpdated(vault, authorized);
     }
