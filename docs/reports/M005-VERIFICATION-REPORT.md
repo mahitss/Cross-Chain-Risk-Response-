@@ -99,21 +99,21 @@ The 16 operational scenarios documented in `docs/operations/CROSSGUARD-OPERATION
 | Scenario | Component | Severity | Detectable by Health Check? | Primary Remediation Action |
 | :--- | :--- | :--- | :--- | :--- |
 | **SC-01** | Origin RPC Outage | `ERROR` | **Yes** (`origin_chain: ERROR`) | Fail over to backup Base Sepolia RPC endpoint. |
-| **SC-02** | Paused Oracle | `WARNING` | **Partial** (via position LTV evaluation) | Owner unpauses `TestValuationSource` or updates heartbeat. |
-| **SC-03** | Stale / Zero Oracle Price | `CRITICAL` | **Partial** (via valuation reads) | Owner submits fresh asset price quote to oracle. |
-| **SC-04** | Origin Zero-ID Rejection | `WARNING` | **No** (Contract behavior is fail-safe) | Client application must supply valid non-zero position ID. |
-| **SC-05** | Reactive RPC Outage | `ERROR` | **Yes** (`reactive_chain: ERROR`) | Fail over to backup Reactive Lasna RPC endpoint. |
-| **SC-06** | Reactive Contract Debt | `CRITICAL` | **Yes** (`reactive_reserves: CRITICAL`) | Deposit native REACT to System Contract beneficiary address. |
-| **SC-07** | Low Callback Gas Limit | `WARNING` / `CRITICAL` | **Yes** (`gas_limit: WARNING/CRITICAL`) | Call `setDestinationConfig` with $\ge 100,000$ gas limit. |
-| **SC-08** | Unconfigured Callback Recipient | `CRITICAL` | **Yes** (`wiring: CRITICAL`) | Call `setDestinationConfig` with deployed adapter address. |
-| **SC-09** | `pay()` Non-Implementation | `WARNING` | **Yes** (`operational_notes: WARNING`) | Deposit directly to System Contract; do not call `pay()`. |
-| **SC-10** | Omni Relayer Latency | `WARNING` | **Partial** (Empty record on pending ID) | Await relayer processing or verify Reactive validator quorum. |
-| **SC-11** | Callback Proxy Debt | `CRITICAL` | **Yes** (`proxy_reserves: CRITICAL`) | Deposit native gas token to Unichain Callback Proxy. |
-| **SC-12** | Callback Proxy Revert | `CRITICAL` | **Yes** (via `--callback-id` check) | Inspect revert reason byte string in callback record. |
-| **SC-13** | Callback Sender Forgery | `CRITICAL` | **Yes** (`wiring: CRITICAL`) | Configure `CrossGuardCallback` with valid Reactive address. |
-| **SC-14** | Duplicate / Stale Nonce Revert | `WARNING` | **Yes** (Logs `InvalidNonce()`) | Discard stale callback; re-evaluate position on origin. |
-| **SC-15** | Admin Pause Conflict | `WARNING` | **Partial** (via contract state read) | Admin invokes `emergencyResumeBorrowing` with audit reason. |
-| **SC-16** | Unregistered Position ID | `CRITICAL` | **Partial** (via contract state read) | Register position on `BorrowingController` before borrowing. |
+| **SC-02** | Reactive RPC Outage | `ERROR` | **Yes** (`reactive_chain: ERROR`) | Fail over to backup Reactive Lasna RPC endpoint. |
+| **SC-03** | Destination RPC Outage | `ERROR` | **Yes** (`destination_chain: ERROR`) | Fail over to backup Unichain Sepolia RPC endpoint. |
+| **SC-04** | Reactive Contract Debt | `CRITICAL` | **Yes** (`reactive_reserves: CRITICAL`) | Execute `depositTo(reactiveContract)` on Reactive System Contract with native REACT. |
+| **SC-05** | Callback Contract Debt | `CRITICAL` | **Yes** (`proxy_reserves: CRITICAL`) | Execute `depositTo(callbackContract)` on Callback Proxy with native ETH. |
+| **SC-06** | Reactive Reserves Exhausted | `WARNING` | **Yes** (`reactive_reserves: WARNING`) | Replenish reserves via `depositTo(reactiveContract)` on System Contract. |
+| **SC-07** | Proxy Reserves Exhausted | `WARNING` | **Yes** (`proxy_reserves: WARNING`) | Replenish reserves via `depositTo(callbackContract)` on Callback Proxy. |
+| **SC-08** | Low Callback Gas Limit | `WARNING` / `CRITICAL` | **Yes** (`gas_limit: WARNING/CRITICAL`) | Call `setDestinationConfig` with $\ge 100,000$ gas limit. |
+| **SC-09** | Unconfigured Callback Recipient | `CRITICAL` | **Yes** (`wiring: CRITICAL`) | Call `setDestinationConfig` with deployed adapter address. |
+| **SC-10** | Wrong Authorized Reactive Sender | `CRITICAL` | **Yes** (`wiring: CRITICAL`) | Call `setAuthorizedReactiveSender` with deployed Reactive address. |
+| **SC-11** | Destination Callback Failure | `CRITICAL` | **Yes** (via `--reactive-tx-hash` check) | Inspect revert reason byte string; evaluate emergency manual pause. |
+| **SC-12** | Insufficient Gas Revert | `CRITICAL` | **Yes** (via `--reactive-tx-hash` check) | Increase `callbackGasLimit` in Reactive destination config. |
+| **SC-13** | Pending / Unrecorded Callback | `UNKNOWN` | **Yes** (via `--reactive-tx-hash` check) | Await cross-chain block finalization and retry inspection. |
+| **SC-14** | Delayed Callback Arrival | `WARNING` | **Partial** (via state inspection) | Invoke `emergencyPauseBorrowing` on Unichain if market risk is urgent. |
+| **SC-15** | Duplicate Nonce Replay | `WARNING` | **Yes** (Logs `InvalidNonce()`) | Discard stale callback; re-evaluate position on origin if needed. |
+| **SC-16** | Cross-Chain Relayer Unavailable | `CRITICAL` | **Partial** (persistent empty records) | Escalate to network operators; use emergency administrative controls. |
 
 ---
 

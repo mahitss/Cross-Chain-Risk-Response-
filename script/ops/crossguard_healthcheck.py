@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CrossGuard Operational Health-Check and Diagnostics Tool
-Part of Mission M005 — Cross-Chain Operational Observability & Failure Diagnosis.
+Part of Mission M005 / M005.1 — Operational Safety, ABI Correctness & Multi-Chain Diagnostics.
 
 Topology:
   - Origin: Base Sepolia (Chain ID: 84532)
@@ -14,8 +14,10 @@ Features:
   - Validates cross-contract pointer configurations and topology consistency
   - Evaluates debt and reserves independently on System Contract and Callback Proxy
   - Validates callback gas configuration (>= 100,000 minimum)
-  - Optionally inspects callback records via getCallbacks(uint256)
-  - Strictly read-only: rejects write-capable commands, never requests private keys
+  - Inspects callback records via getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])
+  - Centralized RPC credential redaction across all reports, evidence, and messages
+  - Strictly read-only: rejects write-capable commands, bounded execution timeouts
+  - Deterministic exit codes: 0 for HEALTHY, 1 for WARNING, CRITICAL, UNKNOWN, ERROR
 """
 
 import argparse
@@ -29,6 +31,7 @@ import shutil
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+import urllib.parse
 
 
 # --- Constants & Expected Defaults ---
@@ -39,10 +42,19 @@ UNICHAIN_SEPOLIA_CHAIN_ID = 1301
 DEFAULT_SYSTEM_CONTRACT = "0x8888888888888888888888888888888888888888"
 DEFAULT_CALLBACK_PROXY = "0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4"
 MINIMUM_CALLBACK_GAS = 100_000
+DEFAULT_RPC_TIMEOUT_SECONDS = 15.0
 
 
 class Status(str, Enum):
     PASS = "PASS"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+    UNKNOWN = "UNKNOWN"
+    ERROR = "ERROR"
+
+
+class OverallStatus(str, Enum):
+    HEALTHY = "HEALTHY"
     WARNING = "WARNING"
     CRITICAL = "CRITICAL"
     UNKNOWN = "UNKNOWN"
@@ -78,6 +90,75 @@ class CheckResult:
         }
 
 
+# --- Redaction & Sanitization Utilities ---
+def redact_rpc_url(url: Optional[str]) -> Optional[str]:
+    """
+    Sanitizes an RPC URL by redacting credentials (userinfo, sensitive path segments, query parameters).
+    Preserves scheme, host, and port (if non-standard).
+    Replaces sensitive paths and query strings with /<redacted>.
+    Does not modify the underlying raw URL passed to RPC clients.
+    """
+    if not url or not isinstance(url, str):
+        return url
+    trimmed = url.strip()
+    try:
+        parsed = urllib.parse.urlsplit(trimmed)
+        if not parsed.scheme or not parsed.hostname:
+            # Fallback regex scrubber for irregular URLs or raw strings
+            scrubbed = re.sub(r'//[^/@\s]+@', '//<redacted>@', trimmed)
+            scrubbed = re.sub(r'\?[^#\s]*', '?<redacted>', scrubbed)
+            return scrubbed
+
+        host_part = parsed.hostname
+        if parsed.port and parsed.port not in (80, 443):
+            host_part = f"{host_part}:{parsed.port}"
+
+        has_sensitive_path = bool(parsed.path and parsed.path.strip('/'))
+        has_query = bool(parsed.query)
+
+        if has_sensitive_path or has_query:
+            return f"{parsed.scheme}://{host_part}/<redacted>"
+        else:
+            return f"{parsed.scheme}://{host_part}"
+    except Exception:
+        return "<redacted_rpc_url>"
+
+
+def sanitize_text(text: str, urls: Optional[List[str]] = None) -> str:
+    """
+    Scans text and scrubs any sensitive RPC URLs, userinfo, credentials, or tokens.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    result = text
+    if urls:
+        for u in urls:
+            if u and isinstance(u, str) and u in result:
+                result = result.replace(u, redact_rpc_url(u) or "<redacted>")
+
+    def _scrub_url(match):
+        raw_u = match.group(0)
+        return redact_rpc_url(raw_u) or "<redacted>"
+
+    result = re.sub(r'https?://[^\s"\'<>]+', _scrub_url, result)
+    result = re.sub(r'//[^/@\s]+:[^/@\s]+@', '//<redacted>@', result)
+    return result
+
+
+def compute_exit_code(overall_status: str) -> int:
+    """
+    Calculates process exit code based on top-level overall status:
+    - HEALTHY: 0
+    - WARNING: 1
+    - CRITICAL: 1
+    - UNKNOWN: 1
+    - ERROR: 1
+    """
+    if overall_status == OverallStatus.HEALTHY.value:
+        return 0
+    return 1
+
+
 # --- Address Normalization Utilities ---
 def normalize_address(addr: str) -> str:
     """Normalizes address string to 0x-prefixed 40-char lowercase hex."""
@@ -85,11 +166,132 @@ def normalize_address(addr: str) -> str:
     if clean.startswith("0x"):
         clean = clean[2:]
     if len(clean) > 40:
-        # Extracted from 32-byte word (last 20 bytes = 40 hex chars)
         clean = clean[-40:]
     elif len(clean) < 40:
         clean = clean.zfill(40)
     return f"0x{clean}"
+
+
+# --- Callback Record ABI Decoding ---
+def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """
+    Decodes return data from:
+      getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])
+
+    The six-field tuple represents:
+      (uint256 destination_chain_id, address to, uint256 gas_limit, uint256 gas_price, uint256 tx_id, bytes error)
+
+    Success condition:
+      An empty error field ('0x' or length 0) signifies SUCCESS.
+      Non-empty error bytes signify a REVERT / FAILURE.
+
+    Returns:
+      (records_list, None) on successful parse (records_list may be empty if array length is 0).
+      (None, error_message) on malformed or invalid data.
+    """
+    s = raw_data.strip()
+    if s in ("", "0x", "()", "[]"):
+        return [], None
+
+    # Check for empty ABI array (offset 0x20, count 0)
+    if s.startswith("0x") and len(s) == 130:
+        try:
+            clean_hex = s[2:]
+            arr_offset = int(clean_hex[:64], 16)
+            arr_len = int(clean_hex[64:128], 16)
+            if arr_offset == 32 and arr_len == 0:
+                return [], None
+        except Exception:
+            pass
+
+    # 1. Try parsing formatted tuple string from cast call: [(chain_id, to, gas_limit, gas_price, tx_id, error)]
+    if "(" in s and ")" in s:
+        tuples = re.findall(r'\(([^)]+)\)', s)
+        if not tuples:
+            return None, "No tuples found in formatted response"
+        records = []
+        for t in tuples:
+            parts = [p.strip() for p in t.split(',')]
+            if len(parts) != 6:
+                return None, f"Expected 6 fields per record, found {len(parts)}"
+            try:
+                chain_id = int(parts[0], 0)
+                to_addr = normalize_address(parts[1])
+                gas_limit = int(parts[2], 0)
+                gas_price = int(parts[3], 0)
+                tx_id = int(parts[4], 0)
+                err = parts[5].strip().lower()
+                if not err.startswith("0x"):
+                    err = "0x" + err if err else "0x"
+                is_success = (err in ("0x", ""))
+                records.append({
+                    "destination_chain_id": chain_id,
+                    "to": to_addr,
+                    "gas_limit": gas_limit,
+                    "gas_price": gas_price,
+                    "tx_id": tx_id,
+                    "error": err,
+                    "success": is_success,
+                })
+            except Exception as e:
+                return None, f"Error parsing formatted tuple fields: {str(e)}"
+        return records, None
+
+    # 2. Try parsing raw ABI-encoded hex response
+    if s.startswith("0x"):
+        try:
+            raw_bytes = bytes.fromhex(s[2:])
+            if len(raw_bytes) < 64:
+                return None, "Hex response too short for dynamic ABI array"
+            arr_offset = int.from_bytes(raw_bytes[:32], "big")
+            if arr_offset >= len(raw_bytes):
+                return None, f"Invalid array offset {arr_offset}"
+            arr_len = int.from_bytes(raw_bytes[arr_offset:arr_offset+32], "big")
+            if arr_len == 0:
+                return [], None
+
+            elements_start = arr_offset + 32
+            records = []
+            for i in range(arr_len):
+                elem_offset_loc = elements_start + i * 32
+                if elem_offset_loc + 32 > len(raw_bytes):
+                    return None, f"Truncated element offset pointer at index {i}"
+                elem_offset = int.from_bytes(raw_bytes[elem_offset_loc:elem_offset_loc+32], "big")
+                tuple_start = elements_start + elem_offset
+                if tuple_start + 192 > len(raw_bytes):
+                    return None, f"Truncated tuple head at index {i}"
+
+                chain_id = int.from_bytes(raw_bytes[tuple_start:tuple_start+32], "big")
+                to_addr = "0x" + raw_bytes[tuple_start+12:tuple_start+32].hex()
+                gas_limit = int.from_bytes(raw_bytes[tuple_start+64:tuple_start+96], "big")
+                gas_price = int.from_bytes(raw_bytes[tuple_start+96:tuple_start+128], "big")
+                tx_id = int.from_bytes(raw_bytes[tuple_start+128:tuple_start+160], "big")
+                bytes_offset = int.from_bytes(raw_bytes[tuple_start+160:tuple_start+192], "big")
+
+                bytes_start = tuple_start + bytes_offset
+                if bytes_start + 32 > len(raw_bytes):
+                    return None, f"Truncated error bytes length at index {i}"
+                bytes_len = int.from_bytes(raw_bytes[bytes_start:bytes_start+32], "big")
+                data_start = bytes_start + 32
+                if data_start + bytes_len > len(raw_bytes):
+                    return None, f"Truncated error bytes payload at index {i}"
+
+                err_data = raw_bytes[data_start:data_start+bytes_len]
+                err_hex = "0x" + err_data.hex()
+                records.append({
+                    "destination_chain_id": chain_id,
+                    "to": normalize_address(to_addr),
+                    "gas_limit": gas_limit,
+                    "gas_price": gas_price,
+                    "tx_id": tx_id,
+                    "error": err_hex,
+                    "success": (len(err_data) == 0),
+                })
+            return records, None
+        except Exception as e:
+            return None, f"Hex ABI decoding error: {str(e)}"
+
+    return None, "Unrecognized callback record format"
 
 
 # --- RPC Runner Abstraction & Read-Only Security Guard ---
@@ -110,19 +312,19 @@ class RpcRunner:
 
 
 class CastRpcRunner(RpcRunner):
-    """Executes read-only commands using Foundry's cast CLI."""
+    """Executes read-only commands using Foundry's cast CLI with strict whitelisting and timeouts."""
 
     ALLOWED_SUBCOMMANDS = {"chain-id", "code", "call", "balance"}
     FORBIDDEN_FLAGS = {"--private-key", "--ledger", "--trezor", "--interactive", "--broadcast"}
     FORBIDDEN_COMMANDS = {"send", "mktx", "publish", "create2", "wallet"}
 
-    def __init__(self, cast_path: Optional[str] = None):
+    def __init__(self, cast_path: Optional[str] = None, timeout: float = DEFAULT_RPC_TIMEOUT_SECONDS):
         self.cast_path = cast_path or shutil.which("cast") or shutil.which("cast.exe")
         if not self.cast_path:
             raise FileNotFoundError("Foundry 'cast' executable not found on PATH.")
+        self.timeout = timeout
 
     def _execute(self, subcommand: str, cmd_args: List[str]) -> str:
-        # Strict security enforcement: No write-capable commands allowed
         if subcommand not in self.ALLOWED_SUBCOMMANDS:
             raise PermissionError(f"Security violation: Command '{subcommand}' is not in read-only whitelist.")
 
@@ -133,10 +335,14 @@ class CastRpcRunner(RpcRunner):
 
         full_cmd = [self.cast_path, subcommand] + cmd_args
         try:
-            res = subprocess.run(full_cmd, capture_output=True, text=True, check=True)
+            res = subprocess.run(full_cmd, capture_output=True, text=True, check=True, timeout=self.timeout)
             return res.stdout.strip()
+        except subprocess.TimeoutExpired as e:
+            # Bounded execution: convert subprocess timeout into controlled exception with sanitized text
+            raise TimeoutError(f"Cast {subcommand} query timed out after {self.timeout}s") from e
         except subprocess.CalledProcessError as e:
-            err_msg = e.stderr.strip() or e.stdout.strip() or f"Process exited with code {e.returncode}"
+            raw_err = e.stderr.strip() or e.stdout.strip() or f"Process exited with code {e.returncode}"
+            err_msg = sanitize_text(raw_err, cmd_args)
             raise RuntimeError(f"Cast {subcommand} failed: {err_msg}") from e
 
     def get_chain_id(self, rpc_url: str) -> int:
@@ -201,18 +407,18 @@ class CrossGuardHealthChecker:
             "topology": {
                 "base_sepolia": {
                     "expected_chain_id": BASE_SEPOLIA_CHAIN_ID,
-                    "rpc_url": self.config.get("base_rpc"),
+                    "rpc_url": redact_rpc_url(self.config.get("base_rpc")),
                     "risk_controller": self.config.get("origin_risk_controller"),
                 },
                 "reactive_lasna": {
                     "expected_chain_id": REACTIVE_LASNA_CHAIN_ID,
-                    "rpc_url": self.config.get("reactive_rpc"),
+                    "rpc_url": redact_rpc_url(self.config.get("reactive_rpc")),
                     "reactive_contract": self.config.get("reactive_address"),
                     "system_contract": self.config.get("system_contract", DEFAULT_SYSTEM_CONTRACT),
                 },
                 "unichain_sepolia": {
                     "expected_chain_id": UNICHAIN_SEPOLIA_CHAIN_ID,
-                    "rpc_url": self.config.get("unichain_rpc"),
+                    "rpc_url": redact_rpc_url(self.config.get("unichain_rpc")),
                     "callback_adapter": self.config.get("callback_address"),
                     "borrowing_controller": self.config.get("borrowing_controller_address"),
                     "callback_proxy": self.config.get("callback_proxy", DEFAULT_CALLBACK_PROXY),
@@ -220,17 +426,17 @@ class CrossGuardHealthChecker:
             },
         }
 
-    def _calculate_overall_status(self) -> Status:
+    def _calculate_overall_status(self) -> OverallStatus:
         statuses = {r.status for r in self.results}
         if Status.CRITICAL in statuses:
-            return Status.CRITICAL
+            return OverallStatus.CRITICAL
         if Status.ERROR in statuses:
-            return Status.ERROR
+            return OverallStatus.ERROR
         if Status.WARNING in statuses:
-            return Status.WARNING
+            return OverallStatus.WARNING
         if Status.UNKNOWN in statuses:
-            return Status.UNKNOWN
-        return Status.PASS
+            return OverallStatus.UNKNOWN
+        return OverallStatus.HEALTHY
 
     # --- Check Implementations ---
 
@@ -242,6 +448,7 @@ class CrossGuardHealthChecker:
         ]
 
         for name, rpc, expected_chain_id, check_id in targets:
+            redacted_rpc = redact_rpc_url(rpc)
             if not rpc:
                 self.results.append(
                     CheckResult(
@@ -264,7 +471,7 @@ class CrossGuardHealthChecker:
                             name=check_id,
                             status=Status.PASS,
                             message=f"{name} RPC reachable with correct chain ID ({actual_id}).",
-                            evidence={"expected_chain_id": expected_chain_id, "actual_chain_id": actual_id, "rpc_url": rpc},
+                            evidence={"expected_chain_id": expected_chain_id, "actual_chain_id": actual_id, "rpc_url": redacted_rpc},
                         )
                     )
                 else:
@@ -274,18 +481,19 @@ class CrossGuardHealthChecker:
                             name=check_id,
                             status=Status.CRITICAL,
                             message=f"{name} chain ID mismatch: expected {expected_chain_id}, received {actual_id}.",
-                            evidence={"expected_chain_id": expected_chain_id, "actual_chain_id": actual_id, "rpc_url": rpc},
+                            evidence={"expected_chain_id": expected_chain_id, "actual_chain_id": actual_id, "rpc_url": redacted_rpc},
                             remediation="Verify RPC endpoint configuration. The node is operating on an incorrect blockchain network.",
                         )
                     )
             except Exception as e:
+                sanitized_err = sanitize_text(str(e), [rpc])
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.NETWORK,
                         name=check_id,
                         status=Status.ERROR,
-                        message=f"{name} RPC unreachable or query failed: {str(e)}",
-                        evidence={"expected_chain_id": expected_chain_id, "rpc_url": rpc, "error": str(e)},
+                        message=f"{name} RPC unreachable or query failed: {sanitized_err}",
+                        evidence={"expected_chain_id": expected_chain_id, "rpc_url": redacted_rpc, "error": sanitized_err},
                         remediation=f"Check network connectivity, RPC provider status, or rate limits for {name}.",
                     )
                 )
@@ -351,13 +559,14 @@ class CrossGuardHealthChecker:
                         )
                     )
             except Exception as e:
+                sanitized_err = sanitize_text(str(e), [rpc])
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.DEPLOYMENT,
                         name=check_id,
                         status=Status.ERROR,
-                        message=f"Failed to fetch bytecode for {name} at {addr}: {str(e)}",
-                        evidence={"contract_name": name, "address": addr, "error": str(e)},
+                        message=f"Failed to fetch bytecode for {name} at {addr}: {sanitized_err}",
+                        evidence={"contract_name": name, "address": addr, "error": sanitized_err},
                         remediation="Investigate RPC connectivity or node state.",
                     )
                 )
@@ -456,13 +665,14 @@ class CrossGuardHealthChecker:
                     )
                 )
         except Exception as e:
+            sanitized_err = sanitize_text(str(e), [rpc])
             self.results.append(
                 CheckResult(
                     category=CheckCategory.CONFIGURATION,
                     name=check_id,
                     status=Status.ERROR,
-                    message=f"Failed to query {sig} on {contract}: {str(e)}",
-                    evidence={"contract": contract, "signature": sig, "error": str(e)},
+                    message=f"Failed to query {sig} on {contract}: {sanitized_err}",
+                    evidence={"contract": contract, "signature": sig, "error": sanitized_err},
                     remediation="Check contract ABI and RPC reachability.",
                 )
             )
@@ -494,13 +704,14 @@ class CrossGuardHealthChecker:
                     )
                 )
         except Exception as e:
+            sanitized_err = sanitize_text(str(e), [rpc])
             self.results.append(
                 CheckResult(
                     category=CheckCategory.CONFIGURATION,
                     name=check_id,
                     status=Status.ERROR,
-                    message=f"Failed to query {sig} on {contract}: {str(e)}",
-                    evidence={"contract": contract, "signature": sig, "error": str(e)},
+                    message=f"Failed to query {sig} on {contract}: {sanitized_err}",
+                    evidence={"contract": contract, "signature": sig, "error": sanitized_err},
                     remediation="Check contract ABI and RPC reachability.",
                 )
             )
@@ -522,9 +733,9 @@ class CrossGuardHealthChecker:
                             category=CheckCategory.FUNDING_AND_DEBT,
                             name="funding_reactive_system_debt",
                             status=Status.CRITICAL,
-                            message=f"Reactive contract has OUTSTANDING DEBT of {debt_val} wei on System Contract. react() execution may be suspended.",
+                            message=f"Reactive contract has OUTSTANDING DEBT of {debt_val} wei on System Contract. react() execution suspended.",
                             evidence={"system_contract": system_addr, "target": reactive_addr, "debt_wei": debt_val},
-                            remediation="Fund the contract and settle debt using authorized Reactive System Contract deposit routes.",
+                            remediation="Settle debt by executing depositTo(reactiveContract) on the Reactive System Contract (0x8888...8888) with native REACT. Direct transfers without depositTo credit sender balance, not beneficiary.",
                         )
                     )
                 else:
@@ -538,13 +749,14 @@ class CrossGuardHealthChecker:
                         )
                     )
             except Exception as e:
+                sanitized_err = sanitize_text(str(e), [reactive_rpc])
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.FUNDING_AND_DEBT,
                         name="funding_reactive_system_debt",
                         status=Status.ERROR,
-                        message=f"Failed to query debt on System Contract: {str(e)}",
-                        evidence={"error": str(e)},
+                        message=f"Failed to query debt on System Contract: {sanitized_err}",
+                        evidence={"error": sanitized_err},
                     )
                 )
 
@@ -560,7 +772,7 @@ class CrossGuardHealthChecker:
                             status=Status.WARNING,
                             message="Reactive contract has 0 prepaid reserves on System Contract. Execution depends on ongoing funding.",
                             evidence={"system_contract": system_addr, "target": reactive_addr, "reserves_wei": 0},
-                            remediation="Deposit prepaid REACT reserves into the System Contract to ensure uninterrupted reactive execution.",
+                            remediation="Replenish reserves by executing depositTo(reactiveContract) on the Reactive System Contract (0x8888...8888) with native REACT.",
                         )
                     )
                 else:
@@ -574,14 +786,14 @@ class CrossGuardHealthChecker:
                         )
                     )
             except Exception as e:
-                # In some mock contracts reserves may not be defined; report clearly
+                sanitized_err = sanitize_text(str(e), [reactive_rpc])
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.FUNDING_AND_DEBT,
                         name="funding_reactive_system_reserves",
                         status=Status.UNKNOWN,
-                        message=f"Reserves query on System Contract returned error: {str(e)}",
-                        evidence={"error": str(e)},
+                        message=f"Reserves query on System Contract returned error: {sanitized_err}",
+                        evidence={"error": sanitized_err},
                     )
                 )
 
@@ -589,7 +801,7 @@ class CrossGuardHealthChecker:
             try:
                 bal_wei = self.runner.get_balance(reactive_addr, reactive_rpc)
                 bal_eth = bal_wei / 1e18
-                note = "Note: CrossGuardReactive.pay(uint256) reverts with 'Not implemented'. Direct native balance cannot automatically settle debt via pay()."
+                note = "Note: CrossGuardReactive.pay(uint256) reverts with 'Not implemented'. Direct native balance cannot automatically settle debt via pay(); operators must call depositTo on System Contract."
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.FUNDING_AND_DEBT,
@@ -601,13 +813,14 @@ class CrossGuardHealthChecker:
                     )
                 )
             except Exception as e:
+                sanitized_err = sanitize_text(str(e), [reactive_rpc])
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.FUNDING_AND_DEBT,
                         name="funding_reactive_native_balance",
                         status=Status.ERROR,
-                        message=f"Failed to query native balance of CrossGuardReactive: {str(e)}",
-                        evidence={"error": str(e)},
+                        message=f"Failed to query native balance of CrossGuardReactive: {sanitized_err}",
+                        evidence={"error": sanitized_err},
                     )
                 )
 
@@ -629,7 +842,7 @@ class CrossGuardHealthChecker:
                             status=Status.CRITICAL,
                             message=f"CrossGuardCallback has OUTSTANDING DEBT of {p_debt_val} wei on Callback Proxy. Incoming callbacks may be rejected.",
                             evidence={"callback_proxy": proxy_addr, "target": callback_addr, "debt_wei": p_debt_val},
-                            remediation="Settle callback debt with the Callback Proxy immediately.",
+                            remediation="Settle callback debt by executing depositTo(callbackContract) on the Callback Proxy (0x9299...7FC4) with native gas token (ETH) on Unichain Sepolia.",
                         )
                     )
                 else:
@@ -643,13 +856,14 @@ class CrossGuardHealthChecker:
                         )
                     )
             except Exception as e:
+                sanitized_err = sanitize_text(str(e), [unichain_rpc])
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.FUNDING_AND_DEBT,
                         name="funding_callback_proxy_debt",
                         status=Status.ERROR,
-                        message=f"Failed to query debt on Callback Proxy: {str(e)}",
-                        evidence={"error": str(e)},
+                        message=f"Failed to query debt on Callback Proxy: {sanitized_err}",
+                        evidence={"error": sanitized_err},
                     )
                 )
 
@@ -665,7 +879,7 @@ class CrossGuardHealthChecker:
                             status=Status.WARNING,
                             message="CrossGuardCallback has 0 prepaid reserves on Callback Proxy. Callbacks depend on direct settlement.",
                             evidence={"callback_proxy": proxy_addr, "target": callback_addr, "reserves_wei": 0},
-                            remediation="Deposit native reserves into the Callback Proxy on Unichain Sepolia.",
+                            remediation="Replenish reserves by executing depositTo(callbackContract) on the Callback Proxy (0x9299...7FC4) with native gas token (ETH) on Unichain Sepolia.",
                         )
                     )
                 else:
@@ -679,13 +893,14 @@ class CrossGuardHealthChecker:
                         )
                     )
             except Exception as e:
+                sanitized_err = sanitize_text(str(e), [unichain_rpc])
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.FUNDING_AND_DEBT,
                         name="funding_callback_proxy_reserves",
                         status=Status.UNKNOWN,
-                        message=f"Reserves query on Callback Proxy returned error: {str(e)}",
-                        evidence={"error": str(e)},
+                        message=f"Reserves query on Callback Proxy returned error: {sanitized_err}",
+                        evidence={"error": sanitized_err},
                     )
                 )
 
@@ -704,13 +919,14 @@ class CrossGuardHealthChecker:
                     )
                 )
             except Exception as e:
+                sanitized_err = sanitize_text(str(e), [unichain_rpc])
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.FUNDING_AND_DEBT,
                         name="funding_callback_native_balance",
                         status=Status.ERROR,
-                        message=f"Failed to query native balance of CrossGuardCallback: {str(e)}",
-                        evidence={"error": str(e)},
+                        message=f"Failed to query native balance of CrossGuardCallback: {sanitized_err}",
+                        evidence={"error": sanitized_err},
                     )
                 )
 
@@ -747,13 +963,14 @@ class CrossGuardHealthChecker:
                     )
                 )
         except Exception as e:
+            sanitized_err = sanitize_text(str(e), [reactive_rpc])
             self.results.append(
                 CheckResult(
                     category=CheckCategory.CALLBACK_GAS,
                     name="callback_gas_limit_check",
                     status=Status.ERROR,
-                    message=f"Failed to query callbackGasLimit: {str(e)}",
-                    evidence={"error": str(e)},
+                    message=f"Failed to query callbackGasLimit: {sanitized_err}",
+                    evidence={"error": sanitized_err},
                 )
             )
 
@@ -790,14 +1007,27 @@ class CrossGuardHealthChecker:
             )
             return
 
+        # Call getCallbacks with complete documented return signature
+        signature = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
         try:
-            raw_out = self.runner.call(system_addr, "getCallbacks(uint256)", [uint_hash_str], reactive_rpc)
-            clean_out = raw_out.strip()
+            raw_out = self.runner.call(system_addr, signature, [uint_hash_str], reactive_rpc)
+            records, decode_err = decode_callback_records(raw_out)
 
-            # Empty response or empty ABI array (length 0)
-            is_empty = clean_out in ("", "0x", "()", "[]") or clean_out.endswith("0000000000000000000000000000000000000000000000000000000000000000") and len(clean_out) <= 130
+            if decode_err is not None:
+                self.results.append(
+                    CheckResult(
+                        category=CheckCategory.CALLBACK_RECORDS,
+                        name="callback_record_inspection",
+                        status=Status.ERROR,
+                        message=f"Failed to decode callback records ABI: {decode_err}",
+                        evidence={"tx_hash": tx_hash_str, "raw_response": raw_out, "error": decode_err},
+                        remediation="Inspect Reactive System Contract interface and node response.",
+                    )
+                )
+                return
 
-            if is_empty:
+            # Empty array: callbacks pending, unfinalized, or not yet written
+            if records is None or len(records) == 0:
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.CALLBACK_RECORDS,
@@ -810,80 +1040,65 @@ class CrossGuardHealthChecker:
                 )
                 return
 
-            # Parse record data
-            record_info = self._parse_callback_record(clean_out)
-            if record_info.get("success") is True:
-                self.results.append(
-                    CheckResult(
-                        category=CheckCategory.CALLBACK_RECORDS,
-                        name="callback_record_inspection",
-                        status=Status.PASS,
-                        message=f"Callback execution recorded as SUCCESS on destination chain {record_info.get('destination_chain_id')}.",
-                        evidence={"tx_hash": tx_hash_str, "record": record_info, "raw_response": raw_out},
-                    )
-                )
-            elif record_info.get("success") is False:
-                err_data = record_info.get("error_data", "")
+            # Analyze decoded records
+            failed_records = [r for r in records if not r.get("success")]
+            mismatched_dest_records = [r for r in records if r.get("destination_chain_id") != UNICHAIN_SEPOLIA_CHAIN_ID]
+            missing_tx_records = [r for r in records if r.get("tx_id") == 0]
+
+            if failed_records:
+                first_failed = failed_records[0]
+                err_data = first_failed.get("error", "0x")
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.CALLBACK_RECORDS,
                         name="callback_record_inspection",
                         status=Status.CRITICAL,
-                        message=f"Callback execution recorded as FAILED on destination chain {record_info.get('destination_chain_id')}. Raw error: {err_data}",
-                        evidence={"tx_hash": tx_hash_str, "record": record_info, "raw_response": raw_out},
+                        message=f"Callback execution recorded as FAILED on destination chain (failed: {len(failed_records)}/{len(records)}). Error data: {err_data}",
+                        evidence={
+                            "tx_hash": tx_hash_str,
+                            "records": records,
+                            "failed_records": failed_records,
+                            "raw_response": raw_out,
+                        },
                         remediation="Inspect error data and destination callback logic (e.g., invalid nonce, gas exhaustion, or revert).",
                     )
                 )
-            else:
+            elif mismatched_dest_records:
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.CALLBACK_RECORDS,
                         name="callback_record_inspection",
-                        status=Status.UNKNOWN,
-                        message="Callback records returned non-empty data but outcome could not be deterministically decoded.",
-                        evidence={"tx_hash": tx_hash_str, "raw_response": raw_out, "parsed": record_info},
+                        status=Status.CRITICAL,
+                        message=f"Callback destination chain ID mismatch: expected {UNICHAIN_SEPOLIA_CHAIN_ID}, got {mismatched_dest_records[0].get('destination_chain_id')}.",
+                        evidence={"tx_hash": tx_hash_str, "records": records, "raw_response": raw_out},
+                        remediation="Check destination chain ID configuration in Reactive contract.",
+                    )
+                )
+            else:
+                msg = f"Callback execution recorded as SUCCESS on destination chain {UNICHAIN_SEPOLIA_CHAIN_ID} ({len(records)} record(s))."
+                if missing_tx_records:
+                    msg += f" Note: {len(missing_tx_records)} record(s) have unassigned destination tx identifier (0)."
+                self.results.append(
+                    CheckResult(
+                        category=CheckCategory.CALLBACK_RECORDS,
+                        name="callback_record_inspection",
+                        status=Status.PASS,
+                        message=msg,
+                        evidence={"tx_hash": tx_hash_str, "records": records, "raw_response": raw_out},
                     )
                 )
         except Exception as e:
+            sanitized_err = sanitize_text(str(e), [reactive_rpc])
             self.results.append(
                 CheckResult(
                     category=CheckCategory.CALLBACK_RECORDS,
                     name="callback_record_inspection",
                     status=Status.ERROR,
-                    message=f"Failed to query getCallbacks(uint256) on System Contract: {str(e)}",
-                    evidence={"tx_hash": tx_hash_str, "error": str(e)},
+                    message=f"Failed to query getCallbacks(uint256) on System Contract: {sanitized_err}",
+                    evidence={"tx_hash": tx_hash_str, "error": sanitized_err},
                     remediation="Check Reactive Lasna RPC health and system contract interface compatibility.",
                 )
             )
-
-    def _parse_callback_record(self, raw_data: str) -> Dict[str, Any]:
-        """Parses decoded or raw hex callback records from getCallbacks."""
-        parsed: Dict[str, Any] = {"raw": raw_data}
-
-        # Check for formatted cast output containing boolean keywords
-        lower = raw_data.lower()
-        if "true" in lower:
-            parsed["success"] = True
-        elif "false" in lower:
-            parsed["success"] = False
-
-        # Extract destination chain ID if present
-        chain_match = re.search(r"(\b1301\b|\b84532\b)", raw_data)
-        if chain_match:
-            parsed["destination_chain_id"] = int(chain_match.group(1))
-
-        # Extract transaction hash (64 hex characters)
-        tx_matches = re.findall(r"0x[a-fA-F0-9]{64}", raw_data)
-        if tx_matches:
-            parsed["destination_tx_hash"] = tx_matches[-1]
-
-        # Extract custom revert data if error
-        if parsed.get("success") is False:
-            err_matches = re.findall(r"0x[a-fA-F0-9]{8,}", raw_data)
-            if err_matches:
-                parsed["error_data"] = err_matches[-1]
-
-        return parsed
 
 
 # --- Human-Readable Terminal Formatter ---
@@ -932,8 +1147,9 @@ def format_terminal_report(report: Dict[str, Any]) -> str:
     lines.append("OPERATIONAL ADVISORY & SAFETY BOUNDARIES:")
     lines.append("  1. Tool is strictly read-only; no private keys, transactions, or state mutations.")
     lines.append("  2. Inactive Reactive contracts or callback debts halt cross-chain response pipelines.")
-    lines.append("  3. CrossGuardReactive.pay() reverts with 'Not implemented'; manage reserves explicitly.")
+    lines.append("  3. CrossGuardReactive.pay() reverts with 'Not implemented'; use depositTo(beneficiary).")
     lines.append("  4. Empty callback records represent pending/unfinalized states, not confirmed failures.")
+    lines.append("  5. RPC credentials and query secrets are automatically redacted across all outputs.")
     lines.append("=" * 80)
     return "\n".join(lines)
 
@@ -981,8 +1197,9 @@ def parse_arguments() -> argparse.Namespace:
         help=f"Unichain Sepolia Callback Proxy address (default: {DEFAULT_CALLBACK_PROXY})",
     )
 
-    # Optional inspection
+    # Optional inspection & timeout
     parser.add_argument("--reactive-tx-hash", default=None, help="Inspect callback record for originating Reactive tx hash")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_RPC_TIMEOUT_SECONDS, help="Timeout in seconds for RPC queries")
     parser.add_argument("--json", action="store_true", help="Output diagnostic report in machine-readable JSON")
 
     return parser.parse_args()
@@ -1005,7 +1222,8 @@ def main():
     }
 
     try:
-        checker = CrossGuardHealthChecker(config)
+        runner = CastRpcRunner(timeout=args.timeout)
+        checker = CrossGuardHealthChecker(config, runner=runner)
         report = checker.run_all_checks()
 
         if args.json:
@@ -1013,15 +1231,13 @@ def main():
         else:
             print(format_terminal_report(report))
 
-        # Exit code reflects health: 0 for healthy/warning, 1 for critical/error
-        if report["overall_status"] in (Status.CRITICAL.value, Status.ERROR.value):
-            sys.exit(1)
-        sys.exit(0)
+        sys.exit(compute_exit_code(report["overall_status"]))
     except Exception as e:
+        sanitized_err = sanitize_text(str(e))
         if args.json:
-            print(json.dumps({"error": str(e), "overall_status": Status.ERROR.value}))
+            print(json.dumps({"error": sanitized_err, "overall_status": OverallStatus.ERROR.value}))
         else:
-            print(f"FATAL ERROR during operational health check: {str(e)}", file=sys.stderr)
+            print(f"FATAL ERROR during operational health check: {sanitized_err}", file=sys.stderr)
         sys.exit(1)
 
 

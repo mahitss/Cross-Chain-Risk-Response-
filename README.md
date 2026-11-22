@@ -283,7 +283,7 @@ forge build --sizes
 # 4. Execute all 136 unit, invariant, and integration tests with detailed traces
 forge test -vvv
 
-# 5. Execute 20 operational health-check unit tests (mocked RPC)
+# 5. Execute 36 operational health-check unit tests (mocked RPC)
 python -m unittest discover -s test/ops -p "test_*.py"
 
 # 6. Generate local coverage report
@@ -308,7 +308,7 @@ Ran 10 Foundry test suites:
 Total Foundry Tests: 136 passed, 0 failed, 0 skipped (100% pass rate)
 
 Ran Operational Health Check Test Suite:
-- test/ops/test_crossguard_healthcheck.py: 20 passed, 0 failed, 0 errors (100% pass rate)
+- test/ops/test_crossguard_healthcheck.py: 36 passed, 0 failed, 0 errors (100% pass rate)
 ```
 
 ### Verified Contract Bytecode Sizes
@@ -427,17 +427,20 @@ CrossGuard includes an automated, read-only operational health check CLI and an 
 
 ### 1. Read-Only Health Check CLI (`script/ops/crossguard_healthcheck.py`)
 
-A standalone Python utility using Foundry's `cast` binary under strict execution constraints:
+A standalone Python utility using Foundry's `cast` binary under strict operational constraints:
 - **Strict Read-Only Command Whitelist:** Only permits `cast chain-id`, `cast code`, `cast call`, and `cast balance`. Automatically rejects mutating or state-modifying subcommands (`send`, `publish`, `mktx`, `--broadcast`, `--private-key`).
-- **Zero Third-Party Python Dependencies:** Built strictly using Python's standard library (`subprocess`, `json`, `argparse`, `sys`).
+- **Zero Third-Party Python Dependencies:** Built strictly using Python's standard library (`subprocess`, `json`, `argparse`, `sys`, `urllib.parse`).
+- **Centralized RPC Credential Redaction:** Automatically scrubs user-info, sensitive path segments, and query parameters from all terminal outputs, JSON reports, and error messages.
+- **Bounded Query Execution:** Enforces a configurable timeout (default: 15.0s) on all subprocess queries to prevent hanging on stalled RPC endpoints.
+- **Deterministic Monitoring Exit Codes:** Returns exit code `0` for `HEALTHY`, and exit code `1` for `WARNING`, `CRITICAL`, `UNKNOWN`, and `ERROR` for automated monitoring pipelines.
 - **Exhaustive Multi-Chain Inspection:**
   1. Network connectivity and chain ID validation (Base Sepolia `84532`, Reactive Lasna `5318007`, Unichain Sepolia `1301`).
   2. Contract bytecode verification at all configured addresses.
   3. Cross-chain contract configuration wiring (matching controller addresses and callback recipient).
   4. Reactive reserve and debt accounting for both the Reactive System Contract (`0x8888...8888`) and the Unichain Callback Proxy (`0x9299...7FC4`).
   5. Callback gas limit verification (enforcing $\ge 100,000$ gas).
-  6. Operational advisory for `CrossGuardReactive.pay()` (`"Not implemented"` warning).
-  7. Historical callback status checks via optional `--callback-id` or `--position-id`.
+  6. Operational advisory for `CrossGuardReactive.pay()` (`"Not implemented"` warning; funds must be routed via `depositTo(address)`).
+  7. Historical callback status checks via optional `--reactive-tx-hash` using documented 6-field return schema `getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])`.
 
 #### Running the Health Check
 
@@ -453,13 +456,13 @@ python script/ops/crossguard_healthcheck.py \
   --base-rpc https://sepolia.base.org \
   --reactive-rpc https://lasna-rpc.reactive.network \
   --unichain-rpc https://sepolia.unichain.org \
-  --risk-controller 0x... \
-  --vault 0x... \
-  --reactive-contract 0x... \
-  --callback-adapter 0x... \
-  --borrowing-controller 0x...
+  --origin-risk-controller 0x... \
+  --reactive-address 0x... \
+  --callback-address 0x... \
+  --borrowing-controller-address 0x... \
+  --reactive-tx-hash 0x...
 
-# Execute the 20-scenario offline unit test suite (100% mocked RPC)
+# Execute the 36-scenario offline unit test suite (100% mocked RPC)
 python -m unittest discover -s test/ops -p "test_*.py"
 ```
 
@@ -473,10 +476,11 @@ A comprehensive operational manual covering **16 multi-chain failure scenarios**
 5. **Post-Remediation Verification:** CLI checks to confirm healthy restoration.
 
 #### Covered Scenarios:
-- **Origin (Base Sepolia):** RPC outage, paused oracle, invalid/stale price feed, zero-ID registration rejection.
-- **Reactive Engine (Lasna):** RPC outage, reactive contract debt / exhausted reserve, insufficient callback gas limit, unconfigured destination callback adapter, `pay()` non-implementation.
-- **Relayer & Delivery:** Omni relayer latency, callback proxy debt / insufficient execution reserves, callback proxy revert.
-- **Destination (Unichain Sepolia):** Callback authentication failure, duplicate/stale nonce revert, administrative pause state conflict, unmapped position ID.
+- **Network RPC Reachability:** Base Sepolia RPC outage, Reactive Lasna RPC outage, Unichain Sepolia RPC outage.
+- **Contract Funding & Reserves:** Reactive System Contract debt / exhausted reserves, Callback Proxy debt / exhausted reserves. (Remediation uses `depositTo(address)`).
+- **Configuration & Wiring:** Insufficient callback gas limit (< 100k), wrong destination callback recipient, wrong authorized Reactive sender.
+- **Relayer & Delivery:** Destination callback failure (`CallbackFailure`), gas exhaustion revert, pending/unrecorded callback status, delayed arrival, duplicate replay attempt, relayer outage.
+- **Oracle & Telemetry Note:** Mock oracle price updates (`TestValuationSource.setAssetPrice`) and position-level LTV telemetry are manual operations. Automated oracle freshness and heartbeat monitoring are documented as future work.
 
 #### Callback Retry & Recovery Boundary:
 - The protocol **does not support automatic destination retries**; duplicate nonces are strictly rejected on Unichain Sepolia to prevent replay attacks.

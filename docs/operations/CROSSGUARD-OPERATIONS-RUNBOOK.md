@@ -1,9 +1,9 @@
 # CrossGuard Operations, Failure Diagnosis & Runbook
 
-**Protocol:** CrossGuard — Autonomous Cross-Chain Risk-Response Protocol  
-**Milestone:** MISSION M005 — Cross-Chain Operational Observability & Failure Diagnosis  
-**Date:** 2026-11-22  
-**Multi-Chain Topology:**  
+**Protocol:** CrossGuard — Autonomous Cross-Chain Risk-Response Protocol
+**Milestone:** MISSION M005 / M005.1 — Operational Observability, Safety & ABI Correctness
+**Date:** 2026-11-23
+**Multi-Chain Topology:**
 - Origin: Base Sepolia (`84532`)  
 - Reactive Engine: Reactive Lasna (`5318007`)  
 - Destination: Unichain Sepolia (`1301`)  
@@ -33,6 +33,9 @@ python script/ops/crossguard_healthcheck.py \
 
 ### Safety & Operational Constraints
 - **Strictly Read-Only:** The health checker only executes whitelisted read-only queries (`cast chain-id`, `cast code`, `cast call`, `cast balance`). It strictly forbids transaction broadcasting, wallet access, or private key handling.
+- **Credential Redaction:** The tool automatically redacts all RPC credentials, user-info, sensitive path segments, and query tokens from terminal outputs, JSON reports, and error messages.
+- **Bounded Execution Timeouts:** Subprocess RPC queries enforce a 15-second default timeout to prevent hanging on unresponsive endpoints.
+- **Strict Exit Codes:** Returns exit code `0` for `HEALTHY`, and exit code `1` for `WARNING`, `CRITICAL`, `UNKNOWN`, and `ERROR` to facilitate reliable monitoring automation.
 - **Human-in-the-Loop Remediation:** Any remediation requiring state changes or funding requires an authorized human operator executing verified, audited transactions. No automated scripts are permitted to hold private keys or execute unilateral recovery transactions.
 
 ---
@@ -92,51 +95,80 @@ Every failure scenario must follow this rigorous five-step diagnostic procedure:
 ---
 
 ### Scenario 4: Reactive Contract Has Debt
+> [!WARNING]
+> Remediation requires spending native REACT tokens on Reactive Lasna and paying gas fees. Do not execute in automated scripts.
+
 1. **Detection:** Health checker reports `funding_reactive_system_debt: CRITICAL`.
 2. **Evidence Collection:**
    ```bash
    cast call 0x8888888888888888888888888888888888888888 "debt(address)(uint256)" "$REACTIVE_CROSSGUARD" --rpc-url "$REACTIVE_LASNA_RPC_URL"
    ```
-3. **Root-Cause Isolation:** `CrossGuardReactive` has unpaid execution fees on the Reactive Omni System Contract. In the Reactive economy, outstanding debt suspends `react()` log processing, halting autonomous risk responses.
+3. **Root-Cause Isolation:** `CrossGuardReactive` has unpaid execution fees on the Reactive Omni System Contract (`0x8888888888888888888888888888888888888888`). In the Reactive economy, outstanding debt suspends `react()` log processing, halting autonomous risk responses.
 4. **Authorized Remediation:**
-   - *Operational Finding:* `CrossGuardReactive.pay(uint256)` reverts with `"Not implemented"`. Therefore, contract native balance cannot automatically settle debt via `pay()`.
-   - *Action:* An authorized operator must deposit native REACT directly into the Omni System Contract using sanctioned system deposit/recharge methods specifying the reactive contract address as beneficiary.
+   - *Operational Rule:* Funding must use the System Contract's documented `depositTo(address)` route. The deposit settles outstanding debt first before crediting any remainder to prepaid reserves.
+   - *Critical Warning:* Direct transfers to the System Contract credit `msg.sender`'s own accounting balance, **not** the contract beneficiary.
+   - *Contract Constraint:* `CrossGuardReactive.pay(uint256)` reverts with `"Not implemented"` and must **never** be invoked as a recovery action.
+   - *Action (Human Operator Only):*
+     ```bash
+     cast send 0x8888888888888888888888888888888888888888 "depositTo(address)" "$REACTIVE_CROSSGUARD" \
+       --value <AMOUNT_WEI> \
+       --rpc-url "$REACTIVE_LASNA_RPC_URL" \
+       --private-key "$OPERATOR_PRIVATE_KEY"
+     ```
 5. **Post-Remediation Verification:** Re-query `debt(address)` and confirm value returns `0`.
 
 ---
 
 ### Scenario 5: Callback Contract Has Debt
+> [!WARNING]
+> Remediation requires spending native gas tokens (ETH) on Unichain Sepolia and paying gas fees. Do not execute in automated scripts.
+
 1. **Detection:** Health checker reports `funding_callback_proxy_debt: CRITICAL`.
 2. **Evidence Collection:**
    ```bash
    cast call 0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4 "debt(address)(uint256)" "$UNICHAIN_CALLBACK_ADAPTER" --rpc-url "$UNICHAIN_SEPOLIA_RPC_URL"
    ```
-3. **Root-Cause Isolation:** Destination `CrossGuardCallback` has unpaid settlement debt with the Unichain Callback Proxy (`0x9299472A...`). Outstanding debt blocks delivery of subsequent cross-chain callbacks.
-4. **Authorized Remediation:** The operator must settle outstanding debt with the Callback Proxy on Unichain Sepolia using the proxy's documented payment method (e.g., direct native transfer or proxy deposit).
+3. **Root-Cause Isolation:** Destination `CrossGuardCallback` has unpaid settlement debt with the Unichain Callback Proxy (`0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4`). Outstanding debt blocks delivery of subsequent cross-chain callbacks.
+4. **Authorized Remediation:**
+   - *Operational Rule:* Settle callback debt by calling `depositTo(address)` on the Callback Proxy. This settles outstanding debt and replenishes execution reserves for `$UNICHAIN_CALLBACK_ADAPTER`.
+   - *Critical Warning:* A direct transfer to the proxy credits the sender, not the callback contract.
+   - *Action (Human Operator Only):*
+     ```bash
+     cast send 0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4 "depositTo(address)" "$UNICHAIN_CALLBACK_ADAPTER" \
+       --value <AMOUNT_WEI> \
+       --rpc-url "$UNICHAIN_SEPOLIA_RPC_URL" \
+       --private-key "$OPERATOR_PRIVATE_KEY"
+     ```
 5. **Post-Remediation Verification:** Confirm `debt(address)` returns `0`.
 
 ---
 
 ### Scenario 6: Reactive Reserves Exhausted
+> [!WARNING]
+> Remediation requires spending native REACT tokens on Reactive Lasna. Do not execute in automated scripts.
+
 1. **Detection:** Health checker reports `funding_reactive_system_reserves: WARNING`.
 2. **Evidence Collection:**
    ```bash
    cast call 0x8888888888888888888888888888888888888888 "reserves(address)(uint256)" "$REACTIVE_CROSSGUARD" --rpc-url "$REACTIVE_LASNA_RPC_URL"
    ```
-3. **Root-Cause Isolation:** Prepaid gas reserves on the System Contract are 0. The contract may soon incur debt upon the next event trigger.
-4. **Authorized Remediation:** Deposit native REACT into System Contract prepaid reserves for `$REACTIVE_CROSSGUARD`.
+3. **Root-Cause Isolation:** Prepaid gas reserves on the System Contract are 0. The contract will incur debt upon the next origin event trigger.
+4. **Authorized Remediation:** Call `depositTo(address)` on the System Contract with native REACT targeting `$REACTIVE_CROSSGUARD`.
 5. **Post-Remediation Verification:** Confirm `reserves(address) > 0`.
 
 ---
 
 ### Scenario 7: Callback Proxy Reserves Exhausted
+> [!WARNING]
+> Remediation requires spending native gas tokens (ETH) on Unichain Sepolia. Do not execute in automated scripts.
+
 1. **Detection:** Health checker reports `funding_callback_proxy_reserves: WARNING`.
 2. **Evidence Collection:**
    ```bash
    cast call 0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4 "reserves(address)(uint256)" "$UNICHAIN_CALLBACK_ADAPTER" --rpc-url "$UNICHAIN_SEPOLIA_RPC_URL"
    ```
 3. **Root-Cause Isolation:** Destination callback reserves on the Callback Proxy are 0.
-4. **Authorized Remediation:** Deposit native ETH into the Callback Proxy on Unichain Sepolia for `$UNICHAIN_CALLBACK_ADAPTER`.
+4. **Authorized Remediation:** Call `depositTo(address)` on the Callback Proxy on Unichain Sepolia targeting `$UNICHAIN_CALLBACK_ADAPTER`.
 5. **Post-Remediation Verification:** Confirm `reserves(address) > 0`.
 
 ---
@@ -181,14 +213,19 @@ Every failure scenario must follow this rigorous five-step diagnostic procedure:
 1. **Detection:** Health check `--reactive-tx-hash <HASH>` reports `callback_record_inspection: CRITICAL` with error data.
 2. **Evidence Collection:**
    ```bash
-   cast call 0x8888888888888888888888888888888888888888 "getCallbacks(uint256)" <HASH_AS_UINT> --rpc-url "$REACTIVE_LASNA_RPC_URL"
+   cast call 0x8888888888888888888888888888888888888888 \
+     "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])" \
+     <HASH_AS_UINT> \
+     --rpc-url "$REACTIVE_LASNA_RPC_URL"
    ```
-   Inspect raw error bytes:
-   - `0x4e487b71` (Panic / assert)
-   - `0x08c379a0` (Error(string))
-   - `0x...` (Custom errors, e.g. `InvalidNonce`, `CannotBypassActiveRiskBreach`, `UnauthorizedCallback`)
+   Inspect decoded six-field records: `(uint256 destination_chain_id, address to, uint256 gas_limit, uint256 gas_price, uint256 tx_id, bytes error)`.
+   - Empty `error` bytes (`0x`): Execution was successful.
+   - Non-empty `error` bytes: Execution reverted. Common signatures:
+     - `0x4e487b71`: Panic / assert.
+     - `0x08c379a0`: Error(string).
+     - Custom errors: `InvalidNonce`, `CannotBypassActiveRiskBreach`, `UnauthorizedCallback`.
 3. **Root-Cause Isolation:** Destination callback execution reverted during proxy delivery. Destination state was not mutated, but gas and fees were charged.
-4. **Authorized Remediation:** Decode the error data using `cast decode-error` or `cast 4byte`. If caused by state misalignment or relayer disruption, an authorized operator must evaluate whether manual administrative containment (`emergencyPauseBorrowing`) is required.
+4. **Authorized Remediation:** Decode the error data using `cast decode-error` or `cast 4byte`. If caused by temporary state misalignment or relayer disruption, an authorized operator must evaluate whether manual administrative containment (`emergencyPauseBorrowing`) is required.
 5. **Post-Remediation Verification:** Query `BorrowingController.isBorrowingPaused(positionId)` to confirm position protection status.
 
 ---
@@ -202,11 +239,14 @@ Every failure scenario must follow this rigorous five-step diagnostic procedure:
 
 ---
 
-### Scenario 13: No Callback Records Found
+### Scenario 13: No Callback Records Found (Pending State)
 1. **Detection:** Health check reports `callback_record_inspection: UNKNOWN` ("Callback records are pending, not yet recorded, or unavailable").
 2. **Evidence Collection:**
    ```bash
-   cast call 0x8888888888888888888888888888888888888888 "getCallbacks(uint256)" <HASH_AS_UINT> --rpc-url "$REACTIVE_LASNA_RPC_URL"
+   cast call 0x8888888888888888888888888888888888888888 \
+     "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])" \
+     <HASH_AS_UINT> \
+     --rpc-url "$REACTIVE_LASNA_RPC_URL"
    ```
 3. **Root-Cause Isolation:** The transaction is either still propagating, unfinalized on the destination chain, or the relayer has not yet written back the callback receipt to the System Contract.
 4. **Authorized Remediation:** **Do not treat as confirmed failure.** Wait for block finalization across Unichain Sepolia and Reactive Lasna (typically 30–120 seconds).
@@ -267,9 +307,9 @@ Every failure scenario must follow this rigorous five-step diagnostic procedure:
 1. **No Guaranteed Destination Execution:** Calling `systemContract.requestCallbackV_1_0()` requests relay transport; it does **not** guarantee destination inclusion or successful EVM execution.
 2. **No Automatic Callback Retry Service:** If a destination callback reverts (e.g., due to temporary gas exhaustion, transient state lock, or proxy debt), the protocol **does not automatically retry** the failed callback.
 3. **No Retries via Replaying Stale Callbacks:** Because `BorrowingController` enforces strictly increasing nonces, an operator cannot simply replay an old failed callback transaction payload; it will revert with `InvalidNonce`.
-4. **No Self-Healing Relayer Network:** A read-only monitoring script cannot repair a broken or partitioned relayer infrastructure.
+4. **No Automated Oracle Freshness or Position LTV Telemetry:** The current `TestValuationSource` only provides `setAssetPrice(address,uint256)` and `getAssetPrice(address)`. It does not support `pause()`, `unpause()`, price timestamps, or heartbeats. The health checker does not monitor price staleness or position LTV health.
 
-### Future Engineering Recommendations (Post-M005)
-If automated cross-chain callback retry is required in future versions, consider:
+### Future Engineering Recommendations (Post-M005.1)
 1. **Origin Re-Evaluation Trigger:** An off-chain monitor observing a `CallbackFailure` on Lasna can trigger a new `evaluatePositionRisk()` on Base Sepolia. If the breach condition persists, this emits a new event with an incremented nonce, generating a fresh, valid cross-chain callback.
-2. **Destination Reconciliation Queue:** A pull-based reconciliation oracle where destination contracts can query verified origin states directly if push callbacks fail.
+2. **Decentralized Oracle Feed Integration:** Upgrade `TestValuationSource` to integrate Chainlink/Pyth feeds with staleness thresholds, heartbeat monitoring, and automated circuit breakers.
+3. **Destination Reconciliation Queue:** A pull-based reconciliation oracle where destination contracts can query verified origin states directly if push callbacks fail.

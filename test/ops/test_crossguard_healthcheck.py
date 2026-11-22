@@ -1,29 +1,16 @@
 #!/usr/bin/env python3
 """
 Unit tests for CrossGuard Operational Health-Check and Diagnostics Tool.
-Part of Mission M005 — Cross-Chain Operational Observability & Failure Diagnosis.
+Part of Mission M005 / M005.1 — Operational Safety, ABI Correctness & Diagnostics Patch.
 
-Covers all 20 required scenarios offline using mocked RPC runner:
-  1. All three correct chain IDs.
-  2. Incorrect chain ID.
-  3. RPC unavailable.
-  4. Missing contract code.
-  5. Correct contract address wiring.
-  6. Incorrect Reactive callback address.
-  7. Incorrect authorized Reactive sender.
-  8. Incorrect borrowing controller adapter.
-  9. Nonzero Reactive debt.
-  10. Nonzero callback proxy debt.
-  11. Zero reserves with no debt.
-  12. Callback gas below 100,000.
-  13. Callback gas at or above 100,000.
-  14. Empty callback records.
-  15. Successful callback record.
-  16. Failed callback record with error data.
-  17. Malformed RPC or ABI output.
-  18. Missing environment configuration.
-  19. JSON output validity.
-  20. No write-capable command execution.
+Comprehensive test coverage across:
+  - Base M005 checks (network, bytecode, wiring, reserves/debt, gas limit)
+  - Critical Fix A: Centralized RPC credential redaction across all output surfaces
+  - Critical Fix B: Correct getCallbacks ABI decoding (six-field tuple, raw hex, mixed outcomes, malformed data)
+  - Critical Fix C: Correct funding recovery instructions (depositTo routing)
+  - Critical Fix D: Strict exit code behavior (0 for HEALTHY, 1 for all others)
+  - Reliability: Bounded subprocess timeout handling
+  - Security: Rejection of write-capable cast commands
 """
 
 import json
@@ -46,8 +33,14 @@ from script.ops.crossguard_healthcheck import (
     CastRpcRunner,
     CheckCategory,
     CrossGuardHealthChecker,
+    OverallStatus,
     RpcRunner,
     Status,
+    compute_exit_code,
+    decode_callback_records,
+    format_terminal_report,
+    redact_rpc_url,
+    sanitize_text,
 )
 
 
@@ -59,7 +52,7 @@ class MockRpcRunner(RpcRunner):
         self.code_map: Dict[Tuple[str, str], str] = {}
         self.call_map: Dict[Tuple[str, str, str], str] = {}
         self.balances: Dict[Tuple[str, str], int] = {}
-        self.exceptions: Dict[str, Exception] = {}
+        self.exceptions: Dict[Any, Exception] = {}
 
     def get_chain_id(self, rpc_url: str) -> int:
         if rpc_url in self.exceptions:
@@ -149,6 +142,49 @@ def populate_healthy_runner(config: Dict[str, Any]) -> MockRpcRunner:
     return runner
 
 
+def encode_abi_callback_array(records: List[Tuple[int, str, int, int, int, str]]) -> str:
+    """Helper to produce raw ABI-encoded hex string for ((uint256,address,uint256,uint256,uint256,bytes)[])."""
+    out = []
+    out.append((32).to_bytes(32, "big"))  # offset to array
+    out.append(len(records).to_bytes(32, "big"))  # array length
+    if len(records) == 0:
+        return "0x" + b"".join(out).hex()
+
+    head_len = len(records) * 32
+    element_payloads = []
+    for r in records:
+        chain_id, to_addr, gas_limit, gas_price, tx_id, err_hex = r
+        if err_hex.startswith("0x"):
+            err_hex = err_hex[2:]
+        err_bytes = bytes.fromhex(err_hex)
+
+        clean_addr = to_addr[2:] if to_addr.startswith("0x") else to_addr
+        clean_addr = clean_addr.zfill(40)
+        t_head = [
+            chain_id.to_bytes(32, "big"),
+            bytes.fromhex(clean_addr).rjust(32, b"\x00"),
+            gas_limit.to_bytes(32, "big"),
+            gas_price.to_bytes(32, "big"),
+            tx_id.to_bytes(32, "big"),
+            (192).to_bytes(32, "big"),  # offset to bytes within tuple
+        ]
+        padded_len = (len(err_bytes) + 31) // 32 * 32
+        t_tail = [
+            len(err_bytes).to_bytes(32, "big"),
+            err_bytes.ljust(padded_len, b"\x00"),
+        ]
+        element_payloads.append(b"".join(t_head) + b"".join(t_tail))
+
+    cur_offset = head_len
+    for payload in element_payloads:
+        out.append(cur_offset.to_bytes(32, "big"))
+        cur_offset += len(payload)
+    for payload in element_payloads:
+        out.append(payload)
+
+    return "0x" + b"".join(out).hex()
+
+
 class TestCrossGuardHealthChecker(unittest.TestCase):
 
     # 1. All three correct chain IDs
@@ -162,12 +198,12 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertEqual(len(net_checks), 3)
         for check in net_checks:
             self.assertEqual(check["status"], Status.PASS.value)
+        self.assertEqual(report["overall_status"], OverallStatus.HEALTHY.value)
 
     # 2. Incorrect chain ID
     def test_02_incorrect_chain_id(self):
         config = create_base_config()
         runner = populate_healthy_runner(config)
-        # Corrupt Base Sepolia chain ID
         runner.chain_ids[config["base_rpc"]] = 1  # Ethereum mainnet
         checker = CrossGuardHealthChecker(config, runner)
         report = checker.run_all_checks()
@@ -175,7 +211,7 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         base_check = next(c for c in report["checks"] if c["name"] == "network_base_sepolia")
         self.assertEqual(base_check["status"], Status.CRITICAL.value)
         self.assertIn("mismatch", base_check["message"])
-        self.assertEqual(report["overall_status"], Status.CRITICAL.value)
+        self.assertEqual(report["overall_status"], OverallStatus.CRITICAL.value)
 
     # 3. RPC unavailable
     def test_03_rpc_unavailable(self):
@@ -188,13 +224,12 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         lasna_check = next(c for c in report["checks"] if c["name"] == "network_reactive_lasna")
         self.assertEqual(lasna_check["status"], Status.ERROR.value)
         self.assertIn("Connection refused", lasna_check["message"])
-        self.assertIn(report["overall_status"], (Status.CRITICAL.value, Status.ERROR.value))
+        self.assertIn(report["overall_status"], (OverallStatus.CRITICAL.value, OverallStatus.ERROR.value))
 
     # 4. Missing contract code
     def test_04_missing_contract_code(self):
         config = create_base_config()
         runner = populate_healthy_runner(config)
-        # Set reactive contract bytecode to empty '0x'
         runner.code_map[(config["reactive_address"].lower(), config["reactive_rpc"])] = "0x"
         checker = CrossGuardHealthChecker(config, runner)
         report = checker.run_all_checks()
@@ -202,7 +237,7 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         deploy_check = next(c for c in report["checks"] if c["name"] == "deployment_reactive_crossguard")
         self.assertEqual(deploy_check["status"], Status.CRITICAL.value)
         self.assertIn("NO deployed bytecode", deploy_check["message"])
-        self.assertEqual(report["overall_status"], Status.CRITICAL.value)
+        self.assertEqual(report["overall_status"], OverallStatus.CRITICAL.value)
 
     # 5. Correct contract address wiring
     def test_05_correct_contract_address_wiring(self):
@@ -215,13 +250,12 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertGreater(len(config_checks), 0)
         for check in config_checks:
             self.assertEqual(check["status"], Status.PASS.value)
-        self.assertEqual(report["overall_status"], Status.PASS.value)
+        self.assertEqual(report["overall_status"], OverallStatus.HEALTHY.value)
 
     # 6. Incorrect Reactive callback address
     def test_06_incorrect_reactive_callback_address(self):
         config = create_base_config()
         runner = populate_healthy_runner(config)
-        # Reactive destinationCallback points to wrong address
         r_addr = config["reactive_address"].lower()
         runner.call_map[(r_addr, "destinationCallback()", config["reactive_rpc"])] = "0x9999999999999999999999999999999999999999"
 
@@ -236,7 +270,6 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
     def test_07_incorrect_authorized_reactive_sender(self):
         config = create_base_config()
         runner = populate_healthy_runner(config)
-        # CrossGuardCallback points to wrong authorizedReactiveSender
         c_addr = config["callback_address"].lower()
         runner.call_map[(c_addr, "authorizedReactiveSender()", config["unichain_rpc"])] = "0xBAD0000000000000000000000000000000000000"
 
@@ -251,7 +284,6 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
     def test_08_incorrect_borrowing_controller_adapter(self):
         config = create_base_config()
         runner = populate_healthy_runner(config)
-        # BorrowingController callbackAdapter points to wrong address
         b_addr = config["borrowing_controller_address"].lower()
         runner.call_map[(b_addr, "callbackAdapter()", config["unichain_rpc"])] = "0xBADADAPTER000000000000000000000000000000"
 
@@ -267,7 +299,6 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         config = create_base_config()
         runner = populate_healthy_runner(config)
         sys_addr = config["system_contract"].lower()
-        # Set unpaid debt on System Contract
         runner.call_map[(sys_addr, "debt(address)", config["reactive_rpc"])] = "50000000000000000"  # 0.05 REACT
 
         checker = CrossGuardHealthChecker(config, runner)
@@ -276,7 +307,8 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         check = next(c for c in report["checks"] if c["name"] == "funding_reactive_system_debt")
         self.assertEqual(check["status"], Status.CRITICAL.value)
         self.assertIn("OUTSTANDING DEBT", check["message"])
-        self.assertEqual(report["overall_status"], Status.CRITICAL.value)
+        self.assertIn("depositTo(reactiveContract)", check["remediation"])
+        self.assertEqual(report["overall_status"], OverallStatus.CRITICAL.value)
 
     # 10. Nonzero callback proxy debt
     def test_10_nonzero_callback_proxy_debt(self):
@@ -291,7 +323,8 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         check = next(c for c in report["checks"] if c["name"] == "funding_callback_proxy_debt")
         self.assertEqual(check["status"], Status.CRITICAL.value)
         self.assertIn("OUTSTANDING DEBT", check["message"])
-        self.assertEqual(report["overall_status"], Status.CRITICAL.value)
+        self.assertIn("depositTo(callbackContract)", check["remediation"])
+        self.assertEqual(report["overall_status"], OverallStatus.CRITICAL.value)
 
     # 11. Zero reserves with no debt
     def test_11_zero_reserves_with_no_debt(self):
@@ -299,7 +332,6 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         runner = populate_healthy_runner(config)
         sys_addr = config["system_contract"].lower()
         proxy_addr = config["callback_proxy"].lower()
-        # Zero debt, but zero reserves
         runner.call_map[(sys_addr, "debt(address)", config["reactive_rpc"])] = "0"
         runner.call_map[(sys_addr, "reserves(address)", config["reactive_rpc"])] = "0"
         runner.call_map[(proxy_addr, "debt(address)", config["unichain_rpc"])] = "0"
@@ -312,14 +344,14 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         p_reserves = next(c for c in report["checks"] if c["name"] == "funding_callback_proxy_reserves")
         self.assertEqual(r_reserves["status"], Status.WARNING.value)
         self.assertEqual(p_reserves["status"], Status.WARNING.value)
-        self.assertEqual(report["overall_status"], Status.WARNING.value)
+        self.assertEqual(report["overall_status"], OverallStatus.WARNING.value)
 
     # 12. Callback gas below 100,000
     def test_12_callback_gas_below_100k(self):
         config = create_base_config()
         runner = populate_healthy_runner(config)
         r_addr = config["reactive_address"].lower()
-        runner.call_map[(r_addr, "callbackGasLimit()", config["reactive_rpc"])] = hex(75_000)  # Invalid
+        runner.call_map[(r_addr, "callbackGasLimit()", config["reactive_rpc"])] = hex(75_000)
 
         checker = CrossGuardHealthChecker(config, runner)
         report = checker.run_all_checks()
@@ -342,14 +374,14 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertEqual(gas_check["status"], Status.PASS.value)
         self.assertIn("100000 gas", gas_check["message"])
 
-    # 14. Empty callback records
+    # 14. Empty callback records (Pending / Unrecorded)
     def test_14_empty_callback_records(self):
         config = create_base_config()
         config["reactive_tx_hash"] = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
         runner = populate_healthy_runner(config)
         sys_addr = config["system_contract"].lower()
-        # Empty array returned by getCallbacks
-        runner.call_map[(sys_addr, "getCallbacks(uint256)", config["reactive_rpc"])] = "0x"
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        runner.call_map[(sys_addr, sig, config["reactive_rpc"])] = "0x"
 
         checker = CrossGuardHealthChecker(config, runner)
         report = checker.run_all_checks()
@@ -359,15 +391,16 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertIn("pending, not yet recorded, or unavailable", rec_check["message"])
         self.assertEqual(rec_check["evidence"]["state"], "PENDING_OR_UNAVAILABLE")
 
-    # 15. Successful callback record
+    # 15. Successful callback record (Documented 6-field schema with empty error)
     def test_15_successful_callback_record(self):
         config = create_base_config()
         config["reactive_tx_hash"] = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
         runner = populate_healthy_runner(config)
         sys_addr = config["system_contract"].lower()
-        # Simulated formatted cast response for successful callback
-        runner.call_map[(sys_addr, "getCallbacks(uint256)", config["reactive_rpc"])] = (
-            "[(1301, 0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890, true, 0x)]"
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        # 6 fields: destination_chain_id, to, gas_limit, gas_price, tx_id, error
+        runner.call_map[(sys_addr, sig, config["reactive_rpc"])] = (
+            "[(1301, 0x3333333333333333333333333333333333333333, 300000, 1000000000, 1, 0x)]"
         )
 
         checker = CrossGuardHealthChecker(config, runner)
@@ -377,15 +410,15 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertEqual(rec_check["status"], Status.PASS.value)
         self.assertIn("recorded as SUCCESS", rec_check["message"])
 
-    # 16. Failed callback record with error data
+    # 16. Failed callback record with error data (Revert bytes)
     def test_16_failed_callback_record_with_error_data(self):
         config = create_base_config()
         config["reactive_tx_hash"] = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
         runner = populate_healthy_runner(config)
         sys_addr = config["system_contract"].lower()
-        # Simulated formatted cast response for failed callback with revert data
-        runner.call_map[(sys_addr, "getCallbacks(uint256)", config["reactive_rpc"])] = (
-            "[(1301, 0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890, false, 0x4e487b71)]"
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        runner.call_map[(sys_addr, sig, config["reactive_rpc"])] = (
+            "[(1301, 0x3333333333333333333333333333333333333333, 300000, 1000000000, 1, 0x4e487b71)]"
         )
 
         checker = CrossGuardHealthChecker(config, runner)
@@ -395,13 +428,13 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertEqual(rec_check["status"], Status.CRITICAL.value)
         self.assertIn("recorded as FAILED", rec_check["message"])
         self.assertIn("0x4e487b71", rec_check["message"])
+        self.assertEqual(rec_check["evidence"]["failed_records"][0]["error"], "0x4e487b71")
 
     # 17. Malformed RPC or ABI output
     def test_17_malformed_rpc_or_abi_output(self):
         config = create_base_config()
         runner = populate_healthy_runner(config)
         r_addr = config["reactive_address"].lower()
-        # Return corrupt non-integer string for originChainId
         runner.call_map[(r_addr, "originChainId()", config["reactive_rpc"])] = "MALFORMED_OUTPUT"
 
         checker = CrossGuardHealthChecker(config, runner)
@@ -413,16 +446,15 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
 
     # 18. Missing environment configuration
     def test_18_missing_environment_configuration(self):
-        # Empty config
         config = {}
         runner = MockRpcRunner()
         checker = CrossGuardHealthChecker(config, runner)
         report = checker.run_all_checks()
 
-        # All network and deployment checks should report UNKNOWN without crashing
         unknown_checks = [c for c in report["checks"] if c["status"] == Status.UNKNOWN.value]
         self.assertGreater(len(unknown_checks), 0)
-        self.assertEqual(report["overall_status"], Status.UNKNOWN.value)
+        self.assertEqual(report["overall_status"], OverallStatus.UNKNOWN.value)
+        self.assertEqual(compute_exit_code(report["overall_status"]), 1)
 
     # 19. JSON output validity
     def test_19_json_output_validity(self):
@@ -437,23 +469,267 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertIn("summary", reloaded)
         self.assertIn("checks", reloaded)
         self.assertIn("topology", reloaded)
-        self.assertEqual(reloaded["overall_status"], Status.PASS.value)
+        self.assertEqual(reloaded["overall_status"], OverallStatus.HEALTHY.value)
 
     # 20. No write-capable command execution
     def test_20_no_write_capable_command_execution(self):
         runner = CastRpcRunner(cast_path="mock_cast")
 
-        # Verify whitelist rejects write commands
         write_commands = ["send", "mktx", "publish", "create2", "wallet"]
         for cmd in write_commands:
             with self.assertRaises(PermissionError):
                 runner._execute(cmd, ["--rpc-url", "http://localhost:8545"])
 
-        # Verify forbidden flags are rejected even with whitelisted subcommands
         forbidden_flags = ["--private-key", "--ledger", "--trezor", "--interactive", "--broadcast"]
         for flag in forbidden_flags:
             with self.assertRaises(PermissionError):
                 runner._execute("call", ["0x1234", "test()", flag, "--rpc-url", "http://localhost:8545"])
+
+    # -------------------------------------------------------------------------
+    # NEW TESTS FOR M005.1 PATCH
+    # -------------------------------------------------------------------------
+
+    # 21. Credential redaction: URL user-info
+    def test_21_credential_redaction_userinfo(self):
+        raw = "https://alice:supersecretpassword123@sepolia.base.org:8545"
+        redacted = redact_rpc_url(raw)
+        self.assertNotIn("alice", redacted)
+        self.assertNotIn("supersecretpassword123", redacted)
+        self.assertEqual(redacted, "https://sepolia.base.org:8545")
+
+    # 22. Credential redaction: Query parameter API key
+    def test_22_credential_redaction_query_params(self):
+        raw = "https://sepolia.unichain.org?apiKey=VERY_SECRET_KEY_999"
+        redacted = redact_rpc_url(raw)
+        self.assertNotIn("VERY_SECRET_KEY_999", redacted)
+        self.assertEqual(redacted, "https://sepolia.unichain.org/<redacted>")
+
+    # 23. Credential redaction: Path-based API key
+    def test_23_credential_redaction_path_api_key(self):
+        raw = "https://eth-sepolia.g.alchemy.com/v2/SECRET_TOKEN_ABCXYZ"
+        redacted = redact_rpc_url(raw)
+        self.assertNotIn("SECRET_TOKEN_ABCXYZ", redacted)
+        self.assertEqual(redacted, "https://eth-sepolia.g.alchemy.com/<redacted>")
+
+    # 24. Credential redaction: Multiple credential locations
+    def test_24_credential_redaction_multiple_locations(self):
+        raw = "https://operator:pass456@lasna-rpc.rnk.dev:8545/v3/my_secret_path?token=jwt_secret_token#anchor"
+        redacted = redact_rpc_url(raw)
+        for secret in ["operator", "pass456", "my_secret_path", "jwt_secret_token"]:
+            self.assertNotIn(secret, redacted)
+        self.assertEqual(redacted, "https://lasna-rpc.rnk.dev:8545/<redacted>")
+
+    # 25. Credential redaction: Complete report contains zero raw secrets
+    def test_25_no_credentials_leak_in_report_or_terminal(self):
+        secret_user = "secret_user"
+        secret_pass = "secret_password"
+        secret_key = "secret_api_key"
+        secret_token = "secret_auth_token"
+
+        config = {
+            "base_rpc": f"https://{secret_user}:{secret_pass}@sepolia.base.org:8545/v1/{secret_key}",
+            "reactive_rpc": f"https://lasna-rpc.rnk.dev?auth={secret_token}",
+            "unichain_rpc": "https://sepolia.unichain.org",
+            "origin_risk_controller": "0x1111111111111111111111111111111111111111",
+            "reactive_address": "0x2222222222222222222222222222222222222222",
+            "callback_address": "0x3333333333333333333333333333333333333333",
+            "borrowing_controller_address": "0x4444444444444444444444444444444444444444",
+            "system_contract": DEFAULT_SYSTEM_CONTRACT,
+            "callback_proxy": DEFAULT_CALLBACK_PROXY,
+        }
+
+        runner = populate_healthy_runner(config)
+        # Also inject an exception with the secret URL to test error sanitization
+        runner.exceptions[config["base_rpc"]] = RuntimeError(f"Connection timeout to {config['base_rpc']}")
+
+        checker = CrossGuardHealthChecker(config, runner)
+        report = checker.run_all_checks()
+
+        json_out = json.dumps(report)
+        terminal_out = format_terminal_report(report)
+
+        for secret in [secret_user, secret_pass, secret_key, secret_token]:
+            self.assertNotIn(secret, json_out, f"Secret '{secret}' leaked in JSON report!")
+            self.assertNotIn(secret, terminal_out, f"Secret '{secret}' leaked in terminal report!")
+
+    # 26. Callback ABI: Properly encoded empty array (raw ABI hex)
+    def test_26_callback_abi_empty_array_hex(self):
+        empty_hex = encode_abi_callback_array([])
+        records, err = decode_callback_records(empty_hex)
+        self.assertIsNone(err)
+        self.assertEqual(records, [])
+
+    # 27. Callback ABI: Raw hex single success
+    def test_27_callback_abi_single_success_hex(self):
+        raw_hex = encode_abi_callback_array([
+            (1301, "0x3333333333333333333333333333333333333333", 300000, 1000000000, 101, "")
+        ])
+        records, err = decode_callback_records(raw_hex)
+        self.assertIsNone(err)
+        self.assertEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["destination_chain_id"], 1301)
+        self.assertEqual(r["gas_limit"], 300000)
+        self.assertEqual(r["tx_id"], 101)
+        self.assertEqual(r["error"], "0x")
+        self.assertTrue(r["success"])
+
+    # 28. Callback ABI: Raw hex single failure with exact error bytes preserved
+    def test_28_callback_abi_single_failure_hex(self):
+        revert_data = "0x82b42900" + "11" * 32  # Custom error with arguments
+        raw_hex = encode_abi_callback_array([
+            (1301, "0x3333333333333333333333333333333333333333", 300000, 1000000000, 102, revert_data)
+        ])
+        records, err = decode_callback_records(raw_hex)
+        self.assertIsNone(err)
+        self.assertEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r["destination_chain_id"], 1301)
+        self.assertEqual(r["error"], revert_data.lower())
+        self.assertFalse(r["success"])
+
+    # 29. Callback ABI: Multiple callback records (all successful)
+    def test_29_callback_multiple_successful_records(self):
+        config = create_base_config()
+        config["reactive_tx_hash"] = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        runner = populate_healthy_runner(config)
+        sys_addr = config["system_contract"].lower()
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        runner.call_map[(sys_addr, sig, config["reactive_rpc"])] = (
+            "[(1301, 0x3333333333333333333333333333333333333333, 300000, 1000000000, 1, 0x), "
+            "(1301, 0x3333333333333333333333333333333333333333, 300000, 1000000000, 2, 0x)]"
+        )
+
+        checker = CrossGuardHealthChecker(config, runner)
+        report = checker.run_all_checks()
+
+        rec_check = next(c for c in report["checks"] if c["name"] == "callback_record_inspection")
+        self.assertEqual(rec_check["status"], Status.PASS.value)
+        self.assertIn("2 record(s)", rec_check["message"])
+
+    # 30. Callback ABI: Multiple records with mixed outcomes (1 success, 1 failure)
+    def test_30_callback_mixed_outcomes(self):
+        config = create_base_config()
+        config["reactive_tx_hash"] = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        runner = populate_healthy_runner(config)
+        sys_addr = config["system_contract"].lower()
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        runner.call_map[(sys_addr, sig, config["reactive_rpc"])] = (
+            "[(1301, 0x3333333333333333333333333333333333333333, 300000, 1000000000, 1, 0x), "
+            "(1301, 0x3333333333333333333333333333333333333333, 300000, 1000000000, 2, 0x08c379a0)]"
+        )
+
+        checker = CrossGuardHealthChecker(config, runner)
+        report = checker.run_all_checks()
+
+        rec_check = next(c for c in report["checks"] if c["name"] == "callback_record_inspection")
+        self.assertEqual(rec_check["status"], Status.CRITICAL.value)
+        self.assertIn("recorded as FAILED", rec_check["message"])
+        self.assertIn("0x08c379a0", rec_check["message"])
+        self.assertEqual(report["overall_status"], OverallStatus.CRITICAL.value)
+
+    # 31. Callback ABI: Malformed ABI response
+    def test_31_callback_malformed_abi(self):
+        records, err = decode_callback_records("0xCORRUPT_HEX_DATA")
+        self.assertIsNone(records)
+        self.assertIsNotNone(err)
+
+        # Confirm health checker converts malformed data into ERROR, never false PASS
+        config = create_base_config()
+        config["reactive_tx_hash"] = "0x1234"
+        runner = populate_healthy_runner(config)
+        sys_addr = config["system_contract"].lower()
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        runner.call_map[(sys_addr, sig, config["reactive_rpc"])] = "0xCORRUPT_HEX_DATA"
+
+        checker = CrossGuardHealthChecker(config, runner)
+        report = checker.run_all_checks()
+        rec_check = next(c for c in report["checks"] if c["name"] == "callback_record_inspection")
+        self.assertEqual(rec_check["status"], Status.ERROR.value)
+        self.assertIn("Failed to decode callback records ABI", rec_check["message"])
+
+    # 32. Callback ABI: Wrong destination chain ID
+    def test_32_callback_wrong_destination_chain(self):
+        config = create_base_config()
+        config["reactive_tx_hash"] = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        runner = populate_healthy_runner(config)
+        sys_addr = config["system_contract"].lower()
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        # Record with wrong chain ID (84532 instead of 1301)
+        runner.call_map[(sys_addr, sig, config["reactive_rpc"])] = (
+            "[(84532, 0x3333333333333333333333333333333333333333, 300000, 1000000000, 1, 0x)]"
+        )
+
+        checker = CrossGuardHealthChecker(config, runner)
+        report = checker.run_all_checks()
+
+        rec_check = next(c for c in report["checks"] if c["name"] == "callback_record_inspection")
+        self.assertEqual(rec_check["status"], Status.CRITICAL.value)
+        self.assertIn("destination chain ID mismatch", rec_check["message"])
+
+    # 33. Callback ABI: Missing destination transaction details (tx_id = 0)
+    def test_33_callback_missing_destination_tx(self):
+        config = create_base_config()
+        config["reactive_tx_hash"] = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        runner = populate_healthy_runner(config)
+        sys_addr = config["system_contract"].lower()
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        runner.call_map[(sys_addr, sig, config["reactive_rpc"])] = (
+            "[(1301, 0x3333333333333333333333333333333333333333, 300000, 1000000000, 0, 0x)]"
+        )
+
+        checker = CrossGuardHealthChecker(config, runner)
+        report = checker.run_all_checks()
+
+        rec_check = next(c for c in report["checks"] if c["name"] == "callback_record_inspection")
+        self.assertEqual(rec_check["status"], Status.PASS.value)
+        self.assertIn("unassigned destination tx identifier", rec_check["message"])
+
+    # 34. Exit codes: Deterministic mapping for every status
+    def test_34_exit_code_behavior_all_statuses(self):
+        self.assertEqual(compute_exit_code(OverallStatus.HEALTHY.value), 0)
+        self.assertEqual(compute_exit_code(OverallStatus.WARNING.value), 1)
+        self.assertEqual(compute_exit_code(OverallStatus.CRITICAL.value), 1)
+        self.assertEqual(compute_exit_code(OverallStatus.UNKNOWN.value), 1)
+        self.assertEqual(compute_exit_code(OverallStatus.ERROR.value), 1)
+        self.assertEqual(compute_exit_code("ANY_OTHER_STATE"), 1)
+
+    # 35. Funding routing: System Contract & Callback Proxy depositTo instructions
+    def test_35_funding_remediation_uses_deposit_to(self):
+        config = create_base_config()
+        runner = populate_healthy_runner(config)
+        sys_addr = config["system_contract"].lower()
+        proxy_addr = config["callback_proxy"].lower()
+        # Set debt on both
+        runner.call_map[(sys_addr, "debt(address)", config["reactive_rpc"])] = "100"
+        runner.call_map[(proxy_addr, "debt(address)", config["unichain_rpc"])] = "200"
+
+        checker = CrossGuardHealthChecker(config, runner)
+        report = checker.run_all_checks()
+
+        sys_debt = next(c for c in report["checks"] if c["name"] == "funding_reactive_system_debt")
+        proxy_debt = next(c for c in report["checks"] if c["name"] == "funding_callback_proxy_debt")
+
+        self.assertIn("depositTo(reactiveContract)", sys_debt["remediation"])
+        self.assertIn("depositTo(callbackContract)", proxy_debt["remediation"])
+        self.assertNotIn("pay(", sys_debt["remediation"])
+
+    # 36. Reliability: RPC Timeout conversion to ERROR and credential sanitization
+    def test_36_timeout_handling_and_redaction(self):
+        secret_rpc = "https://admin:token999@timeout-rpc.org/v1/key"
+        config = create_base_config()
+        config["base_rpc"] = secret_rpc
+        runner = populate_healthy_runner(config)
+        runner.exceptions[secret_rpc] = TimeoutError(f"Cast chain-id query timed out after 15.0s on {secret_rpc}")
+
+        checker = CrossGuardHealthChecker(config, runner)
+        report = checker.run_all_checks()
+
+        net_check = next(c for c in report["checks"] if c["name"] == "network_base_sepolia")
+        self.assertEqual(net_check["status"], Status.ERROR.value)
+        self.assertIn("timed out", net_check["message"])
+        self.assertNotIn("token999", net_check["message"])
+        self.assertNotIn("token999", json.dumps(net_check["evidence"]))
 
 
 if __name__ == "__main__":
