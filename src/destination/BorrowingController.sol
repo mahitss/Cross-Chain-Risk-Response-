@@ -27,6 +27,7 @@ contract BorrowingController is IBorrowingController, Ownable {
     mapping(bytes32 => address) public override positionOwners;
     mapping(bytes32 => bool) public override isBorrowingPaused;
     mapping(bytes32 => bool) public override pausedByRiskBreach;
+    mapping(bytes32 => bool) public override pausedByAdmin;
     mapping(bytes32 => uint256) public override lastProcessedNonce;
     mapping(bytes32 => uint256) public override lastRiskBreachTimestamp;
     mapping(bytes32 => uint256) public positionBorrowDebt;
@@ -92,6 +93,8 @@ contract BorrowingController is IBorrowingController, Ownable {
 
     /// @notice Resumes borrowing for a position upon receiving an authenticated cross-chain risk resolution callback.
     /// @dev Strictly callable by the callback adapter only. Rejects duplicate and out-of-order nonces.
+    ///      Safely handles resolution-first arrival to establish healthy state and advance nonce.
+    ///      Preserves independent administrative emergency pauses.
     function resolveBorrowing(bytes32 positionId, uint256 nonce, uint256 riskLevel, uint256 timestamp)
         external
         override
@@ -102,21 +105,25 @@ contract BorrowingController is IBorrowingController, Ownable {
         if (nonce <= lastNonce) {
             revert InvalidNonce(nonce, lastNonce);
         }
-        if (!isBorrowingPaused[positionId]) {
-            revert PositionNotPaused(positionId);
-        }
 
         lastProcessedNonce[positionId] = nonce;
-        isBorrowingPaused[positionId] = false;
         pausedByRiskBreach[positionId] = false;
 
+        // If an independent administrative pause is NOT active, unpause borrowing
+        if (!pausedByAdmin[positionId]) {
+            if (isBorrowingPaused[positionId]) {
+                isBorrowingPaused[positionId] = false;
+                emit BorrowingResumed(positionId);
+            }
+        }
+
         emit RiskBreachResolved(positionId, nonce, riskLevel, timestamp);
-        emit BorrowingResumed(positionId);
     }
 
     /// @notice Separate administrative emergency circuit breaker to pause borrowing.
     function emergencyPauseBorrowing(bytes32 positionId) external override onlyOwner {
         if (positionId == bytes32(0)) revert InvalidPositionId();
+        pausedByAdmin[positionId] = true;
         isBorrowingPaused[positionId] = true;
         emit EmergencyBorrowingPaused(positionId);
     }
@@ -129,15 +136,17 @@ contract BorrowingController is IBorrowingController, Ownable {
         if (pausedByRiskBreach[positionId]) {
             revert CannotBypassActiveRiskBreach(positionId);
         }
-        if (!isBorrowingPaused[positionId]) {
+        if (!pausedByAdmin[positionId]) {
             revert PositionNotPaused(positionId);
         }
+        pausedByAdmin[positionId] = false;
         isBorrowingPaused[positionId] = false;
         emit BorrowingResumed(positionId);
     }
 
     /// @notice Emergency administrative override to resume borrowing with an explicit reason and audit event.
     /// @dev Used only when cross-chain relay is permanently unavailable and remediation has been attested.
+    ///      Clears both risk-triggered and administrative pause states.
     function emergencyResumeBorrowing(bytes32 positionId, string calldata reason) external override onlyOwner {
         if (positionId == bytes32(0)) revert InvalidPositionId();
         if (bytes(reason).length == 0) revert EmptyEmergencyReason();
@@ -145,6 +154,7 @@ contract BorrowingController is IBorrowingController, Ownable {
 
         isBorrowingPaused[positionId] = false;
         pausedByRiskBreach[positionId] = false;
+        pausedByAdmin[positionId] = false;
 
         emit EmergencyBorrowingResumed(positionId, msg.sender, reason, block.timestamp);
         emit BorrowingResumed(positionId);

@@ -209,11 +209,13 @@ contract BorrowingControllerTest is Test {
         vm.stopPrank();
     }
 
-    function testRevertResolveBorrowingWhenNotPaused() public {
-        // Attempting to resolve when not paused must revert
+    function testResolveBorrowingWhenNotPausedSucceedsAndSetsNonce() public {
+        // Safe out-of-order resolution arrival when not paused succeeds and updates nonce
         vm.prank(callbackAdapter);
-        vm.expectRevert(abi.encodeWithSelector(BorrowingController.PositionNotPaused.selector, positionId));
         controller.resolveBorrowing(positionId, 1, 4500, 2000);
+        assertEq(controller.lastProcessedNonce(positionId), 1);
+        assertFalse(controller.isBorrowingPaused(positionId));
+        assertFalse(controller.pausedByRiskBreach(positionId));
     }
 
     function testEmergencyResumeWithAuditReason() public {

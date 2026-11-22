@@ -161,9 +161,15 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 - **Layer 2 (Injected Contract Address Authentication):** The Reactive Network relayer replaces the first 160 bits of calldata with the actual deployed `CrossGuardReactive` contract address on Lasna. `CrossGuardCallback` validates that `reactiveSender == authorizedReactiveSender`.
 - *Note:* The authenticated identifier is the deployed smart contract address on Reactive Lasna, not a legacy deployer RVM ID.
 
-### 7. Administrative Controls & Emergency Separation
-- **Ordinary Owner Resume:** `BorrowingController.resumeBorrowing(positionId)` is restricted to positions paused administratively. If the position is actively paused due to a cross-chain risk breach (`pausedByRiskBreach == true`), it **reverts with `CannotBypassActiveRiskBreach`**.
-- **Emergency Circuit Breaker:** `emergencyResumeBorrowing(positionId, string calldata reason)` allows owner override only if cross-chain relay infrastructure is permanently disrupted. It mandates a non-empty audit reason string and emits `EmergencyBorrowingResumed` with the caller address, reason, and timestamp for complete on-chain transparency.
+### 7. Administrative Controls, Orthogonal Pause Dimensions & Delivery Convergence
+- **Orthogonal Pause Tracking:** `BorrowingController` decouples administrative pauses from autonomous risk pauses using two distinct tracking mappings:
+  - `pausedByAdmin[positionId]`: Tracks manual emergency pauses placed by the contract owner via `emergencyPauseBorrowing(positionId)`.
+  - `pausedByRiskBreach[positionId]`: Tracks automated risk breach pauses dispatched by the cross-chain callback adapter via `pauseBorrowing(positionId, nonce, ...)`.
+  - `isBorrowingPaused[positionId]`: Represents the effective composite pause state (`pausedByAdmin || pausedByRiskBreach`). Borrowing is blocked if either condition is active.
+- **Independence & Non-Clobbering:** When an autonomous risk-resolution callback arrives (`resolveBorrowing`), it clears `pausedByRiskBreach[positionId] = false`. If `pausedByAdmin[positionId]` is true, `isBorrowingPaused[positionId]` remains `true`, `BorrowingResumed` is not emitted, and borrowing remains safely paused. Autonomous risk recovery cannot clobber governance actions.
+- **Ordinary Owner Resume:** `BorrowingController.resumeBorrowing(positionId)` is restricted to clearing administrative pauses (`pausedByAdmin`). If the position is actively paused due to a cross-chain risk breach (`pausedByRiskBreach == true`), it **reverts with `CannotBypassActiveRiskBreach`**.
+- **Out-of-Order Delivery Convergence:** `resolveBorrowing` is designed to be idempotent with respect to the pause flag while strictly monotonic with respect to nonces. If network delay or dropped packets cause a resolution callback (e.g., nonce 2) to arrive before an earlier breach callback (e.g., nonce 1), `resolveBorrowing` safely advances `lastProcessedNonce` to 2 and establishes the healthy state without reverting. When the delayed breach message (nonce 1) arrives later, it is rejected as stale (`InvalidNonce(1, 2)`), preventing permanent liveness locks.
+- **Emergency Circuit Breaker:** `emergencyResumeBorrowing(positionId, string calldata reason)` allows owner override to clear both pause dimensions only if cross-chain relay infrastructure is permanently disrupted. It mandates a non-empty audit reason string and emits `EmergencyBorrowingResumed` with the caller address, reason, and timestamp for complete on-chain transparency.
 
 ### 8. Position ID Invariant on State-Changing Functions
 - Zero position IDs (`bytes32(0)`) are invalid protocol-wide for state transitions.
@@ -195,6 +201,10 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 ├── .github/
 │   └── workflows/
 │       └── test.yml                    # CI workflow (formatting, build, test)
+├── docs/
+│   ├── reports/                        # Milestone verification and audit reports
+│   └── security/
+│       └── M004-THREAT-MODEL.md        # Comprehensive multi-chain threat model & adversarial matrix
 ├── script/
 │   ├── DeployOrigin.s.sol              # Base Sepolia origin deployment script (network-guarded: 84532)
 │   ├── DeployDestination.s.sol         # Unichain Sepolia destination deployment script (network-guarded: 1301)
@@ -228,6 +238,7 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 │       ├── ConfigurationConsistency.t.sol # Cross-chain configuration & topology consistency tests
 │       ├── CrossGuardCallback.t.sol    # Unit tests for callback proxy & sender authentication
 │       ├── CrossGuardReactive.t.sol    # Unit tests for reactive event filtering & validation
+│       ├── M004AdversarialSecurity.t.sol # Adversarial security, out-of-order delivery & invariant fuzzing
 │       ├── RiskController.t.sol        # Unit tests for fixed-point LTV math & event emission
 │       ├── ScriptPreflight.t.sol       # Unit tests for all 4 deployment network guards
 │       └── TestValuationSource.t.sol   # Unit tests for valuation oracle
@@ -263,7 +274,7 @@ forge fmt --check
 # 3. Compile contracts and check bytecode sizes
 forge build --sizes
 
-# 4. Execute all 115 unit and integration tests with detailed traces
+# 4. Execute all 136 unit, invariant, and integration tests with detailed traces
 forge test -vvv
 
 # 5. Generate local coverage report
@@ -273,7 +284,7 @@ forge coverage --ir-minimum
 ### Verified Test Results
 
 ```text
-Ran 9 test suites:
+Ran 10 test suites:
 - test/unit/BorrowingController.t.sol: 20 passed, 0 failed, 0 skipped
 - test/unit/CrossGuardReactive.t.sol: 24 passed, 0 failed, 0 skipped
 - test/unit/CollateralVault.t.sol: 19 passed, 0 failed, 0 skipped
@@ -282,16 +293,17 @@ Ran 9 test suites:
 - test/unit/ConfigurationConsistency.t.sol: 10 passed, 0 failed, 0 skipped
 - test/unit/TestValuationSource.t.sol: 4 passed, 0 failed, 0 skipped
 - test/unit/ScriptPreflight.t.sol: 4 passed, 0 failed, 0 skipped
+- test/unit/M004AdversarialSecurity.t.sol: 21 passed, 0 failed, 0 skipped
 - test/integration/CrossGuardE2E.t.sol: 2 passed, 0 failed, 0 skipped
 
-Total: 115 passed, 0 failed, 0 skipped (100% pass rate)
+Total: 136 passed, 0 failed, 0 skipped (100% pass rate)
 ```
 
 ### Verified Contract Bytecode Sizes
 
 | Contract | Runtime Size (Bytes) | Max Limit (24,576 Bytes) | Safety Margin |
 | :--- | :--- | :--- | :--- |
-| `BorrowingController` | 2,806 B | 24,576 B | 21,770 B (88.6% margin) |
+| `BorrowingController` | 2,829 B | 24,576 B | 21,747 B (88.5% margin) |
 | `CollateralVault` | 3,499 B | 24,576 B | 21,077 B (85.8% margin) |
 | `CrossGuardCallback` | 2,314 B | 24,576 B | 22,262 B (90.6% margin) |
 | `CrossGuardReactive` | 3,684 B | 24,576 B | 20,892 B (85.0% margin) |
@@ -305,7 +317,7 @@ Total: 115 passed, 0 failed, 0 skipped (100% pass rate)
 
 | Source File | Line Coverage | Statement Coverage | Branch Coverage | Function Coverage |
 | :--- | :--- | :--- | :--- | :--- |
-| `src/destination/BorrowingController.sol` | **96.10%** (74/77) | **93.42%** (71/76) | **79.17%** (19/24) | **100.00%** (11/11) |
+| `src/destination/BorrowingController.sol` | **97.50%** (78/80) | **94.87%** (74/78) | **84.00%** (21/25) | **100.00%** (11/11) |
 | `src/destination/CrossGuardCallback.sol` | **94.59%** (35/37) | **94.44%** (34/36) | **77.78%** (7/9) | **100.00%** (5/5) |
 | `src/origin/CollateralVault.sol` | **93.59%** (73/78) | **93.27%** (97/104) | **91.67%** (22/24) | **100.00%** (7/7) |
 | `src/origin/RiskController.sol` | **90.91%** (40/44) | **91.49%** (43/47) | **100.00%** (12/12) | **100.00%** (6/6) |
@@ -315,7 +327,7 @@ Total: 115 passed, 0 failed, 0 skipped (100% pass rate)
 | `script/DeployDestination.s.sol` | **44.44%** (12/27) | **45.16%** (14/31) | 0.00% (0/11) | **100.00%** (1/1) |
 | `script/DeployOrigin.s.sol` | **37.50%** (6/16) | **35.00%** (7/20) | 0.00% (0/2) | **100.00%** (1/1) |
 | `script/DeployReactive.s.sol` | **43.33%** (13/30) | **50.00%** (18/36) | 0.00% (0/17) | **100.00%** (1/1) |
-| **All Production Contracts Combined** | **> 94.0%** | **> 93.5%** | **> 84.0%** | **> 97.0%** |
+| **All Production Contracts Combined** | **> 94.5%** | **> 94.0%** | **> 85.0%** | **> 97.0%** |
 
 ### Verified Continuous Integration (CI)
 
