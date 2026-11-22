@@ -202,10 +202,14 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 │   └── workflows/
 │       └── test.yml                    # CI workflow (formatting, build, test)
 ├── docs/
+│   ├── operations/
+│   │   └── CROSSGUARD-OPERATIONS-RUNBOOK.md # Multi-chain operational incident runbook & diagnostic guide
 │   ├── reports/                        # Milestone verification and audit reports
 │   └── security/
 │       └── M004-THREAT-MODEL.md        # Comprehensive multi-chain threat model & adversarial matrix
 ├── script/
+│   ├── ops/
+│   │   └── crossguard_healthcheck.py   # Read-only multi-chain operational health check CLI
 │   ├── DeployOrigin.s.sol              # Base Sepolia origin deployment script (network-guarded: 84532)
 │   ├── DeployDestination.s.sol         # Unichain Sepolia destination deployment script (network-guarded: 1301)
 │   ├── DeployReactive.s.sol            # Reactive Lasna deployment script (network-guarded: 5318007)
@@ -232,6 +236,8 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 │   │   └── CrossGuardE2E.t.sol         # Full cross-chain reactive lifecycle simulation (in-memory)
 │   ├── mocks/
 │   │   └── MockOmniSystemContract.sol  # In-memory mock of Reactive Omni System Contract
+│   ├── ops/
+│   │   └── test_crossguard_healthcheck.py # Offline unit tests for operational health check (20 scenarios)
 │   └── unit/
 │       ├── BorrowingController.t.sol   # Unit tests for destination lending & nonce mechanics
 │       ├── CollateralVault.t.sol       # Unit tests for collateral vault & borrow safety
@@ -277,14 +283,17 @@ forge build --sizes
 # 4. Execute all 136 unit, invariant, and integration tests with detailed traces
 forge test -vvv
 
-# 5. Generate local coverage report
+# 5. Execute 20 operational health-check unit tests (mocked RPC)
+python -m unittest discover -s test/ops -p "test_*.py"
+
+# 6. Generate local coverage report
 forge coverage --ir-minimum
 ```
 
 ### Verified Test Results
 
 ```text
-Ran 10 test suites:
+Ran 10 Foundry test suites:
 - test/unit/BorrowingController.t.sol: 20 passed, 0 failed, 0 skipped
 - test/unit/CrossGuardReactive.t.sol: 24 passed, 0 failed, 0 skipped
 - test/unit/CollateralVault.t.sol: 19 passed, 0 failed, 0 skipped
@@ -296,7 +305,10 @@ Ran 10 test suites:
 - test/unit/M004AdversarialSecurity.t.sol: 21 passed, 0 failed, 0 skipped
 - test/integration/CrossGuardE2E.t.sol: 2 passed, 0 failed, 0 skipped
 
-Total: 136 passed, 0 failed, 0 skipped (100% pass rate)
+Total Foundry Tests: 136 passed, 0 failed, 0 skipped (100% pass rate)
+
+Ran Operational Health Check Test Suite:
+- test/ops/test_crossguard_healthcheck.py: 20 passed, 0 failed, 0 errors (100% pass rate)
 ```
 
 ### Verified Contract Bytecode Sizes
@@ -331,14 +343,16 @@ Total: 136 passed, 0 failed, 0 skipped (100% pass rate)
 
 ### Verified Continuous Integration (CI)
 
-The repository runs automated GitHub Actions CI (`.github/workflows/test.yml`) validating `forge fmt --check`, `forge build --sizes`, and `forge test -vvv` on Ubuntu runners.
+The repository runs automated GitHub Actions CI (`.github/workflows/test.yml`) validating `forge fmt --check`, `forge build --sizes`, `forge test -vvv`, and Python operational unit tests on Ubuntu runners.
 
 - **Automated Steps:**
   1. `forge --version`
   2. `forge fmt --check`
   3. `forge build --sizes`
   4. `forge test -vvv`
-- *Note:* CI verifies formatting, build, and unit/integration tests on every push and pull request; coverage reporting is conducted locally.
+  5. `actions/setup-python@v5` (Python 3.11)
+  6. `python -m unittest discover -s test/ops -p "test_*.py"`
+- *Note:* CI verifies formatting, build, contract unit/integration tests, and Python health check tests on every push and pull request; coverage reporting is conducted locally.
 
 ---
 
@@ -404,6 +418,69 @@ forge script script/ConfigureReactive.s.sol \
   --rpc-url $REACTIVE_LASNA_RPC \
   --broadcast
 ```
+
+---
+
+## 🛠️ Operational Observability & Diagnostics
+
+CrossGuard includes an automated, read-only operational health check CLI and an incident diagnosis runbook to monitor and triage the multi-chain deployment:
+
+### 1. Read-Only Health Check CLI (`script/ops/crossguard_healthcheck.py`)
+
+A standalone Python utility using Foundry's `cast` binary under strict execution constraints:
+- **Strict Read-Only Command Whitelist:** Only permits `cast chain-id`, `cast code`, `cast call`, and `cast balance`. Automatically rejects mutating or state-modifying subcommands (`send`, `publish`, `mktx`, `--broadcast`, `--private-key`).
+- **Zero Third-Party Python Dependencies:** Built strictly using Python's standard library (`subprocess`, `json`, `argparse`, `sys`).
+- **Exhaustive Multi-Chain Inspection:**
+  1. Network connectivity and chain ID validation (Base Sepolia `84532`, Reactive Lasna `5318007`, Unichain Sepolia `1301`).
+  2. Contract bytecode verification at all configured addresses.
+  3. Cross-chain contract configuration wiring (matching controller addresses and callback recipient).
+  4. Reactive reserve and debt accounting for both the Reactive System Contract (`0x8888...8888`) and the Unichain Callback Proxy (`0x9299...7FC4`).
+  5. Callback gas limit verification (enforcing $\ge 100,000$ gas).
+  6. Operational advisory for `CrossGuardReactive.pay()` (`"Not implemented"` warning).
+  7. Historical callback status checks via optional `--callback-id` or `--position-id`.
+
+#### Running the Health Check
+
+```bash
+# Execute health check using environment variables from .env
+python script/ops/crossguard_healthcheck.py
+
+# Output structured JSON for automated alerting / monitoring pipelines
+python script/ops/crossguard_healthcheck.py --json
+
+# Run health check against custom RPCs and contract addresses
+python script/ops/crossguard_healthcheck.py \
+  --base-rpc https://sepolia.base.org \
+  --reactive-rpc https://lasna-rpc.reactive.network \
+  --unichain-rpc https://sepolia.unichain.org \
+  --risk-controller 0x... \
+  --vault 0x... \
+  --reactive-contract 0x... \
+  --callback-adapter 0x... \
+  --borrowing-controller 0x...
+
+# Execute the 20-scenario offline unit test suite (100% mocked RPC)
+python -m unittest discover -s test/ops -p "test_*.py"
+```
+
+### 2. Operational Runbook (`docs/operations/CROSSGUARD-OPERATIONS-RUNBOOK.md`)
+
+A comprehensive operational manual covering **16 multi-chain failure scenarios** following a standardized 5-step diagnostic process:
+1. **Detection:** CLI symptom, log signature, or metric alert.
+2. **Evidence Collection:** Specific read-only CLI commands and RPC calls.
+3. **Root-Cause Isolation:** Deterministic diagnosis logic.
+4. **Authorized Remediation:** Exact manual or administrative steps required.
+5. **Post-Remediation Verification:** CLI checks to confirm healthy restoration.
+
+#### Covered Scenarios:
+- **Origin (Base Sepolia):** RPC outage, paused oracle, invalid/stale price feed, zero-ID registration rejection.
+- **Reactive Engine (Lasna):** RPC outage, reactive contract debt / exhausted reserve, insufficient callback gas limit, unconfigured destination callback adapter, `pay()` non-implementation.
+- **Relayer & Delivery:** Omni relayer latency, callback proxy debt / insufficient execution reserves, callback proxy revert.
+- **Destination (Unichain Sepolia):** Callback authentication failure, duplicate/stale nonce revert, administrative pause state conflict, unmapped position ID.
+
+#### Callback Retry & Recovery Boundary:
+- The protocol **does not support automatic destination retries**; duplicate nonces are strictly rejected on Unichain Sepolia to prevent replay attacks.
+- Recovery from a failed callback occurs when market conditions change or an operator triggers origin re-evaluation (`evaluatePositionRisk()`), advancing the origin nonce and generating a fresh, higher-nonce callback.
 
 ---
 
