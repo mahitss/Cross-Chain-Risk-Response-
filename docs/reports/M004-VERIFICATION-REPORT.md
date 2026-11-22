@@ -2,8 +2,11 @@
 
 **Repository:** `mahitss/Cross-Chain-Risk-Response-`<br>
 **Active Branch:** `fix/m002-2-omni-callback-correctness`<br>
-**Baseline Commit:** `c82c5c5390a86e7882503992fe37b71cf899d631`<br>
-**Milestone:** MISSION M004 — Adversarial Security & Cross-Chain Reliability<br>
+**Baseline Commit (M004):** `c82c5c5390a86e7882503992fe37b71cf899d631`<br>
+**Parent Commit:** `c82c5c5390a86e7882503992fe37b71cf899d631`<br>
+**M004 Implementation Commit:** `ffc29116d9ecd37a49e7b47c262f4a07301c9e1c`<br>
+**GitHub Actions CI Run:** [Run 45002737792 (Conclusion: Success)](https://github.com/mahitss/Cross-Chain-Risk-Response-/actions/runs/45002737792)<br>
+**Milestone:** MISSION M004 / M004.1 — Adversarial Security, Cross-Chain Reliability & Evidence Reconciliation<br>
 **Date:** 2026-11-22
 
 ---
@@ -19,7 +22,8 @@
 | **M003.4.1**| `76345fd995acd74de74253d8207c970e973c9a97` | Implementation | Consistent position ID invariant (`InvalidPositionId` across state-changing functions), fail-closed deployment network preflight guards (`DeployReactive.s.sol`, `ConfigureReactive.s.sol` checking `block.chainid == 5318007`). |
 | **M003.5** | `ba54c4aa29ccbde757b215b14dec7ff2bf4e759f` | Documentation | Complete codebase audit, comprehensive rewrite of `README.md`, verified test/coverage metrics, and CI evidence reporting. |
 | **M003.6** | `c82c5c5390a86e7882503992fe37b71cf899d631` | Implementation & Docs | Comprehensive multi-chain deployment safety: fail-closed `block.chainid` preflight guards added to `DeployOrigin.s.sol` (`84532`) and `DeployDestination.s.sol` (`1301`), expanded `ScriptPreflightTest` suite (115 total tests), and precision corrections in documentation. |
-| **M004** | *Current* | Adversarial Security & Reliability | Formal threat model and 18-vector attack matrix authored in `docs/security/M004-THREAT-MODEL.md`. Resolved pause state conflation vulnerability (orthogonal `pausedByAdmin` vs `pausedByRiskBreach`). Resolved out-of-order callback liveness trap (`resolveBorrowing` idempotence & watermark progression). Added 21 adversarial and invariant tests (`M004AdversarialSecurity.t.sol`), reaching 136 total tests (100% pass rate). |
+| **M004** | `ffc29116d9ecd37a49e7b47c262f4a07301c9e1c` | Adversarial Security & Reliability | Formal threat model and 18-vector attack matrix authored in `docs/security/M004-THREAT-MODEL.md`. Resolved pause state conflation vulnerability (orthogonal `pausedByAdmin` vs `pausedByRiskBreach`). Resolved out-of-order callback liveness trap (`resolveBorrowing` idempotence & watermark progression). Added 21 adversarial and property fuzz tests (`M004AdversarialSecurity.t.sol`), reaching 136 total tests (100% pass rate). CI: Run 45002737792 (success). |
+| **M004.1** | *Current* | Documentation & Reconciliation | Security evidence reconciliation: updated threat model and verification report to reflect post-remediation watermark behavior, marked attack matrix with exact tests, clarified fuzz/property tests vs stateful invariant-handler campaigns, and affirmed local mock cross-chain simulation boundaries. Contract implementation remains 100% unchanged. |
 
 ---
 
@@ -28,7 +32,7 @@
 - **Implementation Engineer (Antigravity):** Author of protocol threat model, adversarial test suite, destination state machine hardening, and verification report.
 - **Principal Architect & Independent Reviewer (ChatGPT):** Independent reviewer reviewing architecture, invariants, and implementation evidence.
 - **Product Owner (Mahit):** Protocol owner and final authority on scope and merges.
-- **No Production / Live Deployment Claim:** All tests, including the end-to-end cross-chain lifecycle, are executed locally using Foundry and mock contracts (`MockOmniSystemContract` and `MockCallbackProxy`). Zero contracts have been deployed to live testnets or mainnets.
+- **Local In-Memory Simulation Disclaimer:** All tests, including the end-to-end cross-chain lifecycle, reordered delivery, dropped messages, and execution failures, are executed locally using Foundry and mock contracts (`MockOmniSystemContract` and `MockCallbackProxy`). Zero contracts have been deployed to live testnets or mainnets, and zero live cross-chain messages have been broadcast across live networks.
 - **Zero-Spend Operational Boundary:** Budget remains strictly ₹0. Zero transactions broadcast, zero private keys handled, zero funds expended, and zero branch history rewritten.
 
 ---
@@ -112,10 +116,14 @@ A comprehensive dedicated adversarial suite containing **21 new tests** was crea
 15. `testZeroPositionIdThroughCallbackReceiverReverts`: Proves zero position ID is rejected at destination callback receiver.
 16. `testUnauthorizedConfigChangesOnCallbackReceiverRevert`: Proves unauthorized config changes revert.
 17. `testReactiveRejectsAllInvalidLogMutations`: Fuzz/mutation testing across 11 invalid log permutations in `react()`.
-18. `testFuzzReactiveRiskThresholdSanity`: Fuzz testing LTV and threshold bounds in `react()` (256 runs).
+18. `testFuzzReactiveRiskThresholdSanity`: Parameterized fuzz testing LTV and threshold bounds in `react()` (256 fuzz runs).
 19. `testCallbackRevertLeavesStateUnmutated`: Proves destination execution reverts leave state completely unmutated.
-20. `testInvariantBorrowingNeverSucceedsWhilePaused`: Invariant test proving borrowing never succeeds while paused (256 runs).
-21. `testFuzzNonceMonotonicity`: Fuzz testing monotonic watermark enforcement (256 runs).
+20. `testInvariantBorrowingNeverSucceedsWhilePaused`: Parameterized property test proving borrowing never succeeds while paused (256 fuzz runs).
+21. `testFuzzNonceMonotonicity`: Parameterized fuzz testing monotonic watermark progression (256 fuzz runs).
+
+### Methodological Distinction: Property Fuzz Testing vs Stateful Invariant Handlers
+- The 3 fuzz/property tests in this suite (`testInvariantBorrowingNeverSucceedsWhilePaused`, `testFuzzReactiveRiskThresholdSanity`, `testFuzzNonceMonotonicity`) execute parameterized single-action assertions across randomly generated inputs using Foundry's fuzz engine (`runs: 256`).
+- These tests are distinct from Foundry stateful invariant campaigns (which employ dedicated handler contracts with `targetContract` / `targetSender` multi-action sequence generation). They provide rapid, reproducible coverage of boundary arithmetic and monotonic invariants without introducing handler complexity.
 
 ---
 
@@ -193,10 +201,10 @@ All production smart contracts combined maintain **> 94.5% line coverage**, **> 
 
 ---
 
-## 9. Untested Network Assumptions & Remaining Risks
+## 9. Untested Network Assumptions & Local Simulation Boundaries
 
-1. **In-Memory Synchrony vs Live Asynchrony:**
-   All Foundry tests execute in a single synchronous EVM environment. Real cross-chain execution involves multi-block confirmations, variable relayer latency (seconds to minutes), gas market volatility on Unichain Sepolia, and potential reorgs on Base Sepolia.
+1. **Local In-Memory Simulation vs Live Network Realities:**
+   All cross-chain failure, message reordering, latency, dropped callback, and execution failure scenarios were simulated locally within Foundry EVM test fixtures using `MockOmniSystemContract` and `MockCallbackProxy`. Live multi-chain operations involve distributed validator consensus on Base Sepolia and Reactive Lasna, variable relayer latency (seconds to minutes), network partitions, gas price surges on Unichain Sepolia, and potential chain reorganizations. None of these physical network dynamics have been verified on live networks.
 2. **Relayer Gas Starvation:**
    If the callback gas limit (`300,000` gas) is insufficient due to future destination contract logic additions or extreme EVM opcode repricing, destination callbacks could run out of gas. `CrossGuardCallback` currently consumes under 70,000 gas, providing a 4.2x safety margin.
 3. **Lasna Account Balance Monitoring:**
