@@ -5,6 +5,8 @@
 **GitHub URL:** `https://github.com/mahitss/Cross-Chain-Risk-Response-`  
 **Working Branch:** `fix/m002-2-omni-callback-correctness`  
 **Baseline Commit:** `d2888010c77f49eaf1c454e1343ae007d815b354`  
+**Commit SHA:** `f6a85f1b308aef4199f2bd5d768df9c14b80dcfb`  
+**CI Workflow Run:** [Run #45251799829](https://github.com/mahitss/Cross-Chain-Risk-Response-/actions/runs/45251799829) (`success`)  
 **Execution Date:** 2026-11-24  
 **Roles:**  
 - **Product Owner:** Mahit  
@@ -173,4 +175,4 @@ The implementation engineer certifies that:
 - Zero live transactions have been broadcast; zero funds expended (₹0 budget strictly preserved).
 - Working branch remains strictly `fix/m002-2-omni-callback-correctness`.
 - Monotonicity, replay resistance, and fail-closed security properties have been verified locally via 159 Foundry tests and 67 Python unit tests.
-- Ready for commit and push to remote.
+- Code committed as `f6a85f1b308aef4199f2bd5d768df9c14b80dcfb`, pushed to remote, and verified on GitHub Actions CI ([Run #45251799829](https://github.com/mahitss/Cross-Chain-Risk-Response-/actions/runs/45251799829) — `conclusion: success`).
