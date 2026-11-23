@@ -324,4 +324,144 @@ contract CrossGuardE2ETest is Test {
         assertEq(omniSys.requestedCallbackCount(), 0, "No callback request should be registered");
         assertFalse(borrowingController.isBorrowingPaused(positionId));
     }
+
+    function testEndToEndControlledCallbackRecoveryLifecycle() public {
+        // 1. Position healthy on origin ($6,000 collateral, $2,000 debt -> 33.33% LTV)
+        assertFalse(borrowingController.isBorrowingPaused(positionId));
+
+        // 2. Alice borrows safely while collateral is healthy ($4,000 debt on $6,000 collateral -> 66.66% LTV)
+        vm.prank(alice);
+        vault.recordBorrow(positionId, mockUsdc, 2000e18);
+
+        // Market shock: Collateral value drops on Base Sepolia ($3,000 -> $2,300)
+        // Collateral: $4,600, Debt: $4,000 -> LTV: 86.95% (exceeds 80.00% threshold)
+        vm.prank(owner);
+        oracle.setAssetPrice(mockWeth, 2300e8);
+
+        // Evaluate risk on Base Sepolia
+        vm.recordLogs();
+        (bool isBreached,, uint256 breachNonce) = vault.evaluatePositionRisk(positionId);
+        assertTrue(isBreached);
+        assertEq(breachNonce, 1);
+
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 breachTopic = crossGuardReactive.RISK_BREACH_TOPIC_0();
+        Vm.Log memory breachLog;
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].emitter == address(riskController) && entries[i].topics[0] == breachTopic) {
+                breachLog = entries[i];
+                break;
+            }
+        }
+
+        // Deliver to Reactive Lasna
+        IReactive.LogRecord memory reactiveLog = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: address(riskController),
+            topic_0: uint256(breachLog.topics[0]),
+            topic_1: uint256(breachLog.topics[1]),
+            topic_2: uint256(breachLog.topics[2]),
+            topic_3: uint256(breachLog.topics[3]),
+            data: breachLog.data,
+            block_number: block.number,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        vm.prank(address(omniSys));
+        crossGuardReactive.react(reactiveLog);
+        assertEq(omniSys.requestedCallbackCount(), 1);
+
+        ISystemContract.CallbackConfiguration_V_1_0 memory cb1 = omniSys.getLastRequestedCallback();
+
+        // 3. Simulated destination delivery failure: out-of-gas
+        (bool execFail,) = callbackProxy.executeCallback(cb1.recipient, cb1.payload, 1000, address(crossGuardReactive));
+        assertFalse(execFail, "Simulated callback execution should fail");
+
+        // Destination remains unpaused, lastProcessedNonce remains 0
+        assertFalse(borrowingController.isBorrowingPaused(positionId));
+        assertEq(borrowingController.lastProcessedNonce(positionId), 0);
+
+        // 4. Repeated evaluation on Base Sepolia does not increment nonce (Idempotency)
+        (bool stillBreached,, uint256 repeatedNonce) = vault.evaluatePositionRisk(positionId);
+        assertTrue(stillBreached);
+        assertEq(repeatedNonce, 1);
+
+        // 5. Controlled Recovery: Owner diagnoses issue and triggers retryFailedCallback
+        bytes32 reason = bytes32("RECOVERY_GAS_EXHAUSTION");
+        vm.prank(owner);
+        crossGuardReactive.retryFailedCallback(positionId, 1, reason);
+        assertEq(omniSys.requestedCallbackCount(), 2);
+
+        ISystemContract.CallbackConfiguration_V_1_0 memory retryCb = omniSys.getLastRequestedCallback();
+        assertEq(retryCb.payload, cb1.payload, "Retried payload must match exact original breach payload");
+
+        // 6. Destination executes retried callback with sufficient gas
+        (bool retrySuccess,) = callbackProxy.executeCallback(
+            retryCb.recipient, retryCb.payload, retryCb.gasLimit, address(crossGuardReactive)
+        );
+        assertTrue(retrySuccess, "Destination retried callback must succeed");
+
+        // Destination is now safely paused, nonce = 1
+        assertTrue(borrowingController.isBorrowingPaused(positionId));
+        assertEq(borrowingController.lastProcessedNonce(positionId), 1);
+
+        // 7. Verify replay protection: replaying the retry callback reverts on destination
+        (bool replaySuccess,) = callbackProxy.executeCallback(
+            retryCb.recipient, retryCb.payload, retryCb.gasLimit, address(crossGuardReactive)
+        );
+        assertFalse(replaySuccess, "Replaying same-nonce callback must revert on destination");
+
+        // 8. Recovery to Healthy on Base Sepolia: Alice deposits more collateral ($6,000 extra)
+        vm.prank(alice);
+        vault.depositCollateral(positionId, mockWeth, 3e18); // Total 5 WETH = $10,000 collateral, $3,500 debt -> 35% LTV
+
+        vm.recordLogs();
+        (bool recoveredBreached,, uint256 resNonce) = vault.evaluatePositionRisk(positionId);
+        assertFalse(recoveredBreached);
+        assertEq(resNonce, 2);
+
+        Vm.Log[] memory resEntries = vm.getRecordedLogs();
+        bytes32 resTopic = crossGuardReactive.RISK_RESOLVED_TOPIC_0();
+        Vm.Log memory resLog;
+        for (uint256 i = 0; i < resEntries.length; i++) {
+            if (resEntries[i].emitter == address(riskController) && resEntries[i].topics[0] == resTopic) {
+                resLog = resEntries[i];
+                break;
+            }
+        }
+
+        // Deliver resolution to Reactive Lasna
+        IReactive.LogRecord memory reactiveResLog = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: address(riskController),
+            topic_0: uint256(resLog.topics[0]),
+            topic_1: uint256(resLog.topics[1]),
+            topic_2: uint256(resLog.topics[2]),
+            topic_3: uint256(resLog.topics[3]),
+            data: resLog.data,
+            block_number: block.number,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        vm.prank(address(omniSys));
+        crossGuardReactive.react(reactiveResLog);
+        assertEq(omniSys.requestedCallbackCount(), 3);
+
+        ISystemContract.CallbackConfiguration_V_1_0 memory cbRes = omniSys.getLastRequestedCallback();
+
+        // Destination executes resolution callback
+        (bool resSuccess,) =
+            callbackProxy.executeCallback(cbRes.recipient, cbRes.payload, cbRes.gasLimit, address(crossGuardReactive));
+        assertTrue(resSuccess, "Resolution callback execution must succeed");
+
+        // Destination is unpaused, nonce = 2
+        assertFalse(borrowingController.isBorrowingPaused(positionId));
+        assertEq(borrowingController.lastProcessedNonce(positionId), 2);
+    }
 }

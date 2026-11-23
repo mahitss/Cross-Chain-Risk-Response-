@@ -17,12 +17,32 @@ contract CrossGuardReactive is IReactive, Ownable {
     error UnauthorizedCaller(address caller);
     error UnsupportedChainId(uint256 chainId);
     error InvalidGasLimit(uint64 gasLimit);
+    error InvalidPositionId();
+    error NoCallbackPayloadStored(bytes32 positionId);
+    error NonceMismatch(uint256 expectedNonce, uint256 actualNonce);
+    error RetryLimitExceeded(bytes32 positionId, uint8 currentRetries, uint8 maxRetries);
+    error DestinationNotConfigured();
+    error InvalidReasonCode();
 
     address public constant OMNI_SYSTEM_CONTRACT = 0x8888888888888888888888888888888888888888;
     uint256 internal constant REACTIVE_IGNORE = 0xa65f96fc951c35ead38878e0f0b7a3c744a6f5ccc1476b313353ce31712313ad;
 
     uint256 public constant BASE_SEPOLIA_CHAIN_ID = 84532;
     uint256 public constant UNICHAIN_SEPOLIA_CHAIN_ID = 1301;
+    uint8 public constant MAX_RETRIES = 3;
+
+    enum CallbackType {
+        NONE,
+        BREACH,
+        RESOLVED
+    }
+
+    struct CallbackState {
+        uint256 nonce;
+        CallbackType eventType;
+        bytes payload;
+        uint8 retryCount;
+    }
 
     bytes32 public constant RISK_BREACH_TOPIC_0 =
         keccak256("RiskBreach(bytes32,address,uint256,uint256,uint256,uint256)");
@@ -37,6 +57,8 @@ contract CrossGuardReactive is IReactive, Ownable {
     uint64 public callbackGasLimit;
 
     uint256 public reactCount;
+    mapping(bytes32 => uint256) public latestOriginNonce;
+    mapping(bytes32 => CallbackState) public latestCallback;
 
     event DestinationConfigUpdated(uint256 chainId, address callbackContract, uint64 gasLimit);
     event ReactiveBreachProcessed(
@@ -47,6 +69,10 @@ contract CrossGuardReactive is IReactive, Ownable {
     );
     event ReactiveEventRejected(
         bytes32 indexed topic0, bytes32 indexed positionId, uint256 indexed nonce, string reason
+    );
+    event StaleOriginEventIgnored(bytes32 indexed positionId, uint256 receivedNonce, uint256 latestNonce);
+    event CallbackRetryRequested(
+        bytes32 indexed positionId, uint256 indexed nonce, uint8 retryAttempt, bytes32 reasonCode
     );
 
     modifier onlySystem() {
@@ -209,7 +235,14 @@ contract CrossGuardReactive is IReactive, Ownable {
             return;
         }
 
-        // 11. Semantic validation of risk evaluation
+        // 11. Monotonic Nonce Ordering Guard: reject duplicate or out-of-order stale origin events
+        if (nonce <= latestOriginNonce[positionId]) {
+            emit StaleOriginEventIgnored(positionId, nonce, latestOriginNonce[positionId]);
+            emit ReactiveEventRejected(topic0, positionId, nonce, "STALE_OR_DUPLICATE_NONCE");
+            return;
+        }
+
+        // 12. Semantic validation of risk evaluation
         if (isBreach) {
             // For a breach, current LTV must be >= threshold
             if (currentLtvBps < riskThresholdBps) {
@@ -225,6 +258,10 @@ contract CrossGuardReactive is IReactive, Ownable {
                 currentLtvBps,
                 timestamp
             );
+
+            latestOriginNonce[positionId] = nonce;
+            latestCallback[positionId] =
+                CallbackState({nonce: nonce, eventType: CallbackType.BREACH, payload: payload, retryCount: 0});
 
             emit ReactiveBreachProcessed(positionId, nonce, currentLtvBps, timestamp);
 
@@ -252,6 +289,10 @@ contract CrossGuardReactive is IReactive, Ownable {
                 timestamp
             );
 
+            latestOriginNonce[positionId] = nonce;
+            latestCallback[positionId] =
+                CallbackState({nonce: nonce, eventType: CallbackType.RESOLVED, payload: payload, retryCount: 0});
+
             emit ReactiveResolvedProcessed(positionId, nonce, currentLtvBps, timestamp);
 
             systemContract.requestCallbackV_1_0(
@@ -263,6 +304,51 @@ contract CrossGuardReactive is IReactive, Ownable {
                 })
             );
         }
+    }
+
+    /// @notice Allows owner to retry a failed callback using the exact stored origin nonce and payload.
+    /// @param positionId The position identifier to retry.
+    /// @param expectedNonce The origin nonce expected to be retried (guards against race conditions).
+    /// @param reasonCode Audit code indicating why the retry was initiated.
+    function retryFailedCallback(bytes32 positionId, uint256 expectedNonce, bytes32 reasonCode) external onlyOwner {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
+        if (reasonCode == bytes32(0)) revert InvalidReasonCode();
+
+        CallbackState storage state = latestCallback[positionId];
+        if (state.nonce == 0 || state.payload.length == 0) revert NoCallbackPayloadStored(positionId);
+        if (state.nonce != expectedNonce) revert NonceMismatch(expectedNonce, state.nonce);
+        if (state.retryCount >= MAX_RETRIES) revert RetryLimitExceeded(positionId, state.retryCount, MAX_RETRIES);
+
+        if (
+            destinationCallback == address(0) || destinationChainId != UNICHAIN_SEPOLIA_CHAIN_ID
+                || callbackGasLimit == 0
+        ) {
+            revert DestinationNotConfigured();
+        }
+
+        state.retryCount++;
+
+        emit CallbackRetryRequested(positionId, state.nonce, state.retryCount, reasonCode);
+
+        systemContract.requestCallbackV_1_0(
+            ISystemContract.CallbackConfiguration_V_1_0({
+                chainId: destinationChainId,
+                recipient: destinationCallback,
+                gasLimit: callbackGasLimit,
+                payload: state.payload
+            })
+        );
+    }
+
+    /// @notice Returns the latest stored callback state for a position.
+    /// @param positionId The position identifier.
+    function getLatestCallback(bytes32 positionId)
+        external
+        view
+        returns (uint256 nonce, CallbackType eventType, bytes memory payload, uint8 retryCount)
+    {
+        CallbackState memory state = latestCallback[positionId];
+        return (state.nonce, state.eventType, state.payload, state.retryCount);
     }
 
     /// @notice Allows owner to withdraw any accidentally sent native tokens.

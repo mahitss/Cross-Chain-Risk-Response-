@@ -683,4 +683,224 @@ contract CrossGuardReactiveTest is Test {
         vm.expectRevert("Not implemented");
         reactiveContract.pay(100);
     }
+
+    event StaleOriginEventIgnored(bytes32 indexed positionId, uint256 receivedNonce, uint256 latestNonce);
+    event CallbackRetryRequested(
+        bytes32 indexed positionId, uint256 indexed nonce, uint8 retryAttempt, bytes32 reasonCode
+    );
+
+    function testReactRejectsDuplicateNonce() public {
+        uint256 nonce = 10;
+        IReactive.LogRecord memory log = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_BREACH_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: nonce,
+            data: abi.encode(8500, 8000, block.timestamp),
+            block_number: 100,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        vm.prank(address(mockSystem));
+        reactiveContract.react(log);
+        assertEq(mockSystem.requestedCallbackCount(), 1);
+        assertEq(reactiveContract.latestOriginNonce(positionId), nonce);
+
+        // Duplicate event with same nonce
+        vm.prank(address(mockSystem));
+        vm.expectEmit(true, false, false, true);
+        emit StaleOriginEventIgnored(positionId, nonce, nonce);
+        vm.expectEmit(true, true, true, true);
+        emit ReactiveEventRejected(RISK_BREACH_TOPIC_0, positionId, nonce, "STALE_OR_DUPLICATE_NONCE");
+        reactiveContract.react(log);
+
+        assertEq(mockSystem.requestedCallbackCount(), 1, "Duplicate log must not dispatch callback");
+    }
+
+    function testReactRejectsLowerNonce() public {
+        IReactive.LogRecord memory log5 = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_BREACH_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: 5,
+            data: abi.encode(8500, 8000, block.timestamp),
+            block_number: 100,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        vm.prank(address(mockSystem));
+        reactiveContract.react(log5);
+        assertEq(reactiveContract.latestOriginNonce(positionId), 5);
+
+        // Out-of-order stale event with nonce 3 arrives
+        IReactive.LogRecord memory log3 = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_RESOLVED_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: 3,
+            data: abi.encode(4000, 8000, block.timestamp + 1),
+            block_number: 101,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        vm.prank(address(mockSystem));
+        vm.expectEmit(true, false, false, true);
+        emit StaleOriginEventIgnored(positionId, 3, 5);
+        vm.expectEmit(true, true, true, true);
+        emit ReactiveEventRejected(RISK_RESOLVED_TOPIC_0, positionId, 3, "STALE_OR_DUPLICATE_NONCE");
+        reactiveContract.react(log3);
+
+        assertEq(mockSystem.requestedCallbackCount(), 1, "Stale lower nonce must not dispatch callback");
+    }
+
+    function testRetryFailedCallbackFullLifecycle() public {
+        uint256 nonce = 1;
+        IReactive.LogRecord memory log = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_BREACH_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: nonce,
+            data: abi.encode(8500, 8000, block.timestamp),
+            block_number: 100,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        vm.prank(address(mockSystem));
+        reactiveContract.react(log);
+        assertEq(mockSystem.requestedCallbackCount(), 1);
+
+        (uint256 storedNonce, CrossGuardReactive.CallbackType cType, bytes memory payload, uint8 retries) =
+            reactiveContract.getLatestCallback(positionId);
+        assertEq(storedNonce, 1);
+        assertEq(uint8(cType), uint8(CrossGuardReactive.CallbackType.BREACH));
+        assertEq(retries, 0);
+        assertTrue(payload.length > 0);
+
+        bytes32 reason = bytes32("RECOVERY_GAS_EXHAUSTION");
+
+        // Retry 1
+        vm.prank(owner);
+        vm.expectEmit(true, true, false, true);
+        emit CallbackRetryRequested(positionId, 1, 1, reason);
+        reactiveContract.retryFailedCallback(positionId, 1, reason);
+        assertEq(mockSystem.requestedCallbackCount(), 2);
+
+        // Retry 2
+        vm.prank(owner);
+        reactiveContract.retryFailedCallback(positionId, 1, reason);
+        assertEq(mockSystem.requestedCallbackCount(), 3);
+
+        // Retry 3
+        vm.prank(owner);
+        reactiveContract.retryFailedCallback(positionId, 1, reason);
+        assertEq(mockSystem.requestedCallbackCount(), 4);
+
+        (,,, uint8 retries3) = reactiveContract.getLatestCallback(positionId);
+        assertEq(retries3, 3);
+
+        // Retry 4 -> Reverts with RetryLimitExceeded
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossGuardReactive.RetryLimitExceeded.selector, positionId, uint8(3), uint8(3))
+        );
+        reactiveContract.retryFailedCallback(positionId, 1, reason);
+
+        // New origin event resets retry budget
+        IReactive.LogRecord memory log2 = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_RESOLVED_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: 2,
+            data: abi.encode(4000, 8000, block.timestamp + 10),
+            block_number: 102,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        vm.prank(address(mockSystem));
+        reactiveContract.react(log2);
+        assertEq(mockSystem.requestedCallbackCount(), 5);
+
+        (uint256 newNonce, CrossGuardReactive.CallbackType newType,, uint8 newRetries) =
+            reactiveContract.getLatestCallback(positionId);
+        assertEq(newNonce, 2);
+        assertEq(uint8(newType), uint8(CrossGuardReactive.CallbackType.RESOLVED));
+        assertEq(newRetries, 0);
+
+        // Can retry nonce 2 now
+        vm.prank(owner);
+        reactiveContract.retryFailedCallback(positionId, 2, reason);
+        assertEq(mockSystem.requestedCallbackCount(), 6);
+    }
+
+    function testRetryFailedCallbackRevertsOnInvalidConditions() public {
+        bytes32 reason = bytes32("RECOVERY_MANUAL");
+
+        // Non-owner
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        reactiveContract.retryFailedCallback(positionId, 1, reason);
+
+        // Zero positionId
+        vm.prank(owner);
+        vm.expectRevert(CrossGuardReactive.InvalidPositionId.selector);
+        reactiveContract.retryFailedCallback(bytes32(0), 1, reason);
+
+        // Zero reason code
+        vm.prank(owner);
+        vm.expectRevert(CrossGuardReactive.InvalidReasonCode.selector);
+        reactiveContract.retryFailedCallback(positionId, 1, bytes32(0));
+
+        // No callback payload stored
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.NoCallbackPayloadStored.selector, positionId));
+        reactiveContract.retryFailedCallback(positionId, 1, reason);
+
+        // Store a callback
+        IReactive.LogRecord memory log = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_BREACH_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: 1,
+            data: abi.encode(8500, 8000, block.timestamp),
+            block_number: 100,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+        vm.prank(address(mockSystem));
+        reactiveContract.react(log);
+
+        // Nonce mismatch (expected 2, but actual is 1)
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.NonceMismatch.selector, 2, 1));
+        reactiveContract.retryFailedCallback(positionId, 2, reason);
+    }
 }

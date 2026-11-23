@@ -34,12 +34,17 @@ from script.ops.crossguard_healthcheck import (
     CheckCategory,
     CrossGuardHealthChecker,
     OverallStatus,
+    RecoveryStatus,
     RpcRunner,
     Status,
     compute_exit_code,
+    compute_recovery_exit_code,
     decode_callback_records,
+    decode_get_latest_callback,
+    format_recovery_preflight_terminal,
     format_terminal_report,
     redact_rpc_url,
+    run_recovery_preflight,
     sanitize_text,
 )
 
@@ -52,6 +57,7 @@ class MockRpcRunner(RpcRunner):
         self.code_map: Dict[Tuple[str, str], str] = {}
         self.call_map: Dict[Tuple[str, str, str], str] = {}
         self.balances: Dict[Tuple[str, str], int] = {}
+        self.receipts: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.exceptions: Dict[Any, Exception] = {}
 
     def get_chain_id(self, rpc_url: str) -> int:
@@ -78,6 +84,12 @@ class MockRpcRunner(RpcRunner):
         if key in self.exceptions:
             raise self.exceptions[key]
         return self.balances.get(key, 0)
+
+    def get_receipt(self, tx_hash: str, rpc_url: str) -> Dict[str, Any]:
+        key = (tx_hash.lower(), rpc_url)
+        if key in self.exceptions:
+            raise self.exceptions[key]
+        return self.receipts.get(key, {})
 
 
 def create_base_config() -> Dict[str, Any]:
@@ -901,6 +913,329 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertEqual(rec_check["status"], Status.UNKNOWN.value)
         self.assertIn("destination transaction hash is zero", rec_check["message"])
         self.assertNotEqual(rec_check["status"], Status.PASS.value)
+
+
+    # =========================================================================
+    # Workstream D: Recovery Preflight Unit Tests (Tests 46-67)
+    # =========================================================================
+
+    def _get_test_position_id(self) -> str:
+        return "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+
+    def _setup_preflight_runner(self, config: Dict[str, Any], position_id: str) -> MockRpcRunner:
+        runner = populate_healthy_runner(config)
+        origin = config["origin_risk_controller"].lower()
+        reactive = config["reactive_address"].lower()
+        dest = config["borrowing_controller_address"].lower()
+        sys_contract = config["system_contract"].lower()
+        proxy = config["callback_proxy"].lower()
+        cb_adapter = config["callback_address"].lower()
+
+        base_rpc = config["base_rpc"]
+        reactive_rpc = config["reactive_rpc"]
+        unichain_rpc = config["unichain_rpc"]
+
+        # Origin state
+        runner.call_map[(origin, "positionNonce(bytes32)", base_rpc)] = "1"
+        runner.call_map[(origin, "isPositionBreached(bytes32)", base_rpc)] = "true"
+
+        # Reactive state
+        runner.call_map[(reactive, "latestOriginNonce(bytes32)", reactive_rpc)] = "1"
+        runner.call_map[(reactive, "getLatestCallback(bytes32)", reactive_rpc)] = "(1, 1, 0x11223344, 0)"
+        runner.call_map[(reactive, "destinationCallback()", reactive_rpc)] = cb_adapter
+        runner.call_map[(reactive, "destinationChainId()", reactive_rpc)] = str(UNICHAIN_SEPOLIA_CHAIN_ID)
+        runner.call_map[(reactive, "callbackGasLimit()", reactive_rpc)] = "300000"
+
+        # Destination state
+        runner.call_map[(dest, "lastProcessedNonce(bytes32)", unichain_rpc)] = "0"
+        runner.call_map[(dest, "isBorrowingPaused(bytes32)", unichain_rpc)] = "false"
+        runner.call_map[(dest, "pausedByRiskBreach(bytes32)", unichain_rpc)] = "false"
+        runner.call_map[(dest, "pausedByAdmin(bytes32)", unichain_rpc)] = "false"
+
+        # Economics
+        runner.call_map[(sys_contract, "debt(address)", reactive_rpc)] = "0"
+        runner.call_map[(sys_contract, "reserves(address)", reactive_rpc)] = str(10**18)
+        runner.call_map[(proxy, "debt(address)", unichain_rpc)] = "0"
+        runner.call_map[(proxy, "reserves(address)", unichain_rpc)] = str(10**18)
+
+        return runner
+
+    # 46. RETRY_ELIGIBLE on destination delivery failure
+    def test_46_preflight_eligible_destination_failure(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_ELIGIBLE.value)
+        self.assertIsNotNone(report["suggested_command"])
+        self.assertIn("retryFailedCallback", report["suggested_command"])
+        self.assertIn(pos_id, report["suggested_command"])
+        self.assertEqual(report["reactive_state"]["stored_callback_nonce"], 1)
+        self.assertEqual(report["destination_state"]["last_processed_nonce"], 0)
+
+    # 47. RETRY_ALREADY_SUCCEEDED when destination lastProcessedNonce >= callback nonce
+    def test_47_preflight_already_succeeded_destination_nonce(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        dest = config["borrowing_controller_address"].lower()
+        runner.call_map[(dest, "lastProcessedNonce(bytes32)", config["unichain_rpc"])] = "1"
+        runner.call_map[(dest, "isBorrowingPaused(bytes32)", config["unichain_rpc"])] = "true"
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_ALREADY_SUCCEEDED.value)
+        self.assertIsNone(report["suggested_command"])
+        self.assertIn("already processed nonce 1", report["reason"])
+
+    # 48. RETRY_ALREADY_SUCCEEDED via confirmed callback record
+    def test_48_preflight_already_succeeded_callback_record(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        sys_contract = config["system_contract"].lower()
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        # destination tx hash non-zero (999), error empty (0x)
+        runner.call_map[(sys_contract, sig, config["reactive_rpc"])] = (
+            f"[(100, {config['reactive_address']}, 1, 1301, 999, 0x)]"
+        )
+
+        report = run_recovery_preflight(config, position_id=pos_id, reactive_tx_hash="0xabcd", runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_ALREADY_SUCCEEDED.value)
+        self.assertIn("confirms destination transaction", report["reason"])
+
+    # 49. RETRY_PENDING when destination transaction hash is zero (0)
+    def test_49_preflight_pending_zero_destination_tx_hash(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        sys_contract = config["system_contract"].lower()
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        runner.call_map[(sys_contract, sig, config["reactive_rpc"])] = (
+            f"[(100, {config['reactive_address']}, 1, 1301, 0, 0x)]"
+        )
+
+        report = run_recovery_preflight(config, position_id=pos_id, reactive_tx_hash="0xabcd", runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_PENDING.value)
+        self.assertIn("pending delivery by relayer", report["reason"])
+
+    # 50. RETRY_PENDING when callback records array is empty
+    def test_50_preflight_pending_empty_callback_records(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        sys_contract = config["system_contract"].lower()
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        runner.call_map[(sys_contract, sig, config["reactive_rpc"])] = "[]"
+
+        report = run_recovery_preflight(config, position_id=pos_id, reactive_tx_hash="0xabcd", runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_PENDING.value)
+        self.assertIn("empty or pending finalization", report["reason"])
+
+    # 51. RETRY_BLOCKED when retry budget exhausted (3 retries)
+    def test_51_preflight_blocked_retry_limit_exceeded(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        reactive = config["reactive_address"].lower()
+        # 3 retries used
+        runner.call_map[(reactive, "getLatestCallback(bytes32)", config["reactive_rpc"])] = "(1, 1, 0x11223344, 3)"
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("Retry limit exceeded", report["reason"])
+
+    # 52. RETRY_BLOCKED when Reactive System Contract debt is outstanding
+    def test_52_preflight_blocked_system_contract_debt(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        sys_contract = config["system_contract"].lower()
+        runner.call_map[(sys_contract, "debt(address)", config["reactive_rpc"])] = "50000"
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("outstanding debt of 50000 wei", report["reason"])
+
+    # 53. RETRY_BLOCKED when Callback Proxy debt is outstanding
+    def test_53_preflight_blocked_callback_proxy_debt(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        proxy = config["callback_proxy"].lower()
+        runner.call_map[(proxy, "debt(address)", config["unichain_rpc"])] = "75000"
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("outstanding debt of 75000 wei", report["reason"])
+
+    # 54. RETRY_BLOCKED when destination callback address is unconfigured (zero address)
+    def test_54_preflight_blocked_destination_callback_zero(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        reactive = config["reactive_address"].lower()
+        runner.call_map[(reactive, "destinationCallback()", config["reactive_rpc"])] = (
+            "0x0000000000000000000000000000000000000000"
+        )
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("Destination callback contract is not configured", report["reason"])
+
+    # 55. RETRY_BLOCKED when destination chain ID is not Unichain Sepolia (1301)
+    def test_55_preflight_blocked_destination_chain_mismatch(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        reactive = config["reactive_address"].lower()
+        runner.call_map[(reactive, "destinationChainId()", config["reactive_rpc"])] = "1"
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("destination chain ID (1) is invalid", report["reason"])
+
+    # 56. RETRY_BLOCKED when callback gas limit is below minimum 100,000
+    def test_56_preflight_blocked_gas_limit_too_low(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        reactive = config["reactive_address"].lower()
+        runner.call_map[(reactive, "callbackGasLimit()", config["reactive_rpc"])] = "50000"
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("callback gas limit (50000) is below minimum", report["reason"])
+
+    # 57. RETRY_BLOCKED when no callback payload is stored for position
+    def test_57_preflight_blocked_no_stored_payload(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        reactive = config["reactive_address"].lower()
+        runner.call_map[(reactive, "getLatestCallback(bytes32)", config["reactive_rpc"])] = "(0, 0, 0x, 0)"
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("No callback payload stored", report["reason"])
+
+    # 58. RETRY_SUPERSEDED when origin has advanced to a newer nonce
+    def test_58_preflight_superseded_newer_origin_nonce(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        origin = config["origin_risk_controller"].lower()
+        # Origin advanced to nonce 2 (e.g. resolution) while stored callback is nonce 1
+        runner.call_map[(origin, "positionNonce(bytes32)", config["base_rpc"])] = "2"
+        runner.call_map[(origin, "isPositionBreached(bytes32)", config["base_rpc"])] = "false"
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_SUPERSEDED.value)
+        self.assertIn("superseded by newer origin nonce 2", report["reason"])
+
+    # 59. RETRY_UNKNOWN on unexpected RPC exception
+    def test_59_preflight_unknown_on_rpc_exception(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        origin = config["origin_risk_controller"].lower()
+        runner.exceptions[(origin, "positionNonce(bytes32)", config["base_rpc"])] = (
+            RuntimeError("Connection timeout to Base Sepolia")
+        )
+
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertIn("Failed to query origin state", report["reason"])
+
+    # 60. RETRY_UNKNOWN on invalid position ID format
+    def test_60_preflight_invalid_position_id_format(self):
+        config = create_base_config()
+        runner = self._setup_preflight_runner(config, "0x1234")
+
+        report = run_recovery_preflight(config, position_id="not-a-valid-32byte-hex", runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertIn("Invalid position ID format", report["reason"])
+
+    # 61. RETRY_UNKNOWN on missing configuration
+    def test_61_preflight_missing_config(self):
+        pos_id = self._get_test_position_id()
+        runner = MockRpcRunner()
+        # Missing Base RPC
+        incomplete_config = {"base_rpc": None}
+
+        report = run_recovery_preflight(incomplete_config, position_id=pos_id, runner=runner)
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertIn("Missing required", report["reason"])
+
+    # 62. CastRpcRunner whitelist allows 'receipt'
+    def test_62_cast_runner_allows_receipt(self):
+        self.assertIn("receipt", CastRpcRunner.ALLOWED_SUBCOMMANDS)
+
+    # 63. CastRpcRunner rejects forbidden subcommands or flags
+    def test_63_cast_runner_rejects_forbidden_subcommands_or_flags(self):
+        runner = CastRpcRunner(cast_path="cast")
+        with self.assertRaises(PermissionError):
+            runner._execute("send", ["0x1234", "--rpc-url", "https://rpc.test"])
+
+        with self.assertRaises(PermissionError):
+            runner._execute("call", ["0x1234", "--private-key", "0xabc"])
+
+    # 64. MockRpcRunner supports get_receipt
+    def test_64_mock_runner_supports_get_receipt(self):
+        runner = MockRpcRunner()
+        runner.receipts[("0xabc", "https://rpc.test")] = {"status": "0x1", "blockNumber": "100"}
+        res = runner.get_receipt("0xabc", "https://rpc.test")
+        self.assertEqual(res["status"], "0x1")
+
+    # 65. Credential redaction in preflight terminal and JSON output
+    def test_65_credential_redaction_in_preflight_terminal_and_json(self):
+        pos_id = self._get_test_position_id()
+        config = {
+            "base_rpc": "https://api_key_secret_base@base-sepolia.rpc.test/v1/sec123",
+            "reactive_rpc": "https://user:pass@reactive-lasna.rpc.test/v1/sec456",
+            "unichain_rpc": "https://unichain-sepolia.rpc.test/?apikey=secret789",
+            "origin_risk_controller": "0x1111111111111111111111111111111111111111",
+            "reactive_address": "0x2222222222222222222222222222222222222222",
+            "callback_address": "0x3333333333333333333333333333333333333333",
+            "borrowing_controller_address": "0x4444444444444444444444444444444444444444",
+            "system_contract": DEFAULT_SYSTEM_CONTRACT,
+            "callback_proxy": DEFAULT_CALLBACK_PROXY,
+        }
+        runner = self._setup_preflight_runner(config, pos_id)
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+
+        # JSON checks
+        report_json = json.dumps(report)
+        self.assertNotIn("sec123", report_json)
+        self.assertNotIn("pass", report_json)
+        self.assertNotIn("secret789", report_json)
+
+        # Terminal checks
+        term_report = format_recovery_preflight_terminal(report)
+        self.assertNotIn("sec123", term_report)
+        self.assertNotIn("pass", term_report)
+        self.assertNotIn("secret789", term_report)
+
+    # 66. Preflight report contains explicit 'Execution: NOT PERFORMED' safety disclaimer
+    def test_66_preflight_report_safety_disclaimer(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        runner = self._setup_preflight_runner(config, pos_id)
+        report = run_recovery_preflight(config, position_id=pos_id, runner=runner)
+
+        self.assertEqual(report["execution"], "NOT PERFORMED (read-only preflight diagnostic)")
+        term_text = format_recovery_preflight_terminal(report)
+        self.assertIn("Execution: NOT PERFORMED (read-only preflight diagnostic)", term_text)
+        self.assertIn("No private keys used, no transactions broadcast, no state mutated", term_text)
+
+    # 67. Recovery exit code behavior
+    def test_67_recovery_exit_code_behavior(self):
+        self.assertEqual(compute_recovery_exit_code(RecoveryStatus.RETRY_ELIGIBLE.value), 0)
+        self.assertEqual(compute_recovery_exit_code(RecoveryStatus.RETRY_ALREADY_SUCCEEDED.value), 0)
+        self.assertEqual(compute_recovery_exit_code(RecoveryStatus.RETRY_BLOCKED.value), 1)
+        self.assertEqual(compute_recovery_exit_code(RecoveryStatus.RETRY_PENDING.value), 1)
+        self.assertEqual(compute_recovery_exit_code(RecoveryStatus.RETRY_SUPERSEDED.value), 1)
+        self.assertEqual(compute_recovery_exit_code(RecoveryStatus.RETRY_UNKNOWN.value), 1)
 
 
 if __name__ == "__main__":

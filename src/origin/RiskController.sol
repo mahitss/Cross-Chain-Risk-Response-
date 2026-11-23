@@ -109,9 +109,15 @@ contract RiskController is IRiskController, Ownable {
 
         if (currentLtvBps >= riskThresholdBps) {
             isBreached = true;
-            isPositionBreached[positionId] = true;
-            nonce = ++positionNonce[positionId];
-            emit RiskBreach(positionId, user, nonce, currentLtvBps, riskThresholdBps, block.timestamp);
+            if (!isPositionBreached[positionId]) {
+                // State Transition: Healthy -> Breached
+                isPositionBreached[positionId] = true;
+                nonce = ++positionNonce[positionId];
+                emit RiskBreach(positionId, user, nonce, currentLtvBps, riskThresholdBps, block.timestamp);
+            } else {
+                // Idempotent: Position remains breached; do not increment nonce or emit redundant event
+                nonce = positionNonce[positionId];
+            }
         } else {
             isBreached = false;
             if (isPositionBreached[positionId]) {
@@ -120,6 +126,7 @@ contract RiskController is IRiskController, Ownable {
                 nonce = ++positionNonce[positionId];
                 emit RiskResolved(positionId, user, nonce, currentLtvBps, riskThresholdBps, block.timestamp);
             } else {
+                // Idempotent: Position remains healthy; do not increment nonce or emit redundant event
                 nonce = positionNonce[positionId];
             }
         }

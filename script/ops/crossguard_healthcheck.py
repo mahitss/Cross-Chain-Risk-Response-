@@ -61,6 +61,15 @@ class OverallStatus(str, Enum):
     ERROR = "ERROR"
 
 
+class RecoveryStatus(str, Enum):
+    RETRY_ELIGIBLE = "RETRY_ELIGIBLE"
+    RETRY_BLOCKED = "RETRY_BLOCKED"
+    RETRY_PENDING = "RETRY_PENDING"
+    RETRY_ALREADY_SUCCEEDED = "RETRY_ALREADY_SUCCEEDED"
+    RETRY_SUPERSEDED = "RETRY_SUPERSEDED"
+    RETRY_UNKNOWN = "RETRY_UNKNOWN"
+
+
 class CheckCategory(str, Enum):
     NETWORK = "NETWORK"
     DEPLOYMENT = "DEPLOYMENT"
@@ -155,6 +164,21 @@ def compute_exit_code(overall_status: str) -> int:
     - ERROR: 1
     """
     if overall_status == OverallStatus.HEALTHY.value:
+        return 0
+    return 1
+
+
+def compute_recovery_exit_code(status: str) -> int:
+    """
+    Calculates process exit code for recovery preflight:
+    - RETRY_ELIGIBLE: 0
+    - RETRY_ALREADY_SUCCEEDED: 0
+    - RETRY_BLOCKED: 1
+    - RETRY_PENDING: 1
+    - RETRY_SUPERSEDED: 1
+    - RETRY_UNKNOWN: 1
+    """
+    if status in (RecoveryStatus.RETRY_ELIGIBLE.value, RecoveryStatus.RETRY_ALREADY_SUCCEEDED.value):
         return 0
     return 1
 
@@ -332,11 +356,14 @@ class RpcRunner:
     def get_balance(self, address: str, rpc_url: str) -> int:
         raise NotImplementedError
 
+    def get_receipt(self, tx_hash: str, rpc_url: str) -> Dict[str, Any]:
+        raise NotImplementedError
+
 
 class CastRpcRunner(RpcRunner):
     """Executes read-only commands using Foundry's cast CLI with strict whitelisting and timeouts."""
 
-    ALLOWED_SUBCOMMANDS = {"chain-id", "code", "call", "balance"}
+    ALLOWED_SUBCOMMANDS = {"chain-id", "code", "call", "balance", "receipt"}
     FORBIDDEN_FLAGS = {"--private-key", "--ledger", "--trezor", "--interactive", "--broadcast"}
     FORBIDDEN_COMMANDS = {"send", "mktx", "publish", "create2", "wallet"}
 
@@ -381,6 +408,13 @@ class CastRpcRunner(RpcRunner):
     def get_balance(self, address: str, rpc_url: str) -> int:
         out = self._execute("balance", [address, "--rpc-url", rpc_url])
         return int(out.split()[0], 0)
+
+    def get_receipt(self, tx_hash: str, rpc_url: str) -> Dict[str, Any]:
+        out = self._execute("receipt", [tx_hash, "--json", "--rpc-url", rpc_url])
+        try:
+            return json.loads(out)
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse receipt JSON: {e}") from e
 
 
 # --- Health Check Engine ---
@@ -1158,6 +1192,434 @@ class CrossGuardHealthChecker:
             )
 
 
+# --- Recovery Preflight Utilities & Logic ---
+def decode_bool(val: Any) -> bool:
+    """Decodes boolean representation from cast/RPC output."""
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("true", "1", "0x1", "0x01"):
+        return True
+    return False
+
+
+def decode_uint(val: Any) -> int:
+    """Decodes uint representation from cast/RPC output."""
+    if isinstance(val, int):
+        return val
+    s = str(val).strip()
+    if not s or s in ("0x", ""):
+        return 0
+    try:
+        return int(s.split()[0], 0)
+    except Exception:
+        return 0
+
+
+def decode_get_latest_callback(raw: str) -> Tuple[int, int, str, int]:
+    """
+    Decodes return data from getLatestCallback(bytes32):
+      (uint256 nonce, uint8 eventType, bytes payload, uint8 retryCount)
+    Returns:
+      (nonce, eventType, payload_hex, retryCount)
+    """
+    s = raw.strip()
+    if not s or s == "0x":
+        return 0, 0, "0x", 0
+
+    # 1. Tuple string format e.g. (1, 1, 0x1234..., 0)
+    if "(" in s and ")" in s:
+        inner = s[s.find("(") + 1 : s.rfind(")")]
+        parts = [p.strip() for p in inner.split(",")]
+        if len(parts) >= 4:
+            try:
+                nonce = int(parts[0], 0)
+                event_type = int(parts[1], 0)
+                payload = parts[2]
+                if not payload.startswith("0x"):
+                    payload = "0x" + payload
+                retry_count = int(parts[3], 0)
+                return nonce, event_type, payload, retry_count
+            except Exception:
+                pass
+
+    # 2. Whitespace separated e.g. 1 1 0x... 0
+    tokens = s.split()
+    if len(tokens) >= 4 and tokens[2].startswith("0x"):
+        try:
+            return int(tokens[0], 0), int(tokens[1], 0), tokens[2], int(tokens[3], 0)
+        except Exception:
+            pass
+
+    # 3. Raw ABI hex
+    if s.startswith("0x") and len(s) >= 258:
+        try:
+            clean = s[2:]
+            nonce = int(clean[0:64], 16)
+            event_type = int(clean[64:128], 16)
+            payload_offset = int(clean[128:192], 16) * 2
+            retry_count = int(clean[192:256], 16)
+            payload_len = int(clean[payload_offset : payload_offset + 64], 16) * 2
+            payload_hex = "0x" + clean[payload_offset + 64 : payload_offset + 64 + payload_len]
+            return nonce, event_type, payload_hex, retry_count
+        except Exception:
+            pass
+
+    return 0, 0, "0x", 0
+
+
+def run_recovery_preflight(
+    config: Dict[str, Any],
+    position_id: str,
+    reactive_tx_hash: Optional[str] = None,
+    runner: Optional[RpcRunner] = None,
+) -> Dict[str, Any]:
+    """
+    Executes read-only cross-chain recovery preflight diagnostics.
+    Evaluates:
+      - Origin risk state and position nonce
+      - Reactive Lasna stored callback state, latest origin nonce, and destination config
+      - Destination borrowing controller state and last processed nonce
+      - Reactive System Contract debt and reserves
+      - Callback Proxy debt and reserves
+      - Optional callback record from Reactive System Contract
+    Classifies status into:
+      RETRY_ELIGIBLE, RETRY_BLOCKED, RETRY_PENDING, RETRY_ALREADY_SUCCEEDED, RETRY_SUPERSEDED, RETRY_UNKNOWN
+    """
+    clean_pos = position_id.strip().lower()
+    if clean_pos.startswith("0x"):
+        clean_pos_hex = clean_pos[2:]
+    else:
+        clean_pos_hex = clean_pos
+    if len(clean_pos_hex) != 64 or not all(c in "0123456789abcdef" for c in clean_pos_hex):
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": RecoveryStatus.RETRY_UNKNOWN.value,
+            "position_id": position_id,
+            "reason": f"Invalid position ID format: '{position_id}'. Must be a 32-byte hex string (64 hex characters).",
+            "remediation": "Provide a valid 32-byte hex position identifier (e.g., 0x1234... or 64 hex characters).",
+            "suggested_command": None,
+            "execution": "NOT PERFORMED (read-only preflight diagnostic)",
+        }
+    norm_pos = "0x" + clean_pos_hex
+
+    if runner is None:
+        runner = CastRpcRunner(timeout=config.get("timeout", DEFAULT_RPC_TIMEOUT_SECONDS))
+
+    base_rpc = config.get("base_rpc")
+    reactive_rpc = config.get("reactive_rpc")
+    unichain_rpc = config.get("unichain_rpc")
+    origin_controller = config.get("origin_risk_controller")
+    reactive_addr = config.get("reactive_address")
+    callback_addr = config.get("callback_address")
+    borrowing_controller = config.get("borrowing_controller_address")
+    system_addr = config.get("system_contract", DEFAULT_SYSTEM_CONTRACT)
+    proxy_addr = config.get("callback_proxy", DEFAULT_CALLBACK_PROXY)
+
+    if not (base_rpc and reactive_rpc and unichain_rpc and origin_controller and reactive_addr and callback_addr and borrowing_controller):
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": RecoveryStatus.RETRY_UNKNOWN.value,
+            "position_id": norm_pos,
+            "reason": "Missing required multi-chain RPC URLs or contract address configuration.",
+            "remediation": "Specify all required RPC URLs and contract addresses via flags or environment variables.",
+            "suggested_command": None,
+            "execution": "NOT PERFORMED (read-only preflight diagnostic)",
+        }
+
+    # 1. Read Origin State
+    try:
+        raw_o_nonce = runner.call(origin_controller, "positionNonce(bytes32)", [norm_pos], base_rpc)
+        origin_nonce = decode_uint(raw_o_nonce)
+        raw_o_breached = runner.call(origin_controller, "isPositionBreached(bytes32)", [norm_pos], base_rpc)
+        origin_breached = decode_bool(raw_o_breached)
+    except Exception as e:
+        sanitized_err = sanitize_text(str(e), [base_rpc])
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": RecoveryStatus.RETRY_UNKNOWN.value,
+            "position_id": norm_pos,
+            "reason": f"Failed to query origin state on Base Sepolia: {sanitized_err}",
+            "remediation": "Check Base Sepolia RPC connectivity and origin RiskController address.",
+            "suggested_command": None,
+            "execution": "NOT PERFORMED (read-only preflight diagnostic)",
+        }
+
+    # 2. Read Reactive State
+    try:
+        raw_r_latest_nonce = runner.call(reactive_addr, "latestOriginNonce(bytes32)", [norm_pos], reactive_rpc)
+        reactive_latest_origin_nonce = decode_uint(raw_r_latest_nonce)
+
+        raw_r_cb = runner.call(reactive_addr, "getLatestCallback(bytes32)", [norm_pos], reactive_rpc)
+        r_cb_nonce, r_cb_type_idx, r_cb_payload, r_cb_retries = decode_get_latest_callback(raw_r_cb)
+
+        type_map = {0: "NONE", 1: "BREACH", 2: "RESOLVED"}
+        r_cb_type = type_map.get(r_cb_type_idx, "UNKNOWN")
+
+        raw_dest_cb = runner.call(reactive_addr, "destinationCallback()", [], reactive_rpc)
+        dest_callback_configured = normalize_address(raw_dest_cb)
+
+        raw_dest_chain = runner.call(reactive_addr, "destinationChainId()", [], reactive_rpc)
+        dest_chain_id_configured = decode_uint(raw_dest_chain)
+
+        raw_gas = runner.call(reactive_addr, "callbackGasLimit()", [], reactive_rpc)
+        gas_limit_configured = decode_uint(raw_gas)
+    except Exception as e:
+        sanitized_err = sanitize_text(str(e), [reactive_rpc])
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": RecoveryStatus.RETRY_UNKNOWN.value,
+            "position_id": norm_pos,
+            "reason": f"Failed to query Reactive state on Reactive Lasna: {sanitized_err}",
+            "remediation": "Check Reactive Lasna RPC connectivity and CrossGuardReactive address.",
+            "suggested_command": None,
+            "execution": "NOT PERFORMED (read-only preflight diagnostic)",
+        }
+
+    # 3. Read Destination State
+    try:
+        raw_d_nonce = runner.call(borrowing_controller, "lastProcessedNonce(bytes32)", [norm_pos], unichain_rpc)
+        dest_last_processed_nonce = decode_uint(raw_d_nonce)
+
+        raw_d_paused = runner.call(borrowing_controller, "isBorrowingPaused(bytes32)", [norm_pos], unichain_rpc)
+        dest_paused = decode_bool(raw_d_paused)
+
+        raw_d_breach = runner.call(borrowing_controller, "pausedByRiskBreach(bytes32)", [norm_pos], unichain_rpc)
+        dest_paused_by_breach = decode_bool(raw_d_breach)
+
+        raw_d_admin = runner.call(borrowing_controller, "pausedByAdmin(bytes32)", [norm_pos], unichain_rpc)
+        dest_paused_by_admin = decode_bool(raw_d_admin)
+    except Exception as e:
+        sanitized_err = sanitize_text(str(e), [unichain_rpc])
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": RecoveryStatus.RETRY_UNKNOWN.value,
+            "position_id": norm_pos,
+            "reason": f"Failed to query destination state on Unichain Sepolia: {sanitized_err}",
+            "remediation": "Check Unichain Sepolia RPC connectivity and BorrowingController address.",
+            "suggested_command": None,
+            "execution": "NOT PERFORMED (read-only preflight diagnostic)",
+        }
+
+    # 4. Read Economics & Debt
+    system_debt = 0
+    system_reserves = 0
+    proxy_debt = 0
+    proxy_reserves = 0
+    try:
+        system_debt = decode_uint(runner.call(system_addr, "debt(address)", [reactive_addr], reactive_rpc))
+        system_reserves = decode_uint(runner.call(system_addr, "reserves(address)", [reactive_addr], reactive_rpc))
+        proxy_debt = decode_uint(runner.call(proxy_addr, "debt(address)", [callback_addr], unichain_rpc))
+        proxy_reserves = decode_uint(runner.call(proxy_addr, "reserves(address)", [callback_addr], unichain_rpc))
+    except Exception:
+        pass
+
+    # 5. Read Callback Record if reactive_tx_hash provided
+    callback_record_info = None
+    if reactive_tx_hash:
+        try:
+            clean_hash = reactive_tx_hash.strip()
+            uint_hash_str = str(int(clean_hash, 16)) if clean_hash.startswith("0x") else str(int(clean_hash))
+            sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+            raw_cbs = runner.call(system_addr, sig, [uint_hash_str], reactive_rpc)
+            records, _ = decode_callback_records(raw_cbs)
+            if records and len(records) > 0:
+                callback_record_info = records[0]
+            elif records is not None and len(records) == 0:
+                callback_record_info = {"empty": True}
+        except Exception:
+            pass
+
+    # 6. Classification Decision Logic
+    status: Optional[RecoveryStatus] = None
+    reason: Optional[str] = None
+    remediation: Optional[str] = None
+
+    # Already Succeeded
+    if dest_last_processed_nonce >= r_cb_nonce and r_cb_nonce > 0:
+        status = RecoveryStatus.RETRY_ALREADY_SUCCEEDED
+        reason = (
+            f"Destination BorrowingController has already processed nonce {dest_last_processed_nonce} "
+            f"(callback nonce {r_cb_nonce}). Borrowing paused={dest_paused}."
+        )
+        remediation = "No recovery action required. Destination state is fully synchronized."
+    elif callback_record_info and not callback_record_info.get("empty"):
+        dest_tx = callback_record_info.get("destination_tx_hash")
+        err_bytes = callback_record_info.get("error", "0x")
+        if dest_tx not in (0, "0", "0x0", "0x", None) and err_bytes in ("0x", ""):
+            status = RecoveryStatus.RETRY_ALREADY_SUCCEEDED
+            reason = f"Callback record confirms destination transaction ({dest_tx}) executed successfully."
+            remediation = "No recovery action required. Callback already confirmed on destination."
+        elif dest_tx in (0, "0", "0x0", "0x", None):
+            status = RecoveryStatus.RETRY_PENDING
+            reason = "Callback is recorded on Reactive Lasna but pending delivery by relayer (destinationTxHash is 0)."
+            remediation = "Wait for cross-chain relayer to submit transaction to Unichain Sepolia."
+
+    # Pending when callback record array is empty
+    if status is None and callback_record_info and callback_record_info.get("empty"):
+        status = RecoveryStatus.RETRY_PENDING
+        reason = "Callback records are empty or pending finalization on Reactive System Contract."
+        remediation = "Allow additional time for Reactive block indexing, then re-check."
+
+    # Superseded by newer origin state
+    if status is None:
+        if origin_nonce > r_cb_nonce and r_cb_nonce > 0:
+            status = RecoveryStatus.RETRY_SUPERSEDED
+            reason = (
+                f"Stored callback nonce {r_cb_nonce} is superseded by newer origin nonce {origin_nonce}. "
+                f"Origin breached={origin_breached}."
+            )
+            remediation = "Do not retry superseded nonce. Evaluate position on origin to generate latest risk event."
+
+    # Blocked conditions
+    if status is None:
+        if r_cb_nonce == 0 or not r_cb_payload or r_cb_payload in ("0x", ""):
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = f"No callback payload stored for position {norm_pos} in CrossGuardReactive."
+            remediation = "Ensure origin risk evaluation has occurred and event was intercepted by Reactive Lasna."
+        elif r_cb_retries >= 3:
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = f"Retry limit exceeded: maximum 3 retries already consumed ({r_cb_retries}/3)."
+            remediation = "Retry budget exhausted. Manual administrative resolution or new origin event required."
+        elif system_debt > 0:
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = f"CrossGuardReactive has outstanding debt of {system_debt} wei on System Contract."
+            remediation = "Settle debt by calling depositTo(reactiveContract) on Reactive System Contract."
+        elif proxy_debt > 0:
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = f"CrossGuardCallback has outstanding debt of {proxy_debt} wei on Callback Proxy."
+            remediation = "Settle debt by calling depositTo(callbackContract) on Callback Proxy on Unichain Sepolia."
+        elif dest_callback_configured in (normalize_address("0x0"), "0x0000000000000000000000000000000000000000", ""):
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = "Destination callback contract is not configured in CrossGuardReactive."
+            remediation = "Owner must call setDestinationConfig with valid destination callback contract address."
+        elif dest_chain_id_configured != UNICHAIN_SEPOLIA_CHAIN_ID:
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = f"Configured destination chain ID ({dest_chain_id_configured}) is invalid (expected {UNICHAIN_SEPOLIA_CHAIN_ID})."
+            remediation = f"Owner must call setDestinationConfig with destination chain ID {UNICHAIN_SEPOLIA_CHAIN_ID}."
+        elif gas_limit_configured < MINIMUM_CALLBACK_GAS:
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = f"Configured callback gas limit ({gas_limit_configured}) is below minimum required {MINIMUM_CALLBACK_GAS}."
+            remediation = f"Owner must call setDestinationConfig to increase callback gas limit to at least {MINIMUM_CALLBACK_GAS}."
+
+    # Eligible
+    if status is None:
+        status = RecoveryStatus.RETRY_ELIGIBLE
+        reason = (
+            f"Recovery conditions met: stored callback nonce {r_cb_nonce} ({r_cb_type}) has not been processed "
+            f"on destination (dest nonce {dest_last_processed_nonce}), retry budget available ({r_cb_retries}/3), "
+            f"and debts are clear."
+        )
+        remediation = "Safe to initiate retryFailedCallback by authorized contract owner."
+
+    suggested_cmd = None
+    if status == RecoveryStatus.RETRY_ELIGIBLE:
+        reason_bytes32 = "0x5245434f564552595f44455354494e4154494f4e5f5245564552540000000000"  # RECOVERY_DESTINATION_REVERT
+        suggested_cmd = (
+            f"cast send {reactive_addr} "
+            f'"retryFailedCallback(bytes32,uint256,bytes32)" '
+            f"{norm_pos} {r_cb_nonce} {reason_bytes32} "
+            f"--rpc-url {redact_rpc_url(reactive_rpc)}"
+        )
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": status.value,
+        "position_id": norm_pos,
+        "reason": reason,
+        "remediation": remediation,
+        "suggested_command": suggested_cmd,
+        "origin_state": {
+            "risk_controller": origin_controller,
+            "nonce": origin_nonce,
+            "breached": origin_breached,
+        },
+        "reactive_state": {
+            "reactive_contract": reactive_addr,
+            "latest_origin_nonce": reactive_latest_origin_nonce,
+            "stored_callback_nonce": r_cb_nonce,
+            "event_type": r_cb_type,
+            "retry_count": r_cb_retries,
+            "max_retries": 3,
+            "destination_chain_id": dest_chain_id_configured,
+            "destination_callback": dest_callback_configured,
+            "callback_gas_limit": gas_limit_configured,
+        },
+        "destination_state": {
+            "borrowing_controller": borrowing_controller,
+            "callback_adapter": callback_addr,
+            "last_processed_nonce": dest_last_processed_nonce,
+            "is_borrowing_paused": dest_paused,
+            "paused_by_risk_breach": dest_paused_by_breach,
+            "paused_by_admin": dest_paused_by_admin,
+        },
+        "economics": {
+            "system_debt_wei": system_debt,
+            "system_reserves_wei": system_reserves,
+            "callback_proxy_debt_wei": proxy_debt,
+            "callback_proxy_reserves_wei": proxy_reserves,
+        },
+        "callback_record": callback_record_info,
+        "topology": {
+            "base_sepolia_rpc": redact_rpc_url(base_rpc),
+            "reactive_lasna_rpc": redact_rpc_url(reactive_rpc),
+            "unichain_sepolia_rpc": redact_rpc_url(unichain_rpc),
+        },
+        "execution": "NOT PERFORMED (read-only preflight diagnostic)",
+    }
+
+
+def format_recovery_preflight_terminal(report: Dict[str, Any]) -> str:
+    """Formats recovery preflight report into a human-readable terminal output."""
+    lines = []
+    lines.append("=" * 80)
+    lines.append("                 CROSSGUARD RECOVERY PREFLIGHT REPORT")
+    lines.append("=" * 80)
+    lines.append(f"Timestamp (UTC): {report['timestamp']}")
+    lines.append(f"Position ID:     {report['position_id']}")
+    lines.append(f"Classification:  [{report['status']}]")
+    lines.append(f"Diagnosis:       {report['reason']}")
+    lines.append("-" * 80)
+
+    # State overview
+    lines.append("CROSS-CHAIN STATE SNAPSHOT:")
+    o = report.get("origin_state", {})
+    r = report.get("reactive_state", {})
+    d = report.get("destination_state", {})
+    lines.append(f"  • Origin (Base Sepolia - 84532):")
+    lines.append(f"      Nonce: {o.get('nonce')} | Breached: {o.get('breached')}")
+    lines.append(f"  • Reactive Lasna (5318007):")
+    lines.append(f"      Latest Origin Nonce:    {r.get('latest_origin_nonce')}")
+    lines.append(f"      Stored Callback Nonce:  {r.get('stored_callback_nonce')} ({r.get('event_type')})")
+    lines.append(f"      Retry Count:            {r.get('retry_count')}/{r.get('max_retries', 3)}")
+    lines.append(f"      Destination Callback:   {r.get('destination_callback')}")
+    lines.append(f"      Callback Gas Limit:     {r.get('callback_gas_limit')}")
+    lines.append(f"  • Destination (Unichain Sepolia - 1301):")
+    lines.append(f"      Last Processed Nonce:   {d.get('last_processed_nonce')}")
+    lines.append(f"      Borrowing Paused:       {d.get('is_borrowing_paused')}")
+    lines.append(f"      Paused By Risk Breach:  {d.get('paused_by_risk_breach')}")
+    lines.append(f"      Paused By Admin:        {d.get('paused_by_admin')}")
+    lines.append("-" * 80)
+
+    econ = report.get("economics", {})
+    lines.append("ECONOMIC PRECONDITIONS:")
+    lines.append(f"  • Reactive System Reserves: {econ.get('system_reserves_wei')} wei | Debt: {econ.get('system_debt_wei')} wei")
+    lines.append(f"  • Callback Proxy Reserves:   {econ.get('callback_proxy_reserves_wei')} wei | Debt: {econ.get('callback_proxy_debt_wei')} wei")
+    lines.append("-" * 80)
+
+    lines.append("REMEDIATION & RECOVERY ACTION:")
+    lines.append(f"  Remediation: {report.get('remediation')}")
+    if report.get("suggested_command"):
+        lines.append("  Suggested Command (execute manually as contract owner):")
+        lines.append(f"    {report['suggested_command']}")
+    lines.append("\n" + "=" * 80)
+    lines.append("SAFETY ADVISORY:")
+    lines.append(f"  Execution: {report['execution']}")
+    lines.append("  No private keys used, no transactions broadcast, no state mutated.")
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
 # --- Human-Readable Terminal Formatter ---
 def format_terminal_report(report: Dict[str, Any]) -> str:
     lines = []
@@ -1254,6 +1716,10 @@ def parse_arguments() -> argparse.Namespace:
         help=f"Unichain Sepolia Callback Proxy address (default: {DEFAULT_CALLBACK_PROXY})",
     )
 
+    # Recovery Preflight
+    parser.add_argument("--recovery-preflight", action="store_true", help="Execute read-only cross-chain recovery preflight diagnostics")
+    parser.add_argument("--position-id", default=None, help="Position ID (bytes32 hex) for recovery preflight diagnostics")
+
     # Optional inspection & timeout
     parser.add_argument("--reactive-tx-hash", default=None, help="Inspect callback record for originating Reactive tx hash")
     parser.add_argument("--timeout", type=float, default=DEFAULT_RPC_TIMEOUT_SECONDS, help="Timeout in seconds for RPC queries")
@@ -1276,10 +1742,35 @@ def main():
         "system_contract": args.system_contract_address,
         "callback_proxy": args.callback_proxy_address,
         "reactive_tx_hash": args.reactive_tx_hash,
+        "timeout": args.timeout,
     }
 
     try:
         runner = CastRpcRunner(timeout=args.timeout)
+
+        if args.recovery_preflight:
+            if not args.position_id:
+                err_msg = "Error: --position-id is required when --recovery-preflight is enabled."
+                if args.json:
+                    print(json.dumps({"error": err_msg, "status": RecoveryStatus.RETRY_UNKNOWN.value}))
+                else:
+                    print(err_msg, file=sys.stderr)
+                sys.exit(1)
+
+            report = run_recovery_preflight(
+                config,
+                position_id=args.position_id,
+                reactive_tx_hash=args.reactive_tx_hash,
+                runner=runner,
+            )
+
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(format_recovery_preflight_terminal(report))
+
+            sys.exit(compute_recovery_exit_code(report["status"]))
+
         checker = CrossGuardHealthChecker(config, runner=runner)
         report = checker.run_all_checks()
 
