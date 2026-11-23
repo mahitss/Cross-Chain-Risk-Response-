@@ -1,7 +1,7 @@
 # CrossGuard Operations, Failure Diagnosis & Runbook
 
 **Protocol:** CrossGuard — Autonomous Cross-Chain Risk-Response Protocol
-**Milestone:** MISSION M005 / M005.1 — Operational Observability, Safety & ABI Correctness
+**Milestone:** MISSION M005 / M005.1 / M005.2 — Operational Observability, Safety & ABI Correctness Patch
 **Date:** 2026-11-23
 **Multi-Chain Topology:**
 - Origin: Base Sepolia (`84532`)  
@@ -218,12 +218,19 @@ Every failure scenario must follow this rigorous five-step diagnostic procedure:
      <HASH_AS_UINT> \
      --rpc-url "$REACTIVE_LASNA_RPC_URL"
    ```
-   Inspect decoded six-field records: `(uint256 destination_chain_id, address to, uint256 gas_limit, uint256 gas_price, uint256 tx_id, bytes error)`.
-   - Empty `error` bytes (`0x`): Execution was successful.
-   - Non-empty `error` bytes: Execution reverted. Common signatures:
-     - `0x4e487b71`: Panic / assert.
-     - `0x08c379a0`: Error(string).
-     - Custom errors: `InvalidNonce`, `CannotBypassActiveRiskBreach`, `UnauthorizedCallback`.
+   Inspect decoded six-field records according to the official Reactive Network economy specification:
+   `(uint256 blockNumber, address reactiveContract, uint256 callbackIndex, uint256 destinationChainId, uint256 destinationTxHash, bytes error)`.
+   - **Field 1 (`blockNumber`):** The Reactive Lasna block number where the callback request was recorded.
+   - **Field 2 (`reactiveContract`):** The requesting Reactive contract address. Must match deployed `CrossGuardReactive` (`CRITICAL` if unexpected contract).
+   - **Field 3 (`callbackIndex`):** The sequential callback index of the request.
+   - **Field 4 (`destinationChainId`):** The target destination EVM network. Must match Unichain Sepolia `1301` (`CRITICAL` if mismatched).
+   - **Field 5 (`destinationTxHash`):** The transaction hash on the destination network. If zero (`0`), the destination transaction has not yet been mined or finalized (`UNKNOWN`, pending relay).
+   - **Field 6 (`error`):** Execution revert bytes on the destination network:
+     - Empty `error` bytes (`0x`): Execution was successful (provided `destinationTxHash != 0`).
+     - Non-empty `error` bytes: Execution reverted. Common signatures:
+       - `0x4e487b71`: Panic / assert.
+       - `0x08c379a0`: Error(string).
+       - Custom errors: `InvalidNonce`, `CannotBypassActiveRiskBreach`, `UnauthorizedCallback`.
 3. **Root-Cause Isolation:** Destination callback execution reverted during proxy delivery. Destination state was not mutated, but gas and fees were charged.
 4. **Authorized Remediation:** Decode the error data using `cast decode-error` or `cast 4byte`. If caused by temporary state misalignment or relayer disruption, an authorized operator must evaluate whether manual administrative containment (`emergencyPauseBorrowing`) is required.
 5. **Post-Remediation Verification:** Query `BorrowingController.isBorrowingPaused(positionId)` to confirm position protection status.
@@ -240,7 +247,7 @@ Every failure scenario must follow this rigorous five-step diagnostic procedure:
 ---
 
 ### Scenario 13: No Callback Records Found (Pending State)
-1. **Detection:** Health check reports `callback_record_inspection: UNKNOWN` ("Callback records are pending, not yet recorded, or unavailable").
+1. **Detection:** Health check reports `callback_record_inspection: UNKNOWN` ("Callback records are pending, not yet recorded, or unavailable" or "destination transaction hash is zero (0)").
 2. **Evidence Collection:**
    ```bash
    cast call 0x8888888888888888888888888888888888888888 \
@@ -248,7 +255,9 @@ Every failure scenario must follow this rigorous five-step diagnostic procedure:
      <HASH_AS_UINT> \
      --rpc-url "$REACTIVE_LASNA_RPC_URL"
    ```
-3. **Root-Cause Isolation:** The transaction is either still propagating, unfinalized on the destination chain, or the relayer has not yet written back the callback receipt to the System Contract.
+3. **Root-Cause Isolation:**
+   - If the return array is empty: The transaction is either still propagating, unfinalized on the destination chain, or the relayer has not yet written back the callback receipt to the System Contract.
+   - If `destinationTxHash` is `0`: The callback request has been recorded on Reactive Lasna, but the relayer has not yet submitted or confirmed the transaction on Unichain Sepolia. Execution status on destination cannot be confirmed as success without a mined destination transaction hash.
 4. **Authorized Remediation:** **Do not treat as confirmed failure.** Wait for block finalization across Unichain Sepolia and Reactive Lasna (typically 30–120 seconds).
 5. **Post-Remediation Verification:** Query `getCallbacks` again after confirmation window.
 

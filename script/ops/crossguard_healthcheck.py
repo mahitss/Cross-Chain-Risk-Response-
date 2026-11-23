@@ -178,12 +178,19 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
     Decodes return data from:
       getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])
 
-    The six-field tuple represents:
-      (uint256 destination_chain_id, address to, uint256 gas_limit, uint256 gas_price, uint256 tx_id, bytes error)
+    Official Reactive Network economy return schema:
+      1. uint256 blockNumber          - Reactive block number when callback was requested
+      2. address reactiveContract     - Requesting Reactive smart contract address
+      3. uint256 callbackIndex        - Sequential index of callback
+      4. uint256 destinationChainId   - Target destination EVM chain ID (e.g., 1301)
+      5. uint256 destinationTxHash    - Transaction hash on destination network (0 if pending relay)
+      6. bytes error                  - Execution revert data on destination (empty if success)
 
     Success condition:
-      An empty error field ('0x' or length 0) signifies SUCCESS.
-      Non-empty error bytes signify a REVERT / FAILURE.
+      - Valid destination chain (1301)
+      - Matching requesting Reactive contract
+      - Non-zero destinationTxHash (mined on destination)
+      - Empty error field ('0x' or length 0)
 
     Returns:
       (records_list, None) on successful parse (records_list may be empty if array length is 0).
@@ -204,7 +211,7 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
         except Exception:
             pass
 
-    # 1. Try parsing formatted tuple string from cast call: [(chain_id, to, gas_limit, gas_price, tx_id, error)]
+    # 1. Try parsing formatted tuple string from cast call: [(blockNumber, reactiveContract, callbackIndex, destinationChainId, destinationTxHash, error)]
     if "(" in s and ")" in s:
         tuples = re.findall(r'\(([^)]+)\)', s)
         if not tuples:
@@ -215,23 +222,30 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
             if len(parts) != 6:
                 return None, f"Expected 6 fields per record, found {len(parts)}"
             try:
-                chain_id = int(parts[0], 0)
-                to_addr = normalize_address(parts[1])
-                gas_limit = int(parts[2], 0)
-                gas_price = int(parts[3], 0)
-                tx_id = int(parts[4], 0)
+                block_number = int(parts[0], 0)
+                reactive_contract = normalize_address(parts[1])
+                callback_index = int(parts[2], 0)
+                dest_chain_id = int(parts[3], 0)
+                dest_tx_hash = int(parts[4], 0)
                 err = parts[5].strip().lower()
                 if not err.startswith("0x"):
                     err = "0x" + err if err else "0x"
-                is_success = (err in ("0x", ""))
+                is_pending = (dest_tx_hash == 0)
+                is_success = (err in ("0x", "")) and not is_pending
                 records.append({
-                    "destination_chain_id": chain_id,
-                    "to": to_addr,
-                    "gas_limit": gas_limit,
-                    "gas_price": gas_price,
-                    "tx_id": tx_id,
+                    "block_number": block_number,
+                    "blockNumber": block_number,
+                    "reactive_contract": reactive_contract,
+                    "reactiveContract": reactive_contract,
+                    "callback_index": callback_index,
+                    "callbackIndex": callback_index,
+                    "destination_chain_id": dest_chain_id,
+                    "destinationChainId": dest_chain_id,
+                    "destination_tx_hash": dest_tx_hash,
+                    "destinationTxHash": dest_tx_hash,
                     "error": err,
                     "success": is_success,
+                    "is_pending": is_pending,
                 })
             except Exception as e:
                 return None, f"Error parsing formatted tuple fields: {str(e)}"
@@ -261,11 +275,11 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
                 if tuple_start + 192 > len(raw_bytes):
                     return None, f"Truncated tuple head at index {i}"
 
-                chain_id = int.from_bytes(raw_bytes[tuple_start:tuple_start+32], "big")
-                to_addr = "0x" + raw_bytes[tuple_start+12:tuple_start+32].hex()
-                gas_limit = int.from_bytes(raw_bytes[tuple_start+64:tuple_start+96], "big")
-                gas_price = int.from_bytes(raw_bytes[tuple_start+96:tuple_start+128], "big")
-                tx_id = int.from_bytes(raw_bytes[tuple_start+128:tuple_start+160], "big")
+                block_number = int.from_bytes(raw_bytes[tuple_start:tuple_start+32], "big")
+                reactive_contract = "0x" + raw_bytes[tuple_start+44:tuple_start+64].hex()
+                callback_index = int.from_bytes(raw_bytes[tuple_start+64:tuple_start+96], "big")
+                dest_chain_id = int.from_bytes(raw_bytes[tuple_start+96:tuple_start+128], "big")
+                dest_tx_hash = int.from_bytes(raw_bytes[tuple_start+128:tuple_start+160], "big")
                 bytes_offset = int.from_bytes(raw_bytes[tuple_start+160:tuple_start+192], "big")
 
                 bytes_start = tuple_start + bytes_offset
@@ -278,14 +292,22 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
 
                 err_data = raw_bytes[data_start:data_start+bytes_len]
                 err_hex = "0x" + err_data.hex()
+                is_pending = (dest_tx_hash == 0)
+                is_success = (len(err_data) == 0) and not is_pending
                 records.append({
-                    "destination_chain_id": chain_id,
-                    "to": normalize_address(to_addr),
-                    "gas_limit": gas_limit,
-                    "gas_price": gas_price,
-                    "tx_id": tx_id,
+                    "block_number": block_number,
+                    "blockNumber": block_number,
+                    "reactive_contract": normalize_address(reactive_contract),
+                    "reactiveContract": normalize_address(reactive_contract),
+                    "callback_index": callback_index,
+                    "callbackIndex": callback_index,
+                    "destination_chain_id": dest_chain_id,
+                    "destinationChainId": dest_chain_id,
+                    "destination_tx_hash": dest_tx_hash,
+                    "destinationTxHash": dest_tx_hash,
                     "error": err_hex,
-                    "success": (len(err_data) == 0),
+                    "success": is_success,
+                    "is_pending": is_pending,
                 })
             return records, None
         except Exception as e:
@@ -1041,9 +1063,19 @@ class CrossGuardHealthChecker:
                 return
 
             # Analyze decoded records
-            failed_records = [r for r in records if not r.get("success")]
-            mismatched_dest_records = [r for r in records if r.get("destination_chain_id") != UNICHAIN_SEPOLIA_CHAIN_ID]
-            missing_tx_records = [r for r in records if r.get("tx_id") == 0]
+            failed_records = [r for r in records if r.get("error") not in ("0x", "")]
+            mismatched_dest_records = [
+                r for r in records if r.get("destination_chain_id") != UNICHAIN_SEPOLIA_CHAIN_ID
+            ]
+            mismatched_reactive_records = []
+            if self.config.get("reactive_address"):
+                expected_reactive = normalize_address(self.config["reactive_address"])
+                mismatched_reactive_records = [
+                    r for r in records if normalize_address(r.get("reactive_contract", "")) != expected_reactive
+                ]
+            unconfirmed_records = [
+                r for r in records if r.get("destination_tx_hash") in (0, "0", "0x0", "0x", None)
+            ]
 
             if failed_records:
                 first_failed = failed_records[0]
@@ -1063,6 +1095,17 @@ class CrossGuardHealthChecker:
                         remediation="Inspect error data and destination callback logic (e.g., invalid nonce, gas exhaustion, or revert).",
                     )
                 )
+            elif mismatched_reactive_records:
+                self.results.append(
+                    CheckResult(
+                        category=CheckCategory.CALLBACK_RECORDS,
+                        name="callback_record_inspection",
+                        status=Status.CRITICAL,
+                        message=f"Callback requesting Reactive contract mismatch: expected {normalize_address(self.config.get('reactive_address'))}, got {mismatched_reactive_records[0].get('reactive_contract')}.",
+                        evidence={"tx_hash": tx_hash_str, "records": records, "raw_response": raw_out},
+                        remediation="Check that the query transaction hash corresponds to the configured CrossGuardReactive contract.",
+                    )
+                )
             elif mismatched_dest_records:
                 self.results.append(
                     CheckResult(
@@ -1074,16 +1117,30 @@ class CrossGuardHealthChecker:
                         remediation="Check destination chain ID configuration in Reactive contract.",
                     )
                 )
+            elif unconfirmed_records:
+                self.results.append(
+                    CheckResult(
+                        category=CheckCategory.CALLBACK_RECORDS,
+                        name="callback_record_inspection",
+                        status=Status.UNKNOWN,
+                        message=f"Callback recorded on Reactive Network, but destination transaction hash is zero (0) ({len(unconfirmed_records)}/{len(records)} record(s)). Destination execution is pending or unconfirmed.",
+                        evidence={
+                            "tx_hash": tx_hash_str,
+                            "records": records,
+                            "unconfirmed_records": unconfirmed_records,
+                            "state": "PENDING_DESTINATION_TX",
+                            "raw_response": raw_out,
+                        },
+                        remediation="Wait for relayer to submit callback transaction to destination chain (Unichain Sepolia) and destination block confirmation, then query again.",
+                    )
+                )
             else:
-                msg = f"Callback execution recorded as SUCCESS on destination chain {UNICHAIN_SEPOLIA_CHAIN_ID} ({len(records)} record(s))."
-                if missing_tx_records:
-                    msg += f" Note: {len(missing_tx_records)} record(s) have unassigned destination tx identifier (0)."
                 self.results.append(
                     CheckResult(
                         category=CheckCategory.CALLBACK_RECORDS,
                         name="callback_record_inspection",
                         status=Status.PASS,
-                        message=msg,
+                        message=f"Callback execution recorded as SUCCESS on destination chain {UNICHAIN_SEPOLIA_CHAIN_ID} ({len(records)} record(s)).",
                         evidence={"tx_hash": tx_hash_str, "records": records, "raw_response": raw_out},
                     )
                 )

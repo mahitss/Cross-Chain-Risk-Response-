@@ -440,7 +440,7 @@ A standalone Python utility using Foundry's `cast` binary under strict operation
   4. Reactive reserve and debt accounting for both the Reactive System Contract (`0x8888...8888`) and the Unichain Callback Proxy (`0x9299...7FC4`).
   5. Callback gas limit verification (enforcing $\ge 100,000$ gas).
   6. Operational advisory for `CrossGuardReactive.pay()` (`"Not implemented"` warning; funds must be routed via `depositTo(address)`).
-  7. Historical callback status checks via optional `--reactive-tx-hash` using documented 6-field return schema `getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])`.
+  7. Historical callback status checks via optional `--reactive-tx-hash` using official 6-field return schema `getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])` (`blockNumber`, `reactiveContract`, `callbackIndex`, `destinationChainId`, `destinationTxHash`, `error`), validating destination execution confirmation and preserving exact revert bytes.
 
 #### Running the Health Check
 
