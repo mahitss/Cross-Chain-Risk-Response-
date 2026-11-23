@@ -183,3 +183,17 @@ Commands:
 - [x] **All 136 Foundry tests pass:** Zero regressions in protocol smart contracts.
 - [x] **Python regression suite passes:** 45/45 tests passing with 100% success rate.
 - [x] **Zero deployments, transactions, and expenditure:** Strictly ₹0 spent.
+
+---
+
+## 8. Commit & CI Execution Evidence
+
+- **Parent Baseline Commit:** `158972a6f9d4151e9a7b7cc7cf4cdae983419070`
+- **Implementation Commit:** `8b37179d46f7cbbac891746ba44a2575117243de`
+- **Working Branch:** `fix/m002-2-omni-callback-correctness`
+- **Remote:** `origin/fix/m002-2-omni-callback-correctness`
+- **GitHub Actions CI Workflow Run:**
+  - Run ID: `45238357872`
+  - URL: `https://github.com/mahitss/Cross-Chain-Risk-Response-/actions/runs/45238357872`
+  - Status: `completed`
+  - Conclusion: `success`
