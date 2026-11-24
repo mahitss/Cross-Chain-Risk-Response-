@@ -41,6 +41,9 @@ UNICHAIN_SEPOLIA_CHAIN_ID = 1301
 
 DEFAULT_SYSTEM_CONTRACT = "0x8888888888888888888888888888888888888888"
 DEFAULT_CALLBACK_PROXY = "0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4"
+ZERO_ADDRESS = "0x" + "0" * 40
+UINT256_MAX = (1 << 256) - 1
+UINT64_MAX = (1 << 64) - 1
 MINIMUM_CALLBACK_GAS = 100_000
 DEFAULT_RPC_TIMEOUT_SECONDS = 15.0
 
@@ -189,16 +192,34 @@ def compute_recovery_exit_code(status: str) -> int:
     return 1
 
 
-# --- Address Normalization Utilities ---
+# --- Address Normalization & Strict Validation Utilities ---
+def validate_evm_address(addr: Any, field_name: str = "address") -> str:
+    """Strictly validates a 20-byte 0x-prefixed EVM address (40 hex characters)."""
+    if addr is None or not isinstance(addr, str):
+        raise ValueError(f"Missing or non-string {field_name}: {addr}")
+    s = addr.strip().lower()
+    if not s.startswith("0x"):
+        raise ValueError(f"Invalid {field_name}: missing '0x' prefix in '{addr}'")
+    hex_body = s[2:]
+    if len(hex_body) != 40 or not all(c in "0123456789abcdef" for c in hex_body):
+        raise ValueError(f"Invalid {field_name}: expected 20-byte EVM address (40 hex chars), got '{addr}'")
+    return f"0x{hex_body}"
+
+
 def normalize_address(addr: str) -> str:
-    """Normalizes address string to 0x-prefixed 40-char lowercase hex."""
+    """
+    Normalizes an EVM address or 32-byte zero-padded ABI word to 0x-prefixed lowercase 40-char hex.
+    For strict 20-byte validation without zero-padding truncated strings, use validate_evm_address().
+    """
     clean = addr.strip().lower()
     if clean.startswith("0x"):
         clean = clean[2:]
-    if len(clean) > 40:
-        clean = clean[-40:]
-    elif len(clean) < 40:
-        clean = clean.zfill(40)
+    if len(clean) == 64 and clean[:24] == "0" * 24 and all(c in "0123456789abcdef" for c in clean):
+        clean = clean[24:]
+    elif len(clean) == 40 and all(c in "0123456789abcdef" for c in clean):
+        pass
+    else:
+        return f"0x{clean}"
     return f"0x{clean}"
 
 
@@ -243,9 +264,16 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
 
     # 1. Try parsing formatted tuple string from cast call: [(blockNumber, reactiveContract, callbackIndex, destinationChainId, destinationTxHash, error)]
     if "(" in s and ")" in s:
-        tuples = re.findall(r'\(([^)]+)\)', s)
+        stripped = s
+        if stripped.startswith("[") and stripped.endswith("]"):
+            stripped = stripped[1:-1].strip()
+        tuples = re.findall(r'\(([^()]+)\)', stripped)
         if not tuples:
             return None, "No tuples found in formatted response"
+        # Ensure no unexpected non-whitespace/non-comma characters exist outside matched tuples
+        remainder = re.sub(r'\(([^()]+)\)', '', stripped).replace(",", "").strip()
+        if remainder:
+            return None, f"Malformed extra tokens in formatted callback records: '{remainder}'"
         records = []
         for t in tuples:
             parts = [p.strip() for p in t.split(',')]
@@ -253,13 +281,25 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
                 return None, f"Expected 6 fields per record, found {len(parts)}"
             try:
                 block_number = int(parts[0], 0)
-                reactive_contract = normalize_address(parts[1])
+                if block_number < 0 or block_number > UINT256_MAX:
+                    return None, f"Invalid blockNumber in callback record: {block_number}"
+                reactive_contract = validate_evm_address(parts[1], "callback_record.reactiveContract")
                 callback_index = int(parts[2], 0)
+                if callback_index < 0 or callback_index > UINT256_MAX:
+                    return None, f"Invalid callbackIndex in callback record: {callback_index}"
                 dest_chain_id = int(parts[3], 0)
+                if dest_chain_id < 0 or dest_chain_id > UINT256_MAX:
+                    return None, f"Invalid destinationChainId in callback record: {dest_chain_id}"
                 dest_tx_hash = int(parts[4], 0)
-                err = parts[5].strip().lower()
-                if not err.startswith("0x"):
-                    err = "0x" + err if err else "0x"
+                if dest_tx_hash < 0 or dest_tx_hash > UINT256_MAX:
+                    return None, f"Invalid destinationTxHash in callback record: {dest_tx_hash}"
+                err_raw = parts[5].strip().lower()
+                if not err_raw:
+                    err = "0x"
+                else:
+                    if not err_raw.startswith("0x"):
+                        err_raw = "0x" + err_raw
+                    err = decode_bytes_strict(err_raw, "callback_record.error")
                 is_pending = (dest_tx_hash == 0)
                 is_success = (err in ("0x", "")) and not is_pending
                 records.append({
@@ -306,7 +346,10 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
                     return None, f"Truncated tuple head at index {i}"
 
                 block_number = int.from_bytes(raw_bytes[tuple_start:tuple_start+32], "big")
-                reactive_contract = "0x" + raw_bytes[tuple_start+44:tuple_start+64].hex()
+                reactive_contract = decode_address_strict(
+                    "0x" + raw_bytes[tuple_start+32:tuple_start+64].hex(),
+                    "callback_record.reactiveContract",
+                )
                 callback_index = int.from_bytes(raw_bytes[tuple_start+64:tuple_start+96], "big")
                 dest_chain_id = int.from_bytes(raw_bytes[tuple_start+96:tuple_start+128], "big")
                 dest_tx_hash = int.from_bytes(raw_bytes[tuple_start+128:tuple_start+160], "big")
@@ -327,8 +370,8 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
                 records.append({
                     "block_number": block_number,
                     "blockNumber": block_number,
-                    "reactive_contract": normalize_address(reactive_contract),
-                    "reactiveContract": normalize_address(reactive_contract),
+                    "reactive_contract": reactive_contract,
+                    "reactiveContract": reactive_contract,
                     "callback_index": callback_index,
                     "callbackIndex": callback_index,
                     "destination_chain_id": dest_chain_id,
@@ -758,6 +801,8 @@ class CrossGuardHealthChecker:
             raw = self.runner.call(contract, sig, [], rpc)
             actual_norm = normalize_address(raw)
             expected_norm = normalize_address(expected)
+            if len(actual_norm) != 42 or len(expected_norm) != 42:
+                raise ValueError(f"Invalid EVM address length for {sig}: actual='{raw}', expected='{expected}'")
             if actual_norm == expected_norm:
                 self.results.append(
                     CheckResult(
@@ -1283,7 +1328,9 @@ CALLBACK_DISPATCH_SUBMITTED_TOPIC = keccak256_topic("CallbackDispatchSubmitted(b
 CALLBACK_RETRY_REQUESTED_TOPIC = keccak256_topic("CallbackRetryRequested(bytes32,uint256,uint8,bytes32)")
 PENDING_CALLBACK_SUPERSEDED_TOPIC = keccak256_topic("PendingCallbackSuperseded(bytes32,uint256,uint256)")
 CALLBACK_REQUEST_TOPIC = keccak256_topic("CallbackRequest(uint256,address,address,uint8,bytes)")
-CALLBACK_REQUESTED_V1_TOPIC = keccak256_topic("CallbackRequestedV1(uint256,address,uint64,bytes)")
+# Legacy / mock-only signature kept solely to identify & reject unverified receipts cleanly (NEVER accepted):
+UNSUPPORTED_LEGACY_CALLBACK_REQUESTED_V1_TOPIC = keccak256_topic("CallbackRequestedV1(uint256,address,uint64,bytes)")
+SUPPORTED_CALLBACK_VERSIONS = (0,)  # ISystemContract.CallbackVersion.V_1_0
 
 DEFAULT_RESERVE_SAFETY_MULTIPLIER = 2
 DEFAULT_REACTIVE_GAS_ESTIMATE = 150_000
@@ -1476,22 +1523,148 @@ def decode_get_latest_callback(raw: str) -> Tuple[int, int, str, int, int]:
         return 0, 0, "0x", 0, 0
 
 
+def encode_callback_request_data(
+    chain_id: int,
+    recipient: str,
+    gas_limit: int,
+    payload_hex: str,
+    version: int = 0,
+) -> str:
+    """
+    ABI-encodes non-indexed CallbackRequest event data:
+      (uint8 version, bytes configuration)
+    where configuration = abi.encode(CallbackConfiguration_V_1_0(chainId, recipient, gasLimit, payload)).
+    """
+    norm_recipient = validate_evm_address(recipient, "CallbackConfiguration.recipient")
+    clean_payload = decode_bytes_strict(payload_hex, "CallbackConfiguration.payload")[2:]
+    payload_bytes = bytes.fromhex(clean_payload)
+    padded_payload = payload_bytes + b"\x00" * ((32 - (len(payload_bytes) % 32)) % 32)
+
+    cfg_inner = (
+        (32).to_bytes(32, "big")
+        + int(chain_id).to_bytes(32, "big")
+        + b"\x00" * 12
+        + bytes.fromhex(norm_recipient[2:])
+        + int(gas_limit).to_bytes(32, "big")
+        + (128).to_bytes(32, "big")
+        + len(payload_bytes).to_bytes(32, "big")
+        + padded_payload
+    )
+    padded_cfg = cfg_inner + b"\x00" * ((32 - (len(cfg_inner) % 32)) % 32)
+    outer = (
+        int(version).to_bytes(32, "big")
+        + (64).to_bytes(32, "big")
+        + len(cfg_inner).to_bytes(32, "big")
+        + padded_cfg
+    )
+    return "0x" + outer.hex()
+
+
+def decode_callback_request_data_strict(raw_data: Any) -> Dict[str, Any]:
+    """
+    Strictly decodes and validates CallbackRequest non-indexed ABI data:
+      (CallbackVersion version, bytes configuration)
+    where version == 0 (V_1_0) and configuration decodes as CallbackConfiguration_V_1_0:
+      (uint256 chainId, address recipient, uint64 gasLimit, bytes payload).
+    Raises ValueError on missing, truncated, malformed, or unsupported version/config data.
+    """
+    norm_hex = decode_bytes_strict(raw_data, "CallbackRequest.data")
+    raw_bytes = bytes.fromhex(norm_hex[2:])
+    if len(raw_bytes) < 96:
+        raise ValueError(f"CallbackRequest.data missing or too short ({len(raw_bytes)} bytes < 96)")
+
+    version_word = raw_bytes[0:32]
+    if version_word[:31] != b"\x00" * 31:
+        raise ValueError("Dirty upper bits in CallbackRequest.version")
+    version = version_word[31]
+    if version not in SUPPORTED_CALLBACK_VERSIONS:
+        raise ValueError(f"Unsupported CallbackVersion {version} in CallbackRequest (only V_1_0=0 supported)")
+
+    cfg_offset = int.from_bytes(raw_bytes[32:64], "big")
+    if cfg_offset < 64 or cfg_offset + 32 > len(raw_bytes):
+        raise ValueError(f"Invalid configuration bytes offset {cfg_offset} in CallbackRequest.data")
+    cfg_len = int.from_bytes(raw_bytes[cfg_offset : cfg_offset + 32], "big")
+    cfg_start = cfg_offset + 32
+    if cfg_len < 192 or cfg_start + cfg_len > len(raw_bytes):
+        raise ValueError(f"Invalid or truncated CallbackConfiguration length ({cfg_len}) in CallbackRequest.data")
+    cfg_bytes = raw_bytes[cfg_start : cfg_start + cfg_len]
+
+    tuple_offset = int.from_bytes(cfg_bytes[0:32], "big")
+    if tuple_offset != 32:
+        raise ValueError(f"Invalid outer tuple offset ({tuple_offset}) in CallbackConfiguration_V_1_0")
+
+    t_start = 32
+    if t_start + 160 > len(cfg_bytes):
+        raise ValueError("Truncated CallbackConfiguration_V_1_0 tuple body")
+
+    cfg_chain_id = int.from_bytes(cfg_bytes[t_start : t_start + 32], "big")
+    cfg_recipient = decode_address_strict(
+        "0x" + cfg_bytes[t_start + 32 : t_start + 64].hex(), "CallbackConfiguration.recipient"
+    )
+    cfg_gas_limit = int.from_bytes(cfg_bytes[t_start + 64 : t_start + 96], "big")
+    if cfg_gas_limit > UINT64_MAX:
+        raise ValueError(f"CallbackConfiguration.gasLimit ({cfg_gas_limit}) overflows uint64")
+
+    payload_offset = int.from_bytes(cfg_bytes[t_start + 96 : t_start + 128], "big")
+    if payload_offset < 128 or t_start + payload_offset + 32 > len(cfg_bytes):
+        raise ValueError(f"Invalid payload offset ({payload_offset}) in CallbackConfiguration_V_1_0")
+    payload_len = int.from_bytes(cfg_bytes[t_start + payload_offset : t_start + payload_offset + 32], "big")
+    payload_start = t_start + payload_offset + 32
+    if payload_len == 0 or payload_start + payload_len > len(cfg_bytes):
+        raise ValueError(f"Missing or truncated payload in CallbackConfiguration_V_1_0 (len={payload_len})")
+    cfg_payload = "0x" + cfg_bytes[payload_start : payload_start + payload_len].hex()
+
+    return {
+        "version": version,
+        "chain_id": cfg_chain_id,
+        "recipient": cfg_recipient,
+        "gas_limit": cfg_gas_limit,
+        "payload": cfg_payload,
+    }
+
+
+def _require_uint256(val: Any, field_name: str) -> int:
+    """Strictly validates a non-bool integer within uint256 bounds [0, 2**256 - 1]."""
+    if val is None or isinstance(val, bool) or not isinstance(val, int):
+        raise ValueError(f"Missing or non-integer {field_name}: {val}")
+    if val < 0 or val > UINT256_MAX:
+        raise ValueError(f"Out-of-range uint256 {field_name}: {val}")
+    return val
+
+
 def estimate_callback_fee_wei(
     gas_limit: int,
     p_base_wei: int,
     coeff_per_1000: int,
     extra_gas: int,
-    max_charge_gas: int,
+    max_charge_gas: Optional[int] = None,
     safety_multiplier: int = DEFAULT_RESERVE_SAFETY_MULTIPLIER,
+    settlement_gas_requirement: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Computes conservative Reactive Network fee estimate using official formula:
+    Computes conservative Reactive fee estimate using official documented equation:
       fee = p_base * (C / 1000) * (g_used + K)
-    where p_base = max(gas_price, base_fee), C = _gasPriceCoeffPer1000, K = _extraGas.
-    Returns estimated single-callback fee, safety-multiplied minimum reserve, max-charge check,
-    and documented assumptions. Never guarantees future delivery.
+    where:
+      - p_base = max(gas_price, base_fee)
+      - C = _gasPriceCoeffPer1000
+      - K = _extraGas
+      - g_used bounded conservatively by configured gas_limit (while noting forwarded gas < gas_limit)
+
+    IMPORTANT: _maxChargeGas is NEVER added to (g_used + K), multiplied into fee, or compared
+    against (g_used + K). _maxChargeGas limits gas available for payment-settlement execution only.
     """
-    if gas_limit < 0 or p_base_wei <= 0 or coeff_per_1000 <= 0 or extra_gas < 0 or safety_multiplier < 1:
+    gas_limit = _require_uint256(gas_limit, "gas_limit")
+    p_base_wei = _require_uint256(p_base_wei, "p_base_wei")
+    coeff_per_1000 = _require_uint256(coeff_per_1000, "coeff_per_1000")
+    extra_gas = _require_uint256(extra_gas, "extra_gas")
+    if max_charge_gas is None:
+        raise ValueError("Missing _maxChargeGas payment-settlement parameter")
+    max_charge_gas = _require_uint256(max_charge_gas, "max_charge_gas")
+    safety_multiplier = _require_uint256(safety_multiplier, "safety_multiplier")
+    if settlement_gas_requirement is not None:
+        settlement_gas_requirement = _require_uint256(settlement_gas_requirement, "settlement_gas_requirement")
+
+    if p_base_wei <= 0 or coeff_per_1000 <= 0 or safety_multiplier < 1:
         raise ValueError(
             f"Invalid economic parameters for fee estimation: gas_limit={gas_limit}, "
             f"p_base_wei={p_base_wei}, coeff={coeff_per_1000}, extra_gas={extra_gas}, "
@@ -1499,17 +1672,51 @@ def estimate_callback_fee_wei(
         )
 
     accounted_gas = gas_limit + extra_gas
-    raw_fee_wei = (p_base_wei * coeff_per_1000 * accounted_gas + 999) // 1000
+    if accounted_gas > UINT256_MAX:
+        raise ValueError(f"Arithmetic overflow in accounted_gas ({gas_limit} + {extra_gas} > uint256)")
+
+    fee_numerator = p_base_wei * coeff_per_1000 * accounted_gas
+    if fee_numerator + 999 > UINT256_MAX:
+        raise ValueError("Arithmetic overflow in callback fee numerator (> uint256)")
+    raw_fee_wei = (fee_numerator + 999) // 1000
     recommended_reserve_wei = raw_fee_wei * safety_multiplier
-    exceeds_max_charge = (max_charge_gas > 0) and (accounted_gas > max_charge_gas)
+    if recommended_reserve_wei > UINT256_MAX:
+        raise ValueError("Arithmetic overflow in recommended_min_reserve_wei (> uint256)")
+
+    if max_charge_gas == 0:
+        settlement_gas_status = "ZERO_SETTLEMENT_GAS"
+        settlement_gas_sufficient: Optional[bool] = False
+    elif settlement_gas_requirement is not None:
+        if max_charge_gas < settlement_gas_requirement:
+            settlement_gas_status = "BELOW_REQUIREMENT"
+            settlement_gas_sufficient = False
+        elif max_charge_gas == settlement_gas_requirement:
+            settlement_gas_status = "AT_REQUIREMENT"
+            settlement_gas_sufficient = True
+        else:
+            settlement_gas_status = "ABOVE_REQUIREMENT"
+            settlement_gas_sufficient = True
+    else:
+        settlement_gas_status = "UNVERIFIED_REQUIREMENT"
+        settlement_gas_sufficient = None
 
     return {
         "p_base_wei": p_base_wei,
+        "configured_gas_limit": gas_limit,
         "gas_used_upper_bound": gas_limit,
         "extra_gas_overhead": extra_gas,
         "accounted_gas": accounted_gas,
         "max_charge_gas": max_charge_gas,
-        "exceeds_max_charge_gas": exceeds_max_charge,
+        "max_charge_gas_role": "Limits gas available for internal payment-settlement execution; NOT part of execution fee formula or execution gas cap.",
+        "max_charge_gas_in_fee_formula": False,
+        "settlement_gas_requirement": settlement_gas_requirement,
+        "settlement_gas_status": settlement_gas_status,
+        "settlement_gas_sufficient": settlement_gas_sufficient,
+        "effective_forwarded_gas_exact": None,
+        "effective_forwarded_gas_warning": (
+            f"Configured callbackGasLimit ({gas_limit}) is NOT exact forwarded destination gas: "
+            f"Callback Proxy accounts +{extra_gas} extraGas overhead and reserves internal accounting/settlement overhead."
+        ),
         "gas_price_coeff_per_1000": coeff_per_1000,
         "estimated_single_callback_fee_wei": raw_fee_wei,
         "safety_multiplier": safety_multiplier,
@@ -1517,10 +1724,11 @@ def estimate_callback_fee_wei(
         "guarantees_future_delivery": False,
         "assumptions": [
             f"p_base = max(gas_price, block.basefee) = {p_base_wei} wei at inspection time.",
-            f"Worst-case execution consumes full configured gas budget ({gas_limit}) + documented _extraGas surcharge ({extra_gas}).",
-            f"Fee formula: p_base * (_gasPriceCoeffPer1000 / 1000) * (g_used + _extraGas) = {raw_fee_wei} wei.",
-            f"Conservative buffer applies safety_multiplier={safety_multiplier}x -> {recommended_reserve_wei} wei minimum.",
-            "Dynamic validator gas prices, base-fee spikes, and actual execution gas cannot be bounded statically; estimate does NOT guarantee future delivery.",
+            f"Fee formula: p_base * (_gasPriceCoeffPer1000 / 1000) * (g_used + _extraGas) = {raw_fee_wei} wei using upper-bound g_used={gas_limit} and K={extra_gas}.",
+            f"_maxChargeGas ({max_charge_gas}) governs gas available for payment settlement only and is excluded from the fee equation.",
+            f"Conservative reserve requirement applies safety_multiplier={safety_multiplier}x -> {recommended_reserve_wei} wei.",
+            "Exact forwarded destination gas is strictly less than configured callbackGasLimit and cannot be derived from configured limit alone.",
+            "Dynamic gas-price spikes and execution variance mean this estimate does NOT guarantee future delivery.",
         ],
     }
 
@@ -1534,15 +1742,19 @@ def _preflight_error(
     remediation: str,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    out = {
+    out: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": status.value,
+        "safe_to_consider_recovery": status in (RecoveryStatus.DISPATCH_REQUIRED, RecoveryStatus.RETRY_ELIGIBLE),
         "position_id": position_id,
         "expected_nonce": expected_nonce,
         "reactive_tx_hash": reactive_tx_hash,
         "reason": reason,
         "remediation": remediation,
         "suggested_command": None,
+        "warnings": [],
+        "unsafe_or_unverified_conditions": [],
+        "missing_or_unavailable_evidence": [],
         "execution": "NOT PERFORMED (read-only preflight diagnostic)",
     }
     if extra:
@@ -1640,12 +1852,51 @@ def run_recovery_preflight(
     system_addr = config.get("system_contract", DEFAULT_SYSTEM_CONTRACT)
     proxy_addr = config.get("callback_proxy", DEFAULT_CALLBACK_PROXY)
     safety_multiplier = config.get("safety_multiplier", DEFAULT_RESERVE_SAFETY_MULTIPLIER)
+    require_reactive_reserves = bool(config.get("require_reactive_reserves", False))
+    settlement_gas_req_raw = config.get("settlement_gas_requirement")
 
     if not (base_rpc and reactive_rpc and unichain_rpc and origin_controller and reactive_addr and callback_addr and borrowing_controller):
         return _preflight_error(
             RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
             "Missing required multi-chain RPC URLs or contract address configuration.",
             "Specify all required RPC URLs and contract addresses via flags or environment variables.",
+        )
+
+    try:
+        norm_origin_ctrl = validate_evm_address(origin_controller, "origin_risk_controller")
+        norm_reactive_cfg = validate_evm_address(reactive_addr, "reactive_address")
+        norm_cb_addr = validate_evm_address(callback_addr, "callback_address")
+        norm_borrow_ctrl = validate_evm_address(borrowing_controller, "borrowing_controller_address")
+        norm_sys_cfg = validate_evm_address(system_addr, "system_contract")
+        norm_proxy_cfg = validate_evm_address(proxy_addr, "callback_proxy")
+    except ValueError as e:
+        return _preflight_error(
+            RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+            f"Malformed contract address in recovery configuration: {e}",
+            "Provide valid 20-byte 0x-prefixed EVM addresses (40 hex characters).",
+        )
+
+    if norm_cb_addr == ZERO_ADDRESS:
+        return _preflight_error(
+            RecoveryStatus.RETRY_BLOCKED, norm_pos, expected_nonce, norm_tx_hash,
+            "Expected CrossGuardCallback address cannot be the zero address.",
+            "Specify the deployed non-zero CrossGuardCallback address.",
+        )
+
+    try:
+        safety_multiplier = _require_uint256(safety_multiplier, "safety_multiplier")
+        if safety_multiplier < 1:
+            raise ValueError("safety_multiplier must be >= 1")
+        settlement_gas_requirement = (
+            _require_uint256(settlement_gas_req_raw, "settlement_gas_requirement")
+            if settlement_gas_req_raw is not None
+            else None
+        )
+    except ValueError as e:
+        return _preflight_error(
+            RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+            f"Invalid economic configuration parameter: {e}",
+            "Provide positive integer economic parameters within uint256 bounds.",
         )
 
     # 1. Read Origin State (strict & fail-closed)
@@ -1757,23 +2008,23 @@ def run_recovery_preflight(
             if r_origin_cid != BASE_SEPOLIA_CHAIN_ID:
                 config_blocker_reason = f"CrossGuardReactive originChainId ({r_origin_cid}) != {BASE_SEPOLIA_CHAIN_ID}."
                 config_blocker_remediation = "Verify CrossGuardReactive deployment parameters."
-            elif r_origin_ctrl != normalize_address(origin_controller):
-                config_blocker_reason = f"CrossGuardReactive originRiskController mismatch: expected {normalize_address(origin_controller)}, got {r_origin_ctrl}."
+            elif r_origin_ctrl != norm_origin_ctrl:
+                config_blocker_reason = f"CrossGuardReactive originRiskController mismatch: expected {norm_origin_ctrl}, got {r_origin_ctrl}."
                 config_blocker_remediation = "Verify RiskController / CrossGuardReactive topology parity."
-            elif r_sys != normalize_address(system_addr):
-                config_blocker_reason = f"CrossGuardReactive systemContract mismatch: expected {normalize_address(system_addr)}, got {r_sys}."
+            elif r_sys != norm_sys_cfg:
+                config_blocker_reason = f"CrossGuardReactive systemContract mismatch: expected {norm_sys_cfg}, got {r_sys}."
                 config_blocker_remediation = "Verify Omni System Contract address wiring."
-            elif cb_proxy != normalize_address(proxy_addr):
-                config_blocker_reason = f"CrossGuardCallback callbackProxy mismatch: expected {normalize_address(proxy_addr)}, got {cb_proxy}."
+            elif cb_proxy != norm_proxy_cfg:
+                config_blocker_reason = f"CrossGuardCallback callbackProxy mismatch: expected {norm_proxy_cfg}, got {cb_proxy}."
                 config_blocker_remediation = "Verify Unichain Sepolia Callback Proxy address wiring."
-            elif cb_sender != normalize_address(reactive_addr):
-                config_blocker_reason = f"CrossGuardCallback authorizedReactiveSender mismatch: expected {normalize_address(reactive_addr)}, got {cb_sender}."
+            elif cb_sender != norm_reactive_cfg:
+                config_blocker_reason = f"CrossGuardCallback authorizedReactiveSender mismatch: expected {norm_reactive_cfg}, got {cb_sender}."
                 config_blocker_remediation = "Owner must call setAuthorizedReactiveSender on CrossGuardCallback."
-            elif cb_borrow != normalize_address(borrowing_controller):
-                config_blocker_reason = f"CrossGuardCallback borrowingController mismatch: expected {normalize_address(borrowing_controller)}, got {cb_borrow}."
+            elif cb_borrow != norm_borrow_ctrl:
+                config_blocker_reason = f"CrossGuardCallback borrowingController mismatch: expected {norm_borrow_ctrl}, got {cb_borrow}."
                 config_blocker_remediation = "Owner must call setBorrowingController on CrossGuardCallback."
-            elif bc_adapter != normalize_address(callback_addr):
-                config_blocker_reason = f"BorrowingController callbackAdapter mismatch: expected {normalize_address(callback_addr)}, got {bc_adapter}."
+            elif bc_adapter != norm_cb_addr:
+                config_blocker_reason = f"BorrowingController callbackAdapter mismatch: expected {norm_cb_addr}, got {bc_adapter}."
                 config_blocker_remediation = "Owner must call setCallbackAdapter on BorrowingController."
     except Exception as e:
         sanitized_err = sanitize_text(str(e), [base_rpc, reactive_rpc, unichain_rpc])
@@ -1816,15 +2067,16 @@ def run_recovery_preflight(
             extra_gas=system_extra_gas,
             max_charge_gas=system_max_gas,
             safety_multiplier=safety_multiplier,
+            settlement_gas_requirement=settlement_gas_requirement,
         )
-        effective_callback_gas_for_est = max(gas_limit_configured, MINIMUM_CALLBACK_GAS)
         proxy_fee_estimate = estimate_callback_fee_wei(
-            gas_limit=effective_callback_gas_for_est,
+            gas_limit=gas_limit_configured,
             p_base_wei=p_base_dest,
             coeff_per_1000=proxy_coeff,
             extra_gas=proxy_extra_gas,
             max_charge_gas=proxy_max_gas,
             safety_multiplier=safety_multiplier,
+            settlement_gas_requirement=settlement_gas_requirement,
         )
     except Exception as e:
         sanitized_err = sanitize_text(str(e), [reactive_rpc, unichain_rpc])
@@ -1833,6 +2085,42 @@ def run_recovery_preflight(
             f"Failed to query or validate economic/fee parameters: {sanitized_err}",
             "Verify System Contract, Callback Proxy fee parameters, and RPC gas-price/base-fee availability.",
         )
+
+    warnings: List[str] = []
+    unsafe_conditions: List[str] = [proxy_fee_estimate["effective_forwarded_gas_warning"]]
+    missing_evidence: List[str] = [
+        "Official 6-field getCallbacks(uint256) schema omits destination recipient address and origin nonce.",
+        "Live SystemContract.requestCallbackV_1_0 enforcement on indebted Reactive contracts cannot be established offline.",
+    ]
+    if proxy_fee_estimate["settlement_gas_sufficient"] is None:
+        msg = (
+            f"Callback Proxy _maxChargeGas={proxy_max_gas} limits payment-settlement gas, "
+            "but exact proxy/recipient settlement gas requirement is unverified offline."
+        )
+        unsafe_conditions.append(msg)
+        missing_evidence.append("Exact destination Callback Proxy + receiver pay() settlement gas requirement.")
+    elif proxy_fee_estimate["settlement_gas_sufficient"] is False:
+        unsafe_conditions.append(
+            f"Callback Proxy _maxChargeGas ({proxy_max_gas}) is below settlement gas requirement ({settlement_gas_requirement})."
+        )
+
+    if system_debt > 0:
+        w = (
+            f"REACTIVE_PATH_WARNING: CrossGuardReactive has {system_debt} wei debt on System Contract. "
+            "Automated react() processing is suspended until depositTo(reactiveContract) clears debt; "
+            "note owner-triggered dispatchPendingCallback/retryFailedCallback uses EOA tx gas on Reactive Lasna "
+            "and is evaluated separately from destination Callback Proxy delivery funding."
+        )
+        warnings.append(w)
+        unsafe_conditions.append(w)
+    if system_reserves == 0 or system_reserves < system_fee_estimate["recommended_min_reserve_wei"]:
+        w = (
+            f"REACTIVE_PATH_WARNING: Reactive System Contract reserves ({system_reserves} wei) are below conservative "
+            f"estimate ({system_fee_estimate['recommended_min_reserve_wei']} wei) for automated react() continuity; "
+            "destination Callback Proxy delivery path uses separate Unichain ETH reserves."
+        )
+        warnings.append(w)
+        unsafe_conditions.append(w)
 
     # 6. Inspect Reactive Transaction Receipt & Strict Log Correlation
     try:
@@ -1862,20 +2150,19 @@ def run_recovery_preflight(
     }
 
     matching_cg_logs = []
-    norm_reactive_addr = normalize_address(reactive_addr)
     for lg in logs:
         lg_addr = normalize_address(lg["address"])
         lg_topics = lg["topics"]
         if not lg_topics:
             continue
         t0 = lg_topics[0].lower()
-        if t0 in cg_topics and lg_addr == norm_reactive_addr:
+        if t0 in cg_topics and lg_addr == norm_reactive_cfg:
             matching_cg_logs.append(lg)
 
     if len(matching_cg_logs) == 0:
         return _preflight_error(
             RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
-            f"Receipt for {norm_tx_hash} does not contain any CrossGuardReactive operational event emitted by {norm_reactive_addr}.",
+            f"Receipt for {norm_tx_hash} does not contain any CrossGuardReactive operational event emitted by {norm_reactive_cfg}.",
             "Verify transaction hash and configured CrossGuardReactive address.",
         )
 
@@ -1934,40 +2221,51 @@ def run_recovery_preflight(
                 "Inspect transaction receipt ABI.",
             )
 
-    # Verify Omni System Contract CallbackRequest log(s)
-    norm_sys_addr = normalize_address(system_addr)
-    norm_cb_addr = normalize_address(callback_addr)
+    # Verify authoritative Omni System Contract CallbackRequest log (no legacy CallbackRequestedV1 fallback)
     system_cb_requests = []
+    legacy_unverified_requests = []
     foreign_cb_requests = []
     for lg in logs:
         lg_topics = lg["topics"]
         if not lg_topics:
             continue
         t0 = lg_topics[0].lower()
-        if t0 in (CALLBACK_REQUEST_TOPIC, CALLBACK_REQUESTED_V1_TOPIC):
-            if normalize_address(lg["address"]) == norm_sys_addr:
-                system_cb_requests.append((t0, lg_topics))
+        lg_sender = normalize_address(lg["address"])
+        if t0 == CALLBACK_REQUEST_TOPIC:
+            if lg_sender == norm_sys_cfg:
+                system_cb_requests.append(lg)
             else:
-                foreign_cb_requests.append(normalize_address(lg["address"]))
+                foreign_cb_requests.append(lg_sender)
+        elif t0 == UNSUPPORTED_LEGACY_CALLBACK_REQUESTED_V1_TOPIC and lg_sender == norm_sys_cfg:
+            legacy_unverified_requests.append(lg)
+
+    historical_cb_recipient: Optional[str] = None
+    historical_cb_request: Optional[Dict[str, Any]] = None
 
     if is_deferred_event:
-        if system_cb_requests:
+        if system_cb_requests or legacy_unverified_requests:
             return _preflight_error(
                 RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
-                f"Contradictory receipt evidence: CallbackDispatchDeferred emitted alongside {len(system_cb_requests)} CallbackRequest log(s).",
+                "Contradictory receipt evidence: CallbackDispatchDeferred emitted alongside System Contract callback request log(s).",
                 "Audit transaction trace for inconsistent execution state.",
             )
     else:
         if len(system_cb_requests) == 0:
+            if legacy_unverified_requests:
+                return _preflight_error(
+                    RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+                    "Receipt contains unverified legacy/mock CallbackRequestedV1 event without modern Omni CallbackRequest(uint256,address,address,uint8,bytes); rejected fail-closed.",
+                    "Supply a transaction receipt emitted by the supported Omni System Contract CallbackRequest ABI.",
+                )
             if foreign_cb_requests:
                 return _preflight_error(
                     RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
-                    f"CallbackRequest log emitted by unexpected contract(s) {foreign_cb_requests} instead of configured System Contract {norm_sys_addr}.",
+                    f"CallbackRequest log emitted by unexpected contract(s) {foreign_cb_requests} instead of configured System Contract {norm_sys_cfg}.",
                     "Verify Omni System Contract address configuration.",
                 )
             return _preflight_error(
                 RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
-                f"Receipt for {norm_tx_hash} does not contain a CallbackRequest event from Omni System Contract {norm_sys_addr}.",
+                f"Receipt for {norm_tx_hash} does not contain a CallbackRequest event from Omni System Contract {norm_sys_cfg}.",
                 "Inspect transaction trace to confirm whether requestCallbackV_1_0 executed.",
             )
         if len(system_cb_requests) > 1:
@@ -1977,42 +2275,131 @@ def run_recovery_preflight(
                 "Perform manual multi-callback receipt correlation.",
             )
 
-        req_t0, req_topics = system_cb_requests[0]
-        if req_t0 == CALLBACK_REQUEST_TOPIC:
-            if len(req_topics) < 4:
-                return _preflight_error(
-                    RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
-                    "CallbackRequest log has fewer than 4 topics (missing chainId/sender/recipient).",
-                    "Verify Omni System Contract ABI.",
-                )
+        req_log = system_cb_requests[0]
+        req_topics = req_log["topics"]
+        if len(req_topics) != 4:
+            return _preflight_error(
+                RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+                f"CallbackRequest log must have exactly 4 topics (chainId/sender/recipient); found {len(req_topics)}.",
+                "Verify Omni System Contract ABI.",
+            )
+        try:
+            req_chain_id = int(req_topics[1], 16)
+            req_sender = decode_address_strict(req_topics[2], "CallbackRequest.sender")
+            req_recipient = decode_address_strict(req_topics[3], "CallbackRequest.recipient")
+        except Exception as e:
+            return _preflight_error(
+                RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+                f"Malformed indexed fields in CallbackRequest log: {e}",
+                "Inspect System Contract receipt event logs.",
+            )
+
+        try:
+            decoded_req_data = decode_callback_request_data_strict(req_log.get("data"))
+        except Exception as e:
+            return _preflight_error(
+                RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+                f"Missing or malformed non-indexed CallbackRequest event data: {e}",
+                "Inspect System Contract CallbackRequest (CallbackVersion, CallbackConfiguration_V_1_0) event data.",
+            )
+
+        if req_sender != norm_reactive_cfg:
+            return _preflight_error(
+                RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+                f"CallbackRequest sender ({req_sender}) does not match CrossGuardReactive ({norm_reactive_cfg}).",
+                "Verify Reactive contract address and transaction hash.",
+            )
+        if req_chain_id != UNICHAIN_SEPOLIA_CHAIN_ID:
+            return _preflight_error(
+                RecoveryStatus.RETRY_BLOCKED, norm_pos, expected_nonce, norm_tx_hash,
+                f"CallbackRequest targets unsupported destination chain ID {req_chain_id} (expected {UNICHAIN_SEPOLIA_CHAIN_ID}).",
+                "Update CrossGuardReactive destinationChainId to 1301 before retrying.",
+            )
+        if decoded_req_data["chain_id"] != req_chain_id:
+            return _preflight_error(
+                RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+                f"CallbackRequest configuration chainId ({decoded_req_data['chain_id']}) contradicts indexed chainId ({req_chain_id}).",
+                "Inspect System Contract receipt event encoding.",
+            )
+        if decoded_req_data["recipient"] != req_recipient:
+            return _preflight_error(
+                RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+                f"CallbackRequest configuration recipient ({decoded_req_data['recipient']}) contradicts indexed recipient ({req_recipient}).",
+                "Inspect System Contract receipt event encoding.",
+            )
+        if decoded_req_data["gas_limit"] < MINIMUM_CALLBACK_GAS:
+            return _preflight_error(
+                RecoveryStatus.RETRY_BLOCKED, norm_pos, expected_nonce, norm_tx_hash,
+                f"CallbackRequest configuration gasLimit ({decoded_req_data['gas_limit']}) is below minimum required {MINIMUM_CALLBACK_GAS}.",
+                "Ensure CrossGuardReactive callbackGasLimit >= 100,000 before dispatching or retrying.",
+            )
+        if r_cb_nonce == expected_nonce and r_cb_payload not in ("0x", ""):
             try:
-                req_chain_id = int(req_topics[1], 16)
-                req_sender = decode_address_strict(req_topics[2], "CallbackRequest.sender")
-                req_recipient = decode_address_strict(req_topics[3], "CallbackRequest.recipient")
+                norm_stored_payload = decode_bytes_strict(r_cb_payload, "latestCallback.payload")
             except Exception as e:
                 return _preflight_error(
                     RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
-                    f"Malformed indexed fields in CallbackRequest log: {e}",
-                    "Inspect System Contract receipt event logs.",
+                    f"Malformed stored callback payload: {e}",
+                    "Inspect CrossGuardReactive latestCallback storage.",
                 )
-            if req_sender != norm_reactive_addr:
+            if decoded_req_data["payload"] != norm_stored_payload:
                 return _preflight_error(
                     RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
-                    f"CallbackRequest sender ({req_sender}) does not match CrossGuardReactive ({norm_reactive_addr}).",
-                    "Verify Reactive contract address and transaction hash.",
+                    "CallbackRequest configuration payload does not match CrossGuardReactive stored callback payload.",
+                    "Verify transaction hash matches the callback payload under recovery.",
                 )
-            if req_chain_id != UNICHAIN_SEPOLIA_CHAIN_ID:
-                return _preflight_error(
-                    RecoveryStatus.RETRY_BLOCKED, norm_pos, expected_nonce, norm_tx_hash,
-                    f"CallbackRequest targets unsupported destination chain ID {req_chain_id} (expected {UNICHAIN_SEPOLIA_CHAIN_ID}).",
-                    "Update CrossGuardReactive destinationChainId to 1301 before retrying.",
-                )
-            if req_recipient != norm_cb_addr:
-                return _preflight_error(
-                    RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
-                    f"CallbackRequest recipient ({req_recipient}) does not match configured CrossGuardCallback ({norm_cb_addr}).",
-                    "Verify CrossGuardCallback address wiring.",
-                )
+
+        historical_cb_recipient = req_recipient
+        historical_cb_request = decoded_req_data
+
+    # 3-Way Destination Callback Drift Comparison
+    expected_matches_current = (dest_callback_configured == norm_cb_addr)
+    expected_matches_historical = (
+        (historical_cb_recipient == norm_cb_addr) if historical_cb_recipient is not None else None
+    )
+    historical_matches_current = (
+        (historical_cb_recipient == dest_callback_configured) if historical_cb_recipient is not None else None
+    )
+    all_recipients_match = (
+        expected_matches_current
+        and (True if historical_cb_recipient is None else (bool(expected_matches_historical) and bool(historical_matches_current)))
+    )
+    failed_comparisons: List[str] = []
+    if not expected_matches_current:
+        failed_comparisons.append("expected_callback != current_destination_callback")
+    if historical_cb_recipient is not None and not expected_matches_historical:
+        failed_comparisons.append("expected_callback != historical_callback_request_recipient")
+    if historical_cb_recipient is not None and not historical_matches_current:
+        failed_comparisons.append("historical_callback_request_recipient != current_destination_callback")
+
+    config_comparison = {
+        "expected_callback": norm_cb_addr,
+        "historical_callback_request_recipient": historical_cb_recipient,
+        "current_destination_callback": dest_callback_configured,
+        "expected_matches_current": expected_matches_current,
+        "expected_matches_historical": expected_matches_historical,
+        "historical_matches_current": historical_matches_current,
+        "all_recipients_match": all_recipients_match,
+        "drift_detected": (not all_recipients_match),
+        "failed_comparisons": failed_comparisons,
+        "migration_policy": (
+            "Normal recovery rejects recipient mismatches and never auto-adopts a new callback address; "
+            "an operator must complete an explicitly reviewed configuration migration."
+        ),
+    }
+
+    if historical_cb_recipient is not None and historical_cb_recipient != norm_cb_addr and dest_callback_configured == norm_cb_addr:
+        return _preflight_error(
+            RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
+            f"CallbackRequest recipient ({historical_cb_recipient}) does not match configured CrossGuardCallback ({norm_cb_addr}).",
+            "Verify CrossGuardCallback address wiring or complete a reviewed configuration migration.",
+            extra={
+                "configuration_comparison": config_comparison,
+                "warnings": warnings,
+                "unsafe_or_unverified_conditions": unsafe_conditions,
+                "missing_or_unavailable_evidence": missing_evidence,
+            },
+        )
 
     # 7. Read and Correlate Official Callback Records
     records = []
@@ -2020,7 +2407,7 @@ def run_recovery_preflight(
     try:
         uint_hash_str = str(int(norm_tx_hash, 16))
         sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
-        raw_cbs = runner.call(system_addr, sig, [uint_hash_str], reactive_rpc)
+        raw_cbs = runner.call(norm_sys_cfg, sig, [uint_hash_str], reactive_rpc)
         records, parse_err = decode_callback_records(raw_cbs)
         if parse_err:
             return _preflight_error(
@@ -2040,6 +2427,7 @@ def run_recovery_preflight(
     status: Optional[RecoveryStatus] = None
     reason: Optional[str] = None
     remediation: Optional[str] = None
+    matched_record_count = 0
 
     # First check Superseded across origin/reactive before contradiction checks
     if origin_nonce > expected_nonce or reactive_latest_origin_nonce > expected_nonce or (r_cb_nonce > expected_nonce):
@@ -2061,7 +2449,7 @@ def run_recovery_preflight(
             reason = f"Contradictory state: Reactive latestOriginNonce ({reactive_latest_origin_nonce}) is lower than expected nonce ({expected_nonce})."
             remediation = "Verify CrossGuardReactive state synchronization and address."
 
-    # Next check deferred dispatch path
+    # Next check deferred dispatch path (requires expected_callback == current_destination_callback)
     if status is None and is_deferred_event:
         if r_cb_nonce == 0 or r_cb_payload in ("0x", ""):
             status = RecoveryStatus.RETRY_BLOCKED
@@ -2083,10 +2471,20 @@ def run_recovery_preflight(
             status = RecoveryStatus.RETRY_UNKNOWN
             reason = f"Receipt recorded CallbackDispatchDeferred, but stored dispatch status is {r_cb_status} (expected PENDING_DISPATCH)."
             remediation = "Inspect newer dispatch transactions for this position and nonce."
-        elif dest_callback_configured == normalize_address("0x0"):
+        elif dest_callback_configured == ZERO_ADDRESS:
             status = RecoveryStatus.RETRY_BLOCKED
             reason = "Origin event is stored as PENDING_DISPATCH, but destination callback contract remains unconfigured."
             remediation = "Owner must call setDestinationConfig before invoking dispatchPendingCallback."
+        elif not config_comparison["all_recipients_match"]:
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = (
+                f"Destination callback configuration drift blocked dispatch: expected_callback={norm_cb_addr}, "
+                f"current destinationCallback()={dest_callback_configured} ({', '.join(failed_comparisons)})."
+            )
+            remediation = (
+                "Complete an explicitly reviewed configuration migration before dispatching; "
+                "preflight does not automatically adopt a drifted callback address."
+            )
         elif dest_chain_id_configured != UNICHAIN_SEPOLIA_CHAIN_ID:
             status = RecoveryStatus.RETRY_BLOCKED
             reason = f"Configured destination chain ID ({dest_chain_id_configured}) is invalid (expected {UNICHAIN_SEPOLIA_CHAIN_ID})."
@@ -2103,10 +2501,6 @@ def run_recovery_preflight(
             status = RecoveryStatus.RETRY_BLOCKED
             reason = f"CrossGuardCallback has outstanding debt of {proxy_debt} wei on Callback Proxy (blocks callback delivery)."
             remediation = "Settle callback debt by calling depositTo(callbackContract) on Unichain Sepolia Callback Proxy."
-        elif system_debt > 0:
-            status = RecoveryStatus.RETRY_BLOCKED
-            reason = f"CrossGuardReactive has outstanding debt of {system_debt} wei on System Contract (blocks future react() execution)."
-            remediation = "Settle debt by calling depositTo(reactiveContract) on Reactive System Contract."
         elif proxy_reserves == 0 or proxy_reserves < proxy_fee_estimate["recommended_min_reserve_wei"]:
             status = RecoveryStatus.RETRY_BLOCKED
             reason = (
@@ -2114,13 +2508,50 @@ def run_recovery_preflight(
                 f"({proxy_fee_estimate['recommended_min_reserve_wei']} wei under current gas environment)."
             )
             remediation = "Replenish reserves via depositTo(callbackContract) on Unichain Sepolia Callback Proxy."
+        elif proxy_fee_estimate["settlement_gas_sufficient"] is False:
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = (
+                f"Callback Proxy _maxChargeGas ({proxy_max_gas}) fails payment-settlement requirement "
+                f"({proxy_fee_estimate['settlement_gas_status']})."
+            )
+            remediation = "Verify destination Callback Proxy _maxChargeGas payment-settlement gas configuration."
+        elif require_reactive_reserves and system_debt > 0:
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = (
+                f"Conservative whole-pipeline policy (require_reactive_reserves=True): "
+                f"CrossGuardReactive has outstanding debt of {system_debt} wei on System Contract (suspends automated react() execution)."
+            )
+            remediation = "Settle debt by calling depositTo(reactiveContract) on Reactive System Contract."
+        elif require_reactive_reserves and (system_reserves == 0 or system_reserves < system_fee_estimate["recommended_min_reserve_wei"]):
+            status = RecoveryStatus.RETRY_BLOCKED
+            reason = (
+                f"Conservative whole-pipeline policy (require_reactive_reserves=True): "
+                f"Insufficient Reactive System Contract reserves ({system_reserves} wei) vs conservative estimate "
+                f"({system_fee_estimate['recommended_min_reserve_wei']} wei)."
+            )
+            remediation = "Replenish reserves via depositTo(reactiveContract) on Reactive System Contract."
         else:
             status = RecoveryStatus.DISPATCH_REQUIRED
             reason = (
                 f"Valid origin event (nonce {expected_nonce}, {r_cb_type}) was stored in CrossGuardReactive "
-                f"as PENDING_DISPATCH when destination config was unavailable, and prerequisites are now satisfied."
+                f"as PENDING_DISPATCH when destination config was unavailable; current configuration and Callback Proxy funding pass."
             )
+            if warnings:
+                reason += f" Advisory: {len(warnings)} Reactive System Contract warning(s) emitted (see warnings)."
             remediation = "Authorized contract owner may review this evidence and manually invoke dispatchPendingCallback(positionId, expectedNonce)."
+
+    # Next check non-deferred recipient drift BEFORE RETRY_ALREADY_SUCCEEDED or RETRY_ELIGIBLE
+    if status is None and dest_callback_configured != ZERO_ADDRESS and not config_comparison["all_recipients_match"]:
+        status = RecoveryStatus.RETRY_BLOCKED
+        reason = (
+            f"Destination callback configuration drift detected: expected={norm_cb_addr}, "
+            f"historical={historical_cb_recipient}, current destinationCallback()={dest_callback_configured} "
+            f"({', '.join(failed_comparisons)})."
+        )
+        remediation = (
+            "Normal recovery blocks recipient drift and never auto-adopts a changed callback address; "
+            "complete an explicitly reviewed configuration migration."
+        )
 
     # Next check already processed on destination
     if status is None and dest_last_processed_nonce >= expected_nonce:
@@ -2162,11 +2593,12 @@ def run_recovery_preflight(
         else:
             matching = [
                 r for r in records
-                if normalize_address(r.get("reactive_contract", "")) == norm_reactive_addr
+                if normalize_address(r.get("reactive_contract", "")) == norm_reactive_cfg
                 and r.get("destination_chain_id") == UNICHAIN_SEPOLIA_CHAIN_ID
             ]
+            matched_record_count = len(matching)
             if len(matching) == 0:
-                wrong_senders = [r.get("reactive_contract") for r in records if normalize_address(r.get("reactive_contract", "")) != norm_reactive_addr]
+                wrong_senders = [r.get("reactive_contract") for r in records if normalize_address(r.get("reactive_contract", "")) != norm_reactive_cfg]
                 wrong_chains = [r.get("destination_chain_id") for r in records if r.get("destination_chain_id") != UNICHAIN_SEPOLIA_CHAIN_ID]
                 if wrong_chains and not wrong_senders:
                     status = RecoveryStatus.RETRY_BLOCKED
@@ -2174,7 +2606,7 @@ def run_recovery_preflight(
                     remediation = "Verify destination chain configuration in CrossGuardReactive."
                 elif wrong_senders or wrong_chains:
                     status = RecoveryStatus.RETRY_UNKNOWN
-                    reason = f"Callback records do not match CrossGuardReactive ({norm_reactive_addr}) on chain {UNICHAIN_SEPOLIA_CHAIN_ID} (senders={wrong_senders}, chains={wrong_chains})."
+                    reason = f"Callback records do not match CrossGuardReactive ({norm_reactive_cfg}) on chain {UNICHAIN_SEPOLIA_CHAIN_ID} (senders={wrong_senders}, chains={wrong_chains})."
                     remediation = "Verify transaction hash corresponds to this CrossGuard deployment."
                 else:
                     status = RecoveryStatus.RETRY_PENDING
@@ -2217,10 +2649,18 @@ def run_recovery_preflight(
                         status = RecoveryStatus.RETRY_BLOCKED
                         reason = f"Callback dispatch status is {r_cb_status} (must be REQUESTED for retry)."
                         remediation = "Callback must have been previously requested before calling retryFailedCallback."
-                    elif dest_callback_configured == normalize_address("0x0"):
+                    elif dest_callback_configured == ZERO_ADDRESS:
                         status = RecoveryStatus.RETRY_BLOCKED
                         reason = "Destination callback contract is not configured in CrossGuardReactive."
                         remediation = "Owner must call setDestinationConfig with valid destination callback contract address."
+                    elif not config_comparison["all_recipients_match"]:
+                        status = RecoveryStatus.RETRY_BLOCKED
+                        reason = (
+                            f"Destination callback configuration drift blocked retry: expected={norm_cb_addr}, "
+                            f"historical={historical_cb_recipient}, current={dest_callback_configured} "
+                            f"({', '.join(failed_comparisons)})."
+                        )
+                        remediation = "Complete an explicitly reviewed configuration migration before retrying."
                     elif dest_chain_id_configured != UNICHAIN_SEPOLIA_CHAIN_ID:
                         status = RecoveryStatus.RETRY_BLOCKED
                         reason = f"Configured destination chain ID ({dest_chain_id_configured}) is invalid (expected {UNICHAIN_SEPOLIA_CHAIN_ID})."
@@ -2233,21 +2673,10 @@ def run_recovery_preflight(
                         status = RecoveryStatus.RETRY_BLOCKED
                         reason = config_blocker_reason
                         remediation = config_blocker_remediation
-                    elif system_debt > 0:
-                        status = RecoveryStatus.RETRY_BLOCKED
-                        reason = f"CrossGuardReactive has outstanding debt of {system_debt} wei on System Contract (blocks automated react() processing)."
-                        remediation = "Settle debt by calling depositTo(reactiveContract) on Reactive System Contract."
                     elif proxy_debt > 0:
                         status = RecoveryStatus.RETRY_BLOCKED
                         reason = f"CrossGuardCallback has outstanding debt of {proxy_debt} wei on Callback Proxy (stops callback delivery on destination)."
                         remediation = "Settle debt by calling depositTo(callbackContract) on Callback Proxy on Unichain Sepolia."
-                    elif system_reserves == 0 or system_reserves < system_fee_estimate["recommended_min_reserve_wei"]:
-                        status = RecoveryStatus.RETRY_BLOCKED
-                        reason = (
-                            f"Insufficient Reactive System Contract reserves ({system_reserves} wei) vs conservative estimate "
-                            f"({system_fee_estimate['recommended_min_reserve_wei']} wei)."
-                        )
-                        remediation = "Replenish reserves by calling depositTo(reactiveContract) on Reactive System Contract."
                     elif proxy_reserves == 0 or proxy_reserves < proxy_fee_estimate["recommended_min_reserve_wei"]:
                         status = RecoveryStatus.RETRY_BLOCKED
                         reason = (
@@ -2255,37 +2684,63 @@ def run_recovery_preflight(
                             f"({proxy_fee_estimate['recommended_min_reserve_wei']} wei)."
                         )
                         remediation = "Replenish reserves via depositTo(callbackContract) on Unichain Sepolia Callback Proxy."
+                    elif proxy_fee_estimate["settlement_gas_sufficient"] is False:
+                        status = RecoveryStatus.RETRY_BLOCKED
+                        reason = (
+                            f"Callback Proxy _maxChargeGas ({proxy_max_gas}) fails payment-settlement requirement "
+                            f"({proxy_fee_estimate['settlement_gas_status']})."
+                        )
+                        remediation = "Verify destination Callback Proxy _maxChargeGas payment-settlement gas configuration."
+                    elif require_reactive_reserves and system_debt > 0:
+                        status = RecoveryStatus.RETRY_BLOCKED
+                        reason = (
+                            f"Conservative whole-pipeline policy (require_reactive_reserves=True): "
+                            f"CrossGuardReactive has outstanding debt of {system_debt} wei on System Contract (suspends automated react() processing)."
+                        )
+                        remediation = "Settle debt by calling depositTo(reactiveContract) on Reactive System Contract."
+                    elif require_reactive_reserves and (system_reserves == 0 or system_reserves < system_fee_estimate["recommended_min_reserve_wei"]):
+                        status = RecoveryStatus.RETRY_BLOCKED
+                        reason = (
+                            f"Conservative whole-pipeline policy (require_reactive_reserves=True): "
+                            f"Insufficient Reactive System Contract reserves ({system_reserves} wei) vs conservative estimate "
+                            f"({system_fee_estimate['recommended_min_reserve_wei']} wei)."
+                        )
+                        remediation = "Replenish reserves by calling depositTo(reactiveContract) on Reactive System Contract."
                     else:
                         status = RecoveryStatus.RETRY_ELIGIBLE
                         reason = (
                             f"Recovery conditions met: confirmed destination execution failure (dest tx: {dest_tx}, error: {err_bytes}), "
                             f"stored callback nonce {r_cb_nonce} ({r_cb_type}) has not been processed on destination "
                             f"(dest nonce {dest_last_processed_nonce}), retry budget available ({r_cb_retries}/3), "
-                            f"debts clear, and reserves exceed conservative estimate."
+                            f"all 3 callback addresses agree ({norm_cb_addr}), and Callback Proxy reserves are adequate."
                         )
+                        if warnings:
+                            reason += f" Advisory: {len(warnings)} Reactive System Contract warning(s) emitted (see warnings)."
                         remediation = "Authorized contract owner may review this evidence and manually invoke retryFailedCallback(positionId, expectedNonce, reasonCode)."
 
-    proxy_effective_gas_note = (
-        f"Configured callbackGasLimit={gas_limit_configured} meets network floor ({MINIMUM_CALLBACK_GAS}); "
-        f"note Callback Proxy accounts +{proxy_extra_gas} extraGas overhead and proxy forwarding overhead means forwarded destination gas < configured limit."
-    )
+    proxy_effective_gas_note = proxy_fee_estimate["effective_forwarded_gas_warning"]
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": status.value,
+        "safe_to_consider_recovery": status in (RecoveryStatus.DISPATCH_REQUIRED, RecoveryStatus.RETRY_ELIGIBLE),
         "position_id": norm_pos,
         "expected_nonce": expected_nonce,
         "reactive_tx_hash": norm_tx_hash,
         "reason": reason,
         "remediation": remediation,
         "suggested_command": None,
+        "warnings": warnings,
+        "unsafe_or_unverified_conditions": unsafe_conditions,
+        "missing_or_unavailable_evidence": missing_evidence,
+        "configuration_comparison": config_comparison,
         "origin_state": {
-            "risk_controller": origin_controller,
+            "risk_controller": norm_origin_ctrl,
             "nonce": origin_nonce,
             "breached": origin_breached,
         },
         "reactive_state": {
-            "reactive_contract": reactive_addr,
+            "reactive_contract": norm_reactive_cfg,
             "latest_origin_nonce": reactive_latest_origin_nonce,
             "stored_callback_nonce": r_cb_nonce,
             "event_type": r_cb_type,
@@ -2296,24 +2751,49 @@ def run_recovery_preflight(
             "destination_callback": dest_callback_configured,
             "callback_gas_limit": gas_limit_configured,
             "gas_minimum_network_floor": MINIMUM_CALLBACK_GAS,
+            "effective_forwarded_gas_exact": None,
             "effective_gas_advisory": proxy_effective_gas_note,
         },
         "destination_state": {
-            "borrowing_controller": borrowing_controller,
-            "callback_adapter": callback_addr,
+            "borrowing_controller": norm_borrow_ctrl,
+            "callback_adapter": norm_cb_addr,
             "last_processed_nonce": dest_last_processed_nonce,
             "is_borrowing_paused": dest_paused,
             "paused_by_risk_breach": dest_paused_by_breach,
             "paused_by_admin": dest_paused_by_admin,
         },
         "economics": {
+            "reactive_event_processing_path": {
+                "contract": norm_sys_cfg,
+                "network": "Reactive Lasna (5318007)",
+                "currency": "REACT",
+                "system_debt_wei": system_debt,
+                "system_reserves_wei": system_reserves,
+                "has_debt_or_low_reserves": bool(system_debt > 0 or system_reserves < system_fee_estimate["recommended_min_reserve_wei"]),
+                "hard_protocol_requirement_for_manual_owner_tx": False,
+                "enforced_conservatively": require_reactive_reserves,
+                "classification_basis": (
+                    "Conservative operational safeguard: System Contract debt/low reserves suspend future automated react() execution; "
+                    "manual owner dispatchPendingCallback/retryFailedCallback pays EOA tx gas on Reactive Lasna."
+                ),
+            },
+            "destination_callback_delivery_path": {
+                "contract": norm_proxy_cfg,
+                "network": "Unichain Sepolia (1301)",
+                "currency": "ETH",
+                "callback_proxy_debt_wei": proxy_debt,
+                "callback_proxy_reserves_wei": proxy_reserves,
+                "has_debt_or_low_reserves": bool(proxy_debt > 0 or proxy_reserves < proxy_fee_estimate["recommended_min_reserve_wei"]),
+                "hard_protocol_requirement_for_destination_delivery": True,
+                "classification_basis": "Callback Proxy blocks destination callback delivery when callback contract has debt or insufficient reserves.",
+            },
             "factual_balances_and_debt": {
                 "system_debt_wei": system_debt,
                 "system_reserves_wei": system_reserves,
                 "callback_proxy_debt_wei": proxy_debt,
                 "callback_proxy_reserves_wei": proxy_reserves,
                 "pathway_impact_notes": {
-                    "system_debt_impact": "System Contract debt suspends future react() event execution (does not automatically block manual owner retryFailedCallback).",
+                    "system_debt_impact": "System Contract debt suspends future react() event execution (does not automatically block manual owner dispatchPendingCallback/retryFailedCallback unless conservative policy enabled).",
                     "callback_proxy_debt_impact": "Callback Proxy debt halts destination callback delivery until settled via depositTo(callbackContract).",
                     "balance_vs_reserves_note": "Direct ETH/REACT balance on contracts is NOT prepaid reserves credit; reserves live inside System Contract / Callback Proxy.",
                 },
@@ -2327,6 +2807,7 @@ def run_recovery_preflight(
                 "callback_proxy_extra_gas": proxy_extra_gas,
                 "callback_proxy_max_charge_gas": proxy_max_gas,
                 "callback_proxy_p_base_wei": p_base_dest,
+                "max_charge_gas_semantics": "Limits gas available for payment-settlement call; excluded from execution fee formula.",
             },
             "reserve_estimates": {
                 "system_contract_estimate": system_fee_estimate,
@@ -2345,8 +2826,20 @@ def run_recovery_preflight(
             "event_nonce": receipt_nonce,
             "deferred": is_deferred_event,
             "callback_request_count": len(system_cb_requests),
+            "callback_request_decoded": historical_cb_request,
         },
         "callback_record": callback_record_info,
+        "callback_record_correlation": {
+            "total_records": len(records),
+            "matched_records": matched_record_count,
+            "expected_reactive_contract": norm_reactive_cfg,
+            "expected_destination_chain_id": UNICHAIN_SEPOLIA_CHAIN_ID,
+            "unambiguous_match": (matched_record_count == 1 and callback_record_info is not None),
+            "protocol_schema_note": (
+                "Official 6-field getCallbacks(uint256) returns (blockNumber, reactiveContract, callbackIndex, "
+                "destinationChainId, destinationTxHash, error); does not contain recipient address or origin nonce."
+            ),
+        },
         "topology": {
             "base_sepolia_rpc": redact_rpc_url(base_rpc),
             "reactive_lasna_rpc": redact_rpc_url(reactive_rpc),
@@ -2366,9 +2859,18 @@ def format_recovery_preflight_terminal(report: Dict[str, Any]) -> str:
     lines.append(f"Position ID:     {report.get('position_id')}")
     lines.append(f"Expected Nonce:  {report.get('expected_nonce')}")
     lines.append(f"Reactive Tx:     {report.get('reactive_tx_hash')}")
-    lines.append(f"Classification:  [{report['status']}]")
+    lines.append(f"Classification:  [{report['status']}] | Safe to consider recovery: {report.get('safe_to_consider_recovery')}")
     lines.append(f"Diagnosis:       {report['reason']}")
     lines.append("-" * 80)
+
+    cfg_cmp = report.get("configuration_comparison")
+    if cfg_cmp:
+        lines.append("CALLBACK ADDRESS DRIFT CHECK:")
+        lines.append(f"  • Expected CrossGuardCallback:    {cfg_cmp.get('expected_callback')}")
+        lines.append(f"  • Historical Request Recipient:   {cfg_cmp.get('historical_callback_request_recipient') or '<None (deferred)>'}")
+        lines.append(f"  • Current Reactive Destination:   {cfg_cmp.get('current_destination_callback')}")
+        lines.append(f"  • All Recipients Match:           {cfg_cmp.get('all_recipients_match')} | Drift Detected: {cfg_cmp.get('drift_detected')}")
+        lines.append("-" * 80)
 
     # State overview
     lines.append("CROSS-CHAIN STATE SNAPSHOT:")
@@ -2406,6 +2908,12 @@ def format_recovery_preflight_terminal(report: Dict[str, Any]) -> str:
         lines.append(f"  • Callback Proxy Est. Min Reserve: {p_est.get('recommended_min_reserve_wei')} wei (single est: {p_est.get('estimated_single_callback_fee_wei')} wei, {p_est.get('safety_multiplier')}x safety)")
         lines.append(f"  • System Contract Est. Min Reserve:{s_est.get('recommended_min_reserve_wei')} wei (single est: {s_est.get('estimated_single_callback_fee_wei')} wei, {s_est.get('safety_multiplier')}x safety)")
     lines.append("-" * 80)
+
+    if report.get("warnings") or report.get("unsafe_or_unverified_conditions"):
+        lines.append("WARNINGS & UNSAFE / UNVERIFIED CONDITIONS:")
+        for item in report.get("unsafe_or_unverified_conditions", []):
+            lines.append(f"  ! {item}")
+        lines.append("-" * 80)
 
     lines.append("REMEDIATION & RECOVERY ACTION:")
     lines.append(f"  Remediation: {report.get('remediation')}")
@@ -2525,6 +3033,17 @@ def parse_arguments() -> argparse.Namespace:
         default=DEFAULT_RESERVE_SAFETY_MULTIPLIER,
         help=f"Conservative reserve estimate safety multiplier (default: {DEFAULT_RESERVE_SAFETY_MULTIPLIER})",
     )
+    parser.add_argument(
+        "--require-reactive-reserves",
+        action="store_true",
+        help="Conservatively block manual recovery when Reactive System Contract has debt or low reserves (automated react() safeguard).",
+    )
+    parser.add_argument(
+        "--settlement-gas-requirement",
+        type=int,
+        default=None,
+        help="Optional minimum payment-settlement gas requirement compared against _maxChargeGas().",
+    )
 
     # Optional inspection & timeout
     parser.add_argument("--timeout", type=float, default=DEFAULT_RPC_TIMEOUT_SECONDS, help="Timeout in seconds for RPC queries")
@@ -2549,6 +3068,8 @@ def main():
         "reactive_tx_hash": args.reactive_tx_hash,
         "expected_nonce": args.expected_nonce,
         "safety_multiplier": args.safety_multiplier,
+        "require_reactive_reserves": args.require_reactive_reserves,
+        "settlement_gas_requirement": args.settlement_gas_requirement,
         "timeout": args.timeout,
     }
 

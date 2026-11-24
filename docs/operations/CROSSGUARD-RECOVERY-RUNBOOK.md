@@ -1,7 +1,7 @@
 # CrossGuard Cross-Chain Recovery Runbook
 
-**Document Version:** 1.1.0  
-**Milestone:** M006.1 — Recovery Preflight Integrity, Durable Event Dispatch & Cross-Chain Failure Reconciliation  
+**Document Version:** 1.2.0  
+**Milestones:** M006, M006.1 & M006.2 — Recovery Preflight Integrity, Drift Protection & Fee-Model Reconciliation  
 **Target Topology:**  
 - **Origin Chain:** Base Sepolia (`84532`)  
 - **Reactive Engine:** Reactive Lasna (`5318007`)  
@@ -22,8 +22,14 @@ CrossGuard automates cross-chain borrowing risk pauses by monitoring origin even
 3. **Same-Nonce Principle:** A failed destination callback rolls back destination EVM state, leaving `lastProcessedNonce` unchanged. Retries MUST target the exact stored origin nonce (`expectedNonce == latestCallback.nonce`) and payload. Never advance origin nonces artificially to retry.
 4. **Strict Retry Quota:** A maximum of 3 retries (`MAX_RETRIES = 3`) are permitted per `REQUESTED` origin event. Valid newer origin transitions supersede earlier state and reset `retryCount` to `0`.
 5. **No Unchecked Automated Mutations:** The `--recovery-preflight` diagnostic tool is strictly read-only. It never broadcasts transactions, never runs automated funding or retry loops, and intentionally keeps `suggested_command = None` (never emitting copy-paste `cast send` commands).
-6. **Fail-Closed Debt & Fee Separation:** Always distinguish System Contract debt/reserves (`REACT` on Reactive Lasna `0x8888...8888`) from Callback Proxy debt/reserves (`ETH` on Unichain Sepolia `0x9299...7FC4`). Any missing or malformed fee/RPC parameter must fail closed as `RETRY_UNKNOWN`.
-7. **Credential Isolation:** Never expose private keys, seed phrases, or unredacted RPC URLs in logs, terminal output, or incident reports.
+6. **Three-Way Recipient Drift Equality & Migration Policy (M006.2 P1):** Because `CrossGuardReactive.retryFailedCallback()` submits a retry to the **currently configured** `destinationCallback()`, historical `CallbackRequest` evidence alone is NOT sufficient. For `RETRY_ELIGIBLE`, preflight enforces exact 20-byte EVM equality across all three addresses: `expected_callback == historical_callback_request_recipient == current_destination_callback`. For `DISPATCH_REQUIRED`, preflight requires `expected_callback == current_destination_callback`. Any mismatch fails closed as `RETRY_BLOCKED` (or `RETRY_UNKNOWN` on historical mismatch/malformed address) and never auto-adopts a drifted callback address; operators must execute an explicitly reviewed configuration migration before recovering.
+7. **Reconciled Payment Paths, Fee Formula & `_maxChargeGas` Semantics (M006.2 P2):**
+   - Callback execution fees follow `fee = p_base * (C / 1000) * (g_used + K)` where `p_base = max(gas_price, base_fee)`, `C = _gasPriceCoeffPer1000`, and `K = _extraGas`.
+   - `_maxChargeGas` limits gas available for payment-settlement execution only and is **never** added to or used as a cap on `(g_used + K)`.
+   - Payment paths are strictly separated: **Destination Callback Proxy** debt or insufficient ETH reserves on Unichain Sepolia (`0x9299...7FC4`) is a hard blocker (`RETRY_BLOCKED`), whereas **Reactive System Contract** debt or low REACT reserves on Reactive Lasna (`0x8888...8888`) suspends automated `react()` execution and emits `REACTIVE_PATH_WARNING` without blocking owner EOA recovery transactions by default (use `--require-reactive-reserves` for conservative whole-pipeline blocking).
+   - Configured `callbackGasLimit` is NOT exact forwarded destination execution gas (`_extraGas` + settlement overhead reduce forwarded gas strictly below configured limits). Any missing or malformed economic field fails closed as `RETRY_UNKNOWN`.
+8. **Authoritative Event ABI Only (M006.2):** Only modern Omni `CallbackRequest(uint256 indexed chainId, address indexed sender, address indexed recipient, CallbackVersion version, bytes configuration)` (`version == 0` / `V_1_0` with valid inner `CallbackConfiguration_V_1_0`) is accepted. Legacy/mock `CallbackRequestedV1` signatures fail closed as `RETRY_UNKNOWN`.
+9. **Credential Isolation:** Never expose private keys, seed phrases, or unredacted RPC URLs in logs, terminal output, or incident reports.
 
 ---
 
@@ -78,8 +84,8 @@ The preflight tool inspects and correlates:
 1. **Origin State:** `positionNonce(bytes32)` and `isPositionBreached(bytes32)` on Base Sepolia `RiskController`.
 2. **Reactive State:** `latestOriginNonce(bytes32)`, 5-field `getLatestCallback(bytes32)` `(nonce, eventType, payload, retryCount, dispatchStatus)`, and destination config (`destinationChainId`, `destinationCallback`, `callbackGasLimit >= 100_000`) on Reactive Lasna `CrossGuardReactive`.
 3. **Destination State:** `lastProcessedNonce(bytes32)`, `isBorrowingPaused(bytes32)`, `pausedByRiskBreach(bytes32)`, and `pausedByAdmin(bytes32)` on Unichain Sepolia `BorrowingController`.
-4. **Economics & Fail-Closed Fee Reserves:** Distinct `debt(address)` and `reserves(address)` on the Reactive System Contract (`0x8888...8888`, REACT) and Unichain Callback Proxy (`0x9299...7FC4`, ETH), plus live fee estimation (`_gasPriceCoeffPer1000()`, `_extraGas()`, `_maxChargeGas()`, destination `gas-price` / `base-fee`) verified against `estimated_fee * safety_multiplier`. Missing or unparseable economic fields fail closed as `RETRY_UNKNOWN`.
-5. **Receipt & 6-Field Callback Correlation:** Verifies `ReactiveBreachProcessed` / `ReactiveResolvedProcessed` / `CallbackDispatchDeferred` / `CallbackDispatchSubmitted` / `CallbackRetryRequested` and `CallbackRequest` logs in `--reactive-tx-hash` using exact Ethereum Keccak-256 event topics, and unambiguously matches `getCallbacks(uint256)` 6-field tuples (`blockNumber`, `reactiveContract`, `callbackIndex`, `destinationChainId`, `destinationTxHash`, `error`).
+4. **Economics & Reconciled Fee Reserves:** Separately reports `reactive_event_processing_path` (`SystemContract`, `REACT`, conservative operational warning by default unless `--require-reactive-reserves` is set) and `destination_callback_delivery_path` (`CallbackProxy`, `ETH`, hard delivery blocker on debt or shortfall), queries `_gasPriceCoeffPer1000()`, `_extraGas()`, `_maxChargeGas()`, and `gas-price` / `base-fee`, evaluates `fee = p_base * (C / 1000) * (gas_limit + extra_gas)`, tracks `_maxChargeGas` settlement gas independently (`--settlement-gas-requirement`), and fails closed (`RETRY_UNKNOWN`) on missing/malformed inputs or uint256 overflow.
+5. **Receipt, Authoritative `CallbackRequest` ABI & 6-Field Callback Correlation:** Verifies `ReactiveBreachProcessed` / `ReactiveResolvedProcessed` / `CallbackDispatchDeferred` / `CallbackDispatchSubmitted` / `CallbackRetryRequested` and authoritative `CallbackRequest(uint256,address,address,uint8,bytes)` (`version == 0`, valid `CallbackConfiguration_V_1_0`, matching payload/chain/sender/recipient) using pure-Python Ethereum Keccak-256 topics (rejecting legacy `CallbackRequestedV1`), enforces 3-way recipient drift equality (`config_comparison`), and unambiguously correlates `getCallbacks(uint256)` 6-field tuples (`blockNumber`, `reactiveContract`, `callbackIndex`, `destinationChainId`, `destinationTxHash`, `error`).
 
 > **Read-Only Guarantee:** `--recovery-preflight` keeps `suggested_command = None` across all outcomes and never emits executable `cast send` commands, never triggers auto-funding, and never runs automatic retry loops.
 
@@ -91,19 +97,23 @@ The preflight tool categorizes recovery eligibility into one of seven determinis
 
 | Classification | Exit Code | Meaning | Required Operator Action |
 |---|---|---|---|
-| **`DISPATCH_REQUIRED`** | `0` | Valid origin event is stored on Reactive with `DispatchStatus.PENDING_DISPATCH` (event was deferred while destination config was incomplete); `CallbackDispatchDeferred` confirmed. | Follow **Path A (Phase 5A): `dispatchPendingCallback()`** once destination config and reserves are verified. |
-| **`RETRY_ELIGIBLE`** | `0` | Destination callback (`REQUESTED`) confirmed failed or rejected (non-empty `error` + nonzero matched `destinationTxHash`), destination nonce unadvanced, `retryCount < 3`, debts `== 0`, reserves adequate, and receipt correlation passed. | Proceed to **Path B (Phase 5B): `retryFailedCallback()`**. |
-| **`RETRY_ALREADY_SUCCEEDED`** | `0` | Destination has already processed `expectedNonce` (`lastProcessedNonce >= expectedNonce`) and destination callback confirmed without contradictions. | Do NOT dispatch or retry. Incident is resolved; update monitoring. |
-| **`RETRY_PENDING`** | `1` | Callback is `REQUESTED` and either callback records are empty or matched record has zero `destinationTxHash` with empty error (relayer in-flight / unconfirmed). Never inferred as succeeded or failed without evidence. | Do NOT retry yet. Wait 2-5 minutes for relayer finalization and re-run preflight. |
-| **`RETRY_SUPERSEDED`** | `1` | Origin `positionNonce` or Reactive `latestOriginNonce` has strictly exceeded `expectedNonce`. | Do NOT dispatch or retry obsolete nonce. Re-run preflight against the latest nonce if still unpaused. |
-| **`RETRY_BLOCKED`** | `1` | Recovery cannot proceed due to System Contract or Callback Proxy debt `> 0`, insufficient fee reserves (`net_reserves < estimated_fee * safety_multiplier`), unconfigured destination, `callbackGasLimit < 100_000`, or retry budget exhausted (`retryCount >= 3`). | Proceed to **Phase 4** (Remediation of Root Cause). |
-| **`RETRY_UNKNOWN`** | `1` | Missing mandatory input, RPC failure, malformed ABI output, missing/unparseable fee parameter, invalid/missing receipt event correlation, ambiguous multiple callback records, or cross-chain state contradiction. | Resolve connectivity/input/correlation issue before any state mutation. Never retry blindly. |
+| **`DISPATCH_REQUIRED`** | `0` | Valid origin event is stored on Reactive with `DispatchStatus.PENDING_DISPATCH`, `expected_callback == current_destination_callback`, destination wiring valid, and Callback Proxy funded cleanly. | Review any `REACTIVE_PATH_WARNING` alerts, then follow **Path A (Phase 5A): `dispatchPendingCallback()`**. |
+| **`RETRY_ELIGIBLE`** | `0` | `REQUESTED` callback confirmed failed (non-empty `error` + nonzero matched `destinationTxHash`), destination nonce unadvanced, `retryCount < 3`, 3-way recipient equality (`expected == historical == current`) holds, valid `CallbackRequest` V1_0 config verified, Callback Proxy debt `== 0`, and proxy reserves adequate. | Review any `REACTIVE_PATH_WARNING` alerts, then proceed to **Path B (Phase 5B): `retryFailedCallback()`**. |
+| **`RETRY_ALREADY_SUCCEEDED`** | `0` | Destination has already processed `expectedNonce` (`lastProcessedNonce >= expectedNonce`) without drift or contradictions. | Do NOT dispatch or retry. Incident is resolved; update monitoring. |
+| **`RETRY_PENDING`** | `1` | Callback is `REQUESTED` and either `getCallbacks` array is empty or matched record has zero `destinationTxHash` with empty error (relayer in-flight / unconfirmed). Never inferred as failure or success. | Do NOT retry yet. Wait 2-5 minutes for relayer finalization and re-run preflight. |
+| **`RETRY_SUPERSEDED`** | `1` | Origin `positionNonce` or Reactive `latestOriginNonce` or stored callback nonce has exceeded `expectedNonce`. | Do NOT dispatch or retry obsolete nonce. Re-run preflight against the latest nonce if still unpaused. |
+| **`RETRY_BLOCKED`** | `1` | Recovery cannot proceed due to callback recipient drift (`expected != current` or `historical != current`), unconfigured destination, `callbackGasLimit < 100_000`, Callback Proxy debt `> 0`, insufficient Callback Proxy reserves, zero/insufficient `_maxChargeGas` settlement gas, retry limit exhausted (`3/3`), or conservative `--require-reactive-reserves` failure. | Proceed to **Phase 4** (Remediation / Reviewed Configuration Migration). Never override drift blindly. |
+| **`RETRY_UNKNOWN`** | `1` | Missing mandatory input, malformed/truncated EVM address, RPC/ABI failure, unparseable fee telemetry, uint256 overflow, unsupported `CallbackVersion` / malformed `CallbackRequest` data / legacy `CallbackRequestedV1`, ambiguous multiple callback records, or cross-chain contradictions. | Resolve connectivity, input, receipt ABI, or contradiction before any state mutation. Never retry blindly. |
 
 ---
 
 ### Phase 4: Remediation of Underlying Cause
 
 Before invoking `dispatchPendingCallback()` or `retryFailedCallback()`, every root cause blocking Phase 3 MUST be resolved manually (cross-chain debts and reserves are strictly tracked separately per chain):
+
+#### Root Cause 0: Destination Callback Recipient Drift (`RETRY_BLOCKED`)
+- **Diagnosis:** `expected_callback != current_destination_callback` or `historical_callback_request_recipient != current_destination_callback` in `configuration_comparison`. Because `CrossGuardReactive.retryFailedCallback()` dispatches to the **current** `destinationCallback()`, a recipient drift means historical evidence no longer authorizes the destination target.
+- **Remediation:** Do NOT attempt to bypass drift via CLI address overrides. Operator must execute an explicitly reviewed configuration migration: verify `CrossGuardCallback.authorizedReactiveSender()`, `BorrowingController.callbackAdapter()`, and `CrossGuardReactive.setDestinationConfig(1301, <MIGRATED_CALLBACK>, <GAS >= 100000>)`, or trigger a fresh origin risk evaluation if recovering stale callbacks across migrated adapters.
 
 #### Root Cause 1: Destination Unconfigured / Deferred Dispatch (`DISPATCH_REQUIRED` or `RETRY_BLOCKED`)
 - **Diagnosis:** Origin event was stored with `DispatchStatus.PENDING_DISPATCH` while `destinationCallback == address(0)` or destination config was invalid.
@@ -115,8 +125,8 @@ Before invoking `dispatchPendingCallback()` or `retryFailedCallback()`, every ro
     --private-key $OWNER_PRIVATE_KEY
   ```
 
-#### Root Cause 2: Outstanding System Contract Debt or Insufficient Reactive Reserves (`RETRY_BLOCKED`)
-- **Diagnosis:** System Contract `debt(reactiveContract) > 0` on Reactive Lasna (`0x8888...8888`).
+#### Root Cause 2: Reactive System Contract Debt or Insufficient Reserves (`REACTIVE_PATH_WARNING` / Optional Conservative `RETRY_BLOCKED`)
+- **Diagnosis:** System Contract `debt(reactiveContract) > 0` or `reserves(reactiveContract)` low on Reactive Lasna (`0x8888...8888`). Note this suspends future automated `react()` processing; manual owner `dispatchPendingCallback()`/`retryFailedCallback()` emits a `REACTIVE_PATH_WARNING` by default (blocked only under `--require-reactive-reserves`).
 - **Remediation:** Deposit native `REACT` funds to the Reactive System Contract on Reactive Lasna (never send funds directly to `CrossGuardReactive.pay()` unless using `depositTo`):
   ```bash
   cast send 0x8888888888888888888888888888888888888888 \

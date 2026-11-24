@@ -793,6 +793,62 @@ contract M006RecoveryTest is Test {
         assertEq(retries, 0);
         assertEq(uint8(st), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
     }
+
+    function test17_OnChainConfigDriftTargetsNewCallbackOnRetry() public {
+        // Demonstrates on-chain why M006.2 off-chain preflight MUST enforce 3-way callback equality:
+        // If initial callback failed against callbackA and owner updates destinationCallback to callbackB,
+        // retryFailedCallback dispatches the retry to callbackB.
+        Vm.Log memory breachLog = _triggerOriginBreach();
+        vm.prank(address(mockSystem));
+        reactiveContract.react(_toLogRecord(breachLog));
+        assertEq(mockSystem.getLastRequestedCallback().recipient, address(crossGuardCallback));
+
+        address newCallback = address(0xBEEF00000000000000000000000000000000BEEf);
+        vm.prank(owner);
+        reactiveContract.setDestinationConfig(UNICHAIN_SEPOLIA_CHAIN_ID, newCallback, CALLBACK_GAS_LIMIT);
+
+        vm.prank(owner);
+        reactiveContract.retryFailedCallback(positionId, 1, bytes32("DRIFT_DEMO"));
+        assertEq(mockSystem.getLastRequestedCallback().recipient, newCallback);
+    }
+
+    function test18_WorkstreamEUnauthorizedDispatchAndRetryGuardsRemainStrict() public {
+        vm.prank(owner);
+        CrossGuardReactive unconf = new CrossGuardReactive(
+            owner,
+            address(mockSystem),
+            BASE_SEPOLIA_CHAIN_ID,
+            address(riskController),
+            UNICHAIN_SEPOLIA_CHAIN_ID,
+            address(0),
+            0
+        );
+
+        Vm.Log memory breachLog = _triggerOriginBreach();
+        vm.prank(address(mockSystem));
+        unconf.react(_toLogRecord(breachLog));
+
+        vm.prank(owner);
+        unconf.setDestinationConfig(UNICHAIN_SEPOLIA_CHAIN_ID, address(crossGuardCallback), CALLBACK_GAS_LIMIT);
+
+        // Stranger cannot dispatchPendingCallback
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        unconf.dispatchPendingCallback(positionId, 1);
+
+        // Owner dispatches valid pending event
+        vm.prank(owner);
+        unconf.dispatchPendingCallback(positionId, 1);
+
+        // Emergency pause + risk resolution cannot bypass admin pause during recovery
+        vm.prank(owner);
+        borrowingController.emergencyPauseBorrowing(positionId);
+
+        (,, bytes memory breachPayload,,) = unconf.getLatestCallback(positionId);
+        callbackProxy.executeCallback(address(crossGuardCallback), breachPayload, CALLBACK_GAS_LIMIT, address(unconf));
+        assertTrue(borrowingController.isBorrowingPaused(positionId));
+        assertTrue(borrowingController.pausedByAdmin(positionId));
+    }
 }
 
 /// @title M006RecoveryHandler

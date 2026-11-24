@@ -32,7 +32,7 @@ python script/ops/crossguard_healthcheck.py \
 ```
 
 ### Safety & Operational Constraints
-- **Strictly Read-Only:** The health checker only executes whitelisted read-only queries (`cast chain-id`, `cast code`, `cast call`, `cast balance`). It strictly forbids transaction broadcasting, wallet access, or private key handling.
+- **Strictly Read-Only:** The health checker only executes whitelisted read-only queries (`cast chain-id`, `cast code`, `cast call`, `cast balance`, `cast receipt`, `cast gas-price`, `cast base-fee`). It strictly forbids transaction broadcasting, wallet access, or private key handling.
 - **Credential Redaction:** The tool automatically redacts all RPC credentials, user-info, sensitive path segments, and query tokens from terminal outputs, JSON reports, and error messages.
 - **Bounded Execution Timeouts:** Subprocess RPC queries enforce a 15-second default timeout to prevent hanging on unresponsive endpoints.
 - **Strict Exit Codes:** Returns exit code `0` for `HEALTHY`, and exit code `1` for `WARNING`, `CRITICAL`, `UNKNOWN`, and `ERROR` to facilitate reliable monitoring automation.
@@ -237,10 +237,14 @@ Every failure scenario must follow this rigorous five-step diagnostic procedure:
 
 ---
 
-### Scenario 12: Insufficient Gas Revert (`InsufficientGas`)
+### Scenario 12: Insufficient Gas Revert (`InsufficientGas`) & Forwarded Gas Overhead
 1. **Detection:** Destination callback reverts with out-of-gas error or `CallbackFailure`.
-2. **Evidence Collection:** Compare configured gas limit (`300,000`) against proxy accounting overhead.
-3. **Root-Cause Isolation:** The callback method or proxy settlement logic required more gas than provided in the forwarded budget.
+2. **Evidence Collection:** Compare configured `callbackGasLimit` (`300,000` recommended; network floor `100,000`) against destination `CallbackProxy` accounting parameters (`_gasPriceCoeffPer1000()`, `_extraGas()`, `_maxChargeGas()`).
+   - **Fee Formula:** `fee = p_base * (C / 1000) * (g_used + K)` where `p_base = max(gas_price, base_fee)`, `C = _gasPriceCoeffPer1000`, `K = _extraGas`.
+   - **Role of `_maxChargeGas`:** Limits gas reserved/available for internal payment-settlement execution only. It is NOT added to `(g_used + K)` and does NOT cap callback execution billing.
+   - **Forwarded Gas Limitation:** Proxy accounting and settlement overhead mean gas actually forwarded to `CrossGuardCallback` is strictly less than configured `callbackGasLimit`; exact forwarded gas cannot be derived from configured limits alone.
+   - **Payment Path Distinction:** `SystemContract` debt (`REACT`, Lasna) suspends automated `react()` execution, whereas `CallbackProxy` debt (`ETH`, Unichain) halts destination callback delivery.
+3. **Root-Cause Isolation:** The callback method plus proxy wrapper overhead exhausted forwarded execution gas or settlement allowance.
 4. **Authorized Remediation:** Call `setDestinationConfig` on `CrossGuardReactive` to increase `callbackGasLimit` (e.g. to `500,000` gas).
 5. **Post-Remediation Verification:** Confirm new gas limit on Lasna.
 

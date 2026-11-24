@@ -1192,6 +1192,6 @@ contract RevertableOmniSystemContract is MockOmniSystemContract {
             revert("Mock system callback failed");
         }
         requestedCallbacks.push(config_);
-        emit CallbackRequestedV1(config_.chainId, config_.recipient, config_.gasLimit, config_.payload);
+        emit CallbackRequest(config_.chainId, msg.sender, config_.recipient, CallbackVersion.V_1_0, abi.encode(config_));
     }
 }

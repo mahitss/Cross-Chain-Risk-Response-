@@ -29,7 +29,6 @@ from script.ops.crossguard_healthcheck import (
     CALLBACK_DISPATCH_DEFERRED_TOPIC,
     CALLBACK_DISPATCH_SUBMITTED_TOPIC,
     CALLBACK_REQUEST_TOPIC,
-    CALLBACK_REQUESTED_V1_TOPIC,
     CALLBACK_RETRY_REQUESTED_TOPIC,
     DEFAULT_CALLBACK_PROXY,
     DEFAULT_SYSTEM_CONTRACT,
@@ -38,6 +37,7 @@ from script.ops.crossguard_healthcheck import (
     REACTIVE_LASNA_CHAIN_ID,
     REACTIVE_RESOLVED_PROCESSED_TOPIC,
     UNICHAIN_SEPOLIA_CHAIN_ID,
+    UNSUPPORTED_LEGACY_CALLBACK_REQUESTED_V1_TOPIC,
     CastRpcRunner,
     CheckCategory,
     CrossGuardHealthChecker,
@@ -51,9 +51,11 @@ from script.ops.crossguard_healthcheck import (
     decode_bool_strict,
     decode_bytes_strict,
     decode_callback_records,
+    decode_callback_request_data_strict,
     decode_get_latest_callback,
     decode_get_latest_callback_strict,
     decode_uint_strict,
+    encode_callback_request_data,
     estimate_callback_fee_wei,
     format_recovery_preflight_terminal,
     format_terminal_report,
@@ -62,6 +64,7 @@ from script.ops.crossguard_healthcheck import (
     redact_rpc_url,
     run_recovery_preflight,
     sanitize_text,
+    validate_evm_address,
 )
 
 
@@ -1031,7 +1034,7 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
                         "0x000000000000000000000000" + reactive[2:],
                         "0x000000000000000000000000" + cb_adapter[2:],
                     ],
-                    "data": "0x",
+                    "data": encode_callback_request_data(1301, cb_adapter, 300_000, "0x11223344"),
                 },
             ],
         }
@@ -1145,7 +1148,7 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertEqual(report["status"], RecoveryStatus.RETRY_BLOCKED.value)
         self.assertIn("Retry limit exceeded", report["reason"])
 
-    # 52. RETRY_BLOCKED when Reactive System Contract debt is outstanding
+    # 52. Reactive debt (warns by default, blocks under conservative policy) vs Callback Proxy debt
     def test_52_preflight_blocked_system_contract_debt(self):
         config = create_base_config()
         pos_id = self._get_test_position_id()
@@ -1154,11 +1157,22 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         sys_contract = config["system_contract"].lower()
         runner.call_map[(sys_contract, "debt(address)", config["reactive_rpc"])] = "50000"
 
+        # Default: System Contract debt threatens automated react(), NOT destination Callback Proxy delivery -> warns visibly without false Proxy block
         report = run_recovery_preflight(
             config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner
         )
-        self.assertEqual(report["status"], RecoveryStatus.RETRY_BLOCKED.value)
-        self.assertIn("outstanding debt of 50000 wei on System Contract", report["reason"])
+        self.assertEqual(report["status"], RecoveryStatus.RETRY_ELIGIBLE.value)
+        self.assertTrue(any("50000 wei debt on System Contract" in w for w in report["warnings"]))
+        self.assertTrue(report["economics"]["reactive_event_processing_path"]["has_debt_or_low_reserves"])
+        self.assertFalse(report["economics"]["destination_callback_delivery_path"]["has_debt_or_low_reserves"])
+
+        # Explicit conservative whole-pipeline gate blocks on Reactive System Contract debt
+        strict_cfg = dict(config, require_reactive_reserves=True)
+        report_strict = run_recovery_preflight(
+            strict_cfg, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner
+        )
+        self.assertEqual(report_strict["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("outstanding debt of 50000 wei on System Contract", report_strict["reason"])
 
     # 53. RETRY_BLOCKED when Callback Proxy debt is outstanding
     def test_53_preflight_blocked_callback_proxy_debt(self):
@@ -1491,8 +1505,12 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
 
         # Case B: Wrong destination chain ID in CallbackRequest (e.g. 1 instead of 1301) -> BLOCKED
         runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        cb_adapter = config["callback_address"].lower()
         runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["topics"][1] = (
             "0x0000000000000000000000000000000000000000000000000000000000000001"
+        )
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = (
+            encode_callback_request_data(1, cb_adapter, 300_000, "0x11223344")
         )
         rep_cid = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
         self.assertEqual(rep_cid["status"], RecoveryStatus.RETRY_BLOCKED.value)
@@ -1500,8 +1518,12 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
 
         # Case C: Wrong recipient in CallbackRequest -> UNKNOWN
         runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        wrong_rcp = "0x9999999999999999999999999999999999999999"
         runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["topics"][3] = (
-            "0x0000000000000000000000009999999999999999999999999999999999999999"
+            "0x000000000000000000000000" + wrong_rcp[2:]
+        )
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = (
+            encode_callback_request_data(1301, wrong_rcp, 300_000, "0x11223344")
         )
         rep_rcp = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
         self.assertEqual(rep_rcp["status"], RecoveryStatus.RETRY_UNKNOWN.value)
@@ -1690,14 +1712,19 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertEqual(rep1["status"], RecoveryStatus.RETRY_BLOCKED.value)
         self.assertIn("conservative estimate", rep1["reason"])
 
-        # Insufficient Reactive System reserves (1 wei) -> BLOCKED
+        # Insufficient Reactive System reserves (1 wei) -> emits REACTIVE_PATH_WARNING by default; RETRY_BLOCKED only if require_reactive_reserves=True
         runner = self._setup_preflight_runner(config, pos_id, tx_hash)
         runner.call_map[(sys_contract, "reserves(address)", config["reactive_rpc"])] = "1"
-        rep_sys = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
-        self.assertEqual(rep_sys["status"], RecoveryStatus.RETRY_BLOCKED.value)
-        self.assertIn("Insufficient Reactive System Contract reserves", rep_sys["reason"])
+        rep_sys_warn = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep_sys_warn["status"], RecoveryStatus.RETRY_ELIGIBLE.value)
+        self.assertTrue(any("Reactive System Contract reserves (1 wei)" in w for w in rep_sys_warn["warnings"]))
 
-    # 81. Reserve fee estimator formula & assumptions verification
+        strict_cfg = dict(config, require_reactive_reserves=True)
+        rep_sys_strict = run_recovery_preflight(strict_cfg, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep_sys_strict["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("Insufficient Reactive System Contract reserves", rep_sys_strict["reason"])
+
+    # 81. Reserve fee estimator formula, _maxChargeGas separation & assumptions verification
     def test_81_fee_estimator_formula_and_assumptions(self):
         # fee = p_base * (C/1000) * (g_used + K)
         # With p_base=2e9, C=1500 (1.5x), g_used=300_000, K=50_000 -> fee = 2e9 * 1.5 * 350_000 = 1_050_000_000_000_000 wei
@@ -1706,12 +1733,17 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
             p_base_wei=2_000_000_000,
             coeff_per_1000=1500,
             extra_gas=50_000,
-            max_charge_gas=300_000,  # exceeds maxChargeGas check
+            max_charge_gas=50_000,
             safety_multiplier=2,
+            settlement_gas_requirement=50_000,
         )
         self.assertEqual(est["estimated_single_callback_fee_wei"], 1_050_000_000_000_000)
         self.assertEqual(est["recommended_min_reserve_wei"], 2_100_000_000_000_000)
-        self.assertTrue(est["exceeds_max_charge_gas"])
+        self.assertNotIn("exceeds_max_charge_gas", est)
+        self.assertFalse(est["max_charge_gas_in_fee_formula"])
+        self.assertEqual(est["settlement_gas_status"], "AT_REQUIREMENT")
+        self.assertTrue(est["settlement_gas_sufficient"])
+        self.assertIsNone(est["effective_forwarded_gas_exact"])
         self.assertFalse(est["guarantees_future_delivery"])
         self.assertTrue(len(est["assumptions"]) >= 4)
 
@@ -1859,7 +1891,7 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
                 "0x000000000000000000000000" + reactive[2:],
                 "0x000000000000000000000000" + cb_adapter[2:],
             ],
-            "data": "0x",
+            "data": encode_callback_request_data(1301, cb_adapter, 300_000, "0x11223344"),
         })
         rep_multi = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
         self.assertEqual(rep_multi["status"], RecoveryStatus.RETRY_UNKNOWN.value)
@@ -1931,7 +1963,7 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
                         "0x000000000000000000000000" + reactive[2:],
                         "0x000000000000000000000000" + cb_adapter[2:],
                     ],
-                    "data": "0x",
+                    "data": encode_callback_request_data(1301, cb_adapter, 300_000, "0x11223344"),
                 },
             ],
         }
@@ -1971,6 +2003,430 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         parsed = json.loads(proc.stdout)
         self.assertEqual(parsed["status"], RecoveryStatus.RETRY_UNKNOWN.value)
         self.assertIn("mandatory", parsed["reason"])
+
+    # =========================================================================
+    # M006.2 ADVERSARIAL TESTS — WORKSTREAM A (CONFIG DRIFT PROTECTION)
+    # =========================================================================
+
+    # 91. Workstream A: All 3 callback recipients match (including mixed uppercase/lowercase)
+    def test_91_drift_all_three_match_and_case_insensitivity(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        # Supply mixed-case expected callback & uppercase reactive destinationCallback()
+        config["callback_address"] = "0x333333333333333333333333333333333333AbCd"
+        cb_norm = config["callback_address"].lower()
+        reactive = config["reactive_address"].lower()
+        borrow = config["borrowing_controller_address"].lower()
+        sys_contract = config["system_contract"].lower()
+        proxy = config["callback_proxy"].lower()
+
+        # Re-populate wiring keys for mixed-case callback_address
+        runner.code_map[(cb_norm, config["unichain_rpc"])] = "0x60806040"
+        runner.call_map[(reactive, "destinationCallback()", config["reactive_rpc"])] = config["callback_address"].upper().replace("0X", "0x")
+        runner.call_map[(borrow, "callbackAdapter()", config["unichain_rpc"])] = cb_norm
+        runner.call_map[(cb_norm, "callbackProxy()", config["unichain_rpc"])] = proxy
+        runner.call_map[(cb_norm, "authorizedReactiveSender()", config["unichain_rpc"])] = reactive
+        runner.call_map[(cb_norm, "borrowingController()", config["unichain_rpc"])] = borrow
+        runner.call_map[(proxy, "debt(address)", config["unichain_rpc"])] = "0"
+        runner.call_map[(proxy, "reserves(address)", config["unichain_rpc"])] = str(10**18)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["topics"][3] = "0x" + "0" * 24 + cb_norm[2:]
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = encode_callback_request_data(
+            1301, config["callback_address"], 300_000, "0x11223344"
+        )
+
+        rep = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep["status"], RecoveryStatus.RETRY_ELIGIBLE.value)
+        self.assertTrue(rep["safe_to_consider_recovery"])
+        self.assertTrue(rep["configuration_comparison"]["all_recipients_match"])
+        self.assertFalse(rep["configuration_comparison"]["drift_detected"])
+        self.assertEqual(rep["configuration_comparison"]["expected_callback"], cb_norm)
+
+    # 92. Workstream A: Historical differs from expected (while current == expected) -> RETRY_UNKNOWN
+    def test_92_drift_historical_differs_from_expected(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        other_cb = "0x7777777777777777777777777777777777777777"
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["topics"][3] = "0x" + "0" * 24 + other_cb[2:]
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = encode_callback_request_data(
+            1301, other_cb, 300_000, "0x11223344"
+        )
+        rep = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertNotEqual(rep["status"], RecoveryStatus.RETRY_ELIGIBLE.value)
+        self.assertEqual(rep["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertTrue(rep["configuration_comparison"]["drift_detected"])
+        self.assertFalse(rep["configuration_comparison"]["expected_matches_historical"])
+        self.assertFalse(rep["safe_to_consider_recovery"])
+
+    # 93. Workstream A: Current destinationCallback differs from expected (and drifted from historical too)
+    def test_93_drift_current_differs_from_expected(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        reactive = config["reactive_address"].lower()
+        drifted_cb = "0x7777777777777777777777777777777777777777"
+        runner.call_map[(reactive, "destinationCallback()", config["reactive_rpc"])] = drifted_cb
+
+        # Even when historical == current == drifted_cb while operator expects original cb, must block!
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["topics"][3] = "0x" + "0" * 24 + drifted_cb[2:]
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = encode_callback_request_data(
+            1301, drifted_cb, 300_000, "0x11223344"
+        )
+        rep = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertFalse(rep["configuration_comparison"]["expected_matches_current"])
+        self.assertFalse(rep["configuration_comparison"]["all_recipients_match"])
+        self.assertIn("migration", rep["remediation"].lower())
+
+    # 94. Workstream A (Critical P1): Historical matches expected, but current destinationCallback drifted between dispatch and retry
+    def test_94_drift_between_initial_dispatch_and_later_recovery_blocks_retry(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        reactive = config["reactive_address"].lower()
+        new_drifted_cb = "0x8888777766665555444433332222111100009999"
+
+        # Historical CallbackRequest was sent to 0x3333... (expected), then owner changed destinationCallback to new_drifted_cb
+        runner.call_map[(reactive, "destinationCallback()", config["reactive_rpc"])] = new_drifted_cb
+
+        rep_orig = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep_orig["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertTrue(rep_orig["configuration_comparison"]["expected_matches_historical"])
+        self.assertFalse(rep_orig["configuration_comparison"]["expected_matches_current"])
+        self.assertFalse(rep_orig["configuration_comparison"]["historical_matches_current"])
+        self.assertIn("drift", rep_orig["reason"].lower())
+        self.assertIn("migration", rep_orig["remediation"].lower())
+        self.assertNotIn("RETRY_ELIGIBLE", rep_orig["status"])
+
+        # Attempting to override CLI --callback-address to new_drifted_cb must STILL fail closed because historical != new_drifted_cb!
+        override_cfg = dict(config, callback_address=new_drifted_cb)
+        runner.code_map[(new_drifted_cb, config["unichain_rpc"])] = "0x60806040"
+        borrow = config["borrowing_controller_address"].lower()
+        runner.call_map[(borrow, "callbackAdapter()", config["unichain_rpc"])] = new_drifted_cb
+        runner.call_map[(new_drifted_cb, "callbackProxy()", config["unichain_rpc"])] = config["callback_proxy"].lower()
+        runner.call_map[(new_drifted_cb, "authorizedReactiveSender()", config["unichain_rpc"])] = reactive
+        runner.call_map[(new_drifted_cb, "borrowingController()", config["unichain_rpc"])] = borrow
+        runner.call_map[(config["callback_proxy"].lower(), "debt(address)", config["unichain_rpc"])] = "0"
+        runner.call_map[(config["callback_proxy"].lower(), "reserves(address)", config["unichain_rpc"])] = str(10**18)
+
+        rep_override = run_recovery_preflight(override_cfg, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertNotEqual(rep_override["status"], RecoveryStatus.RETRY_ELIGIBLE.value)
+        self.assertEqual(rep_override["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+
+    # 95. Workstream A: Zero callback address & malformed/truncated addresses fail closed
+    def test_95_drift_zero_and_malformed_truncated_addresses_fail_closed(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+
+        # Truncated expected callback address
+        bad_cfg = dict(config, callback_address="0x1234")
+        rep_trunc = run_recovery_preflight(bad_cfg, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep_trunc["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertIn("20-byte EVM address", rep_trunc["reason"])
+
+        # Zero expected callback address
+        zero_cfg = dict(config, callback_address="0x" + "0" * 40)
+        rep_zero = run_recovery_preflight(zero_cfg, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep_zero["status"], RecoveryStatus.RETRY_BLOCKED.value)
+
+        # Truncated current destinationCallback() from RPC -> RETRY_UNKNOWN
+        runner.call_map[(config["reactive_address"].lower(), "destinationCallback()", config["reactive_rpc"])] = "0xdead"
+        rep_rpc_trunc = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep_rpc_trunc["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+
+        with self.assertRaises(ValueError):
+            validate_evm_address("0x1234")
+
+    # 96. Workstream A: DISPATCH_REQUIRED valid matching vs mismatched current destinationCallback
+    def test_96_dispatch_required_current_callback_matching_and_mismatched(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        reactive = config["reactive_address"].lower()
+        sys_contract = config["system_contract"].lower()
+
+        runner.call_map[(reactive, "getLatestCallback(bytes32)", config["reactive_rpc"])] = "(1, 1, 0x11223344, 0, 1)"
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])] = {
+            "status": "0x1",
+            "logs": [{
+                "address": reactive,
+                "topics": [
+                    CALLBACK_DISPATCH_DEFERRED_TOPIC,
+                    pos_id,
+                    "0x0000000000000000000000000000000000000000000000000000000000000001",
+                    "0x0000000000000000000000000000000000000000000000000000000000000001",
+                ],
+                "data": "0x",
+            }],
+        }
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+        runner.call_map[(sys_contract, sig, config["reactive_rpc"])] = "[]"
+
+        # Valid matching current callback -> DISPATCH_REQUIRED
+        rep_ok = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep_ok["status"], RecoveryStatus.DISPATCH_REQUIRED.value)
+        self.assertTrue(rep_ok["configuration_comparison"]["all_recipients_match"])
+        self.assertIsNone(rep_ok["configuration_comparison"]["historical_callback_request_recipient"])
+
+        # Mismatched current destinationCallback -> RETRY_BLOCKED (must not approve dispatch!)
+        runner.call_map[(reactive, "destinationCallback()", config["reactive_rpc"])] = "0x9999888877776666555544443333222211110000"
+        rep_mismatch = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep_mismatch["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertFalse(rep_mismatch["configuration_comparison"]["expected_matches_current"])
+        self.assertIn("migration", rep_mismatch["remediation"].lower())
+
+    # =========================================================================
+    # M006.2 ADVERSARIAL TESTS — WORKSTREAM B (FEE & MAX-CHARGE MODEL)
+    # =========================================================================
+
+    # 97. Workstream B: p_base selection (gas_price > base_fee and base_fee > gas_price) & _maxChargeGas fee independence
+    def test_97_fee_pbase_and_max_charge_gas_independence(self):
+        # Verify _maxChargeGas never changes estimated fee
+        e1 = estimate_callback_fee_wei(300_000, 1_500_000_000, 1000, 50_000, max_charge_gas=10_000, safety_multiplier=2)
+        e2 = estimate_callback_fee_wei(300_000, 1_500_000_000, 1000, 50_000, max_charge_gas=5_000_000, safety_multiplier=2)
+        self.assertEqual(e1["estimated_single_callback_fee_wei"], e2["estimated_single_callback_fee_wei"])
+        self.assertEqual(e1["recommended_min_reserve_wei"], e2["recommended_min_reserve_wei"])
+
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        # gas_price > base_fee
+        r1 = self._setup_preflight_runner(config, pos_id, tx_hash)
+        r1.gas_prices[config["unichain_rpc"]] = 3_000_000_000
+        r1.base_fees[config["unichain_rpc"]] = 1_000_000_000
+        rep1 = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=r1)
+        self.assertEqual(rep1["economics"]["fee_parameters"]["callback_proxy_p_base_wei"], 3_000_000_000)
+
+        # base_fee > gas_price
+        r2 = self._setup_preflight_runner(config, pos_id, tx_hash)
+        r2.gas_prices[config["unichain_rpc"]] = 1_000_000_000
+        r2.base_fees[config["unichain_rpc"]] = 4_000_000_000
+        rep2 = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=r2)
+        self.assertEqual(rep2["economics"]["fee_parameters"]["callback_proxy_p_base_wei"], 4_000_000_000)
+
+    # 98. Workstream B: _maxChargeGas below, equal, above settlement requirement + zero/missing _maxChargeGas
+    def test_98_max_charge_gas_settlement_boundaries_and_missing(self):
+        below = estimate_callback_fee_wei(300_000, 2_000_000_000, 1000, 50_000, max_charge_gas=49_999, settlement_gas_requirement=50_000)
+        eq = estimate_callback_fee_wei(300_000, 2_000_000_000, 1000, 50_000, max_charge_gas=50_000, settlement_gas_requirement=50_000)
+        above = estimate_callback_fee_wei(300_000, 2_000_000_000, 1000, 50_000, max_charge_gas=50_001, settlement_gas_requirement=50_000)
+        self.assertFalse(below["settlement_gas_sufficient"])
+        self.assertEqual(below["settlement_gas_status"], "BELOW_REQUIREMENT")
+        self.assertTrue(eq["settlement_gas_sufficient"])
+        self.assertEqual(eq["settlement_gas_status"], "AT_REQUIREMENT")
+        self.assertTrue(above["settlement_gas_sufficient"])
+        self.assertEqual(above["settlement_gas_status"], "ABOVE_REQUIREMENT")
+
+        with self.assertRaises(ValueError):
+            estimate_callback_fee_wei(300_000, 2_000_000_000, 1000, 50_000, max_charge_gas=None)
+
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        proxy = config["callback_proxy"].lower()
+
+        # Zero _maxChargeGas on Callback Proxy -> RETRY_BLOCKED
+        r_zero = self._setup_preflight_runner(config, pos_id, tx_hash)
+        r_zero.call_map[(proxy, "_maxChargeGas()", config["unichain_rpc"])] = "0"
+        rep_zero = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=r_zero)
+        self.assertEqual(rep_zero["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("_maxChargeGas", rep_zero["reason"])
+
+        # Below configured settlement_gas_requirement -> RETRY_BLOCKED; equal -> RETRY_ELIGIBLE
+        r_req = self._setup_preflight_runner(config, pos_id, tx_hash)
+        r_req.call_map[(proxy, "_maxChargeGas()", config["unichain_rpc"])] = "50000"
+        rep_b = run_recovery_preflight(dict(config, settlement_gas_requirement=60_000), pos_id, 1, tx_hash, runner=r_req)
+        self.assertEqual(rep_b["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        rep_e = run_recovery_preflight(dict(config, settlement_gas_requirement=50_000), pos_id, 1, tx_hash, runner=r_req)
+        self.assertEqual(rep_e["status"], RecoveryStatus.RETRY_ELIGIBLE.value)
+
+    # 99. Workstream B: Zero/missing coefficient, invalid extraGas, arithmetic overflow & invalid types
+    def test_99_fee_invalid_inputs_and_uint256_overflow(self):
+        # Zero coeff
+        with self.assertRaises(ValueError):
+            estimate_callback_fee_wei(300_000, 1_000_000_000, 0, 50_000, 50_000)
+        # Negative extraGas / invalid types / bool
+        with self.assertRaises(ValueError):
+            estimate_callback_fee_wei(300_000, 1_000_000_000, 1000, -1, 50_000)
+        with self.assertRaises(ValueError):
+            estimate_callback_fee_wei(True, 1_000_000_000, 1000, 50_000, 50_000)
+        # Arithmetic overflow > uint256
+        with self.assertRaises(ValueError):
+            estimate_callback_fee_wei(2**255, 2**200, 1000, 50_000, 50_000)
+
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        proxy = config["callback_proxy"].lower()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.call_map[(proxy, "_gasPriceCoeffPer1000()", config["unichain_rpc"])] = "0"
+        rep = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+
+    # 100. Workstream B: Configured gas limit vs unverified effective forwarded gas disclosure
+    def test_100_configured_gas_vs_effective_forwarded_gas(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        rep = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertIsNone(rep["reactive_state"]["effective_forwarded_gas_exact"])
+        self.assertIn("strictly less than configured", rep["economics"]["reserve_estimates"]["callback_proxy_estimate"]["assumptions"][4])
+        self.assertTrue(any("NOT exact forwarded destination gas" in u for u in rep["unsafe_or_unverified_conditions"]))
+        term = format_recovery_preflight_terminal(rep)
+        self.assertIn("CALLBACK ADDRESS DRIFT CHECK:", term)
+        self.assertIn("WARNINGS & UNSAFE / UNVERIFIED CONDITIONS:", term)
+
+    # =========================================================================
+    # M006.2 ADVERSARIAL TESTS — WORKSTREAM C (CALLBACKREQUEST ABI VALIDATION)
+    # =========================================================================
+
+    # 101. Workstream C: Valid modern event mixed with unrelated logs succeeds
+    def test_101_callback_request_mixed_unrelated_logs(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        # Insert unrelated Transfer-like event logs before & after
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"].insert(0, {
+            "address": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "topics": ["0x" + "12" * 32],
+            "data": "0x1234",
+        })
+        rep = run_recovery_preflight(config, position_id=pos_id, expected_nonce=1, reactive_tx_hash=tx_hash, runner=runner)
+        self.assertEqual(rep["status"], RecoveryStatus.RETRY_ELIGIBLE.value)
+        self.assertEqual(rep["receipt_evidence"]["callback_request_decoded"]["version"], 0)
+        self.assertEqual(rep["receipt_evidence"]["callback_request_decoded"]["gas_limit"], 300_000)
+
+    # 102. Workstream C: Unsupported version, invalid config bytes, missing data & legacy CallbackRequestedV1 rejected
+    def test_102_callback_request_version_config_missing_data_and_legacy_v1(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        cb_adapter = config["callback_address"].lower()
+        sys_contract = config["system_contract"].lower()
+        reactive = config["reactive_address"].lower()
+
+        # Unsupported version = 1
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = encode_callback_request_data(
+            1301, cb_adapter, 300_000, "0x11223344", version=1
+        )
+        rep_ver = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep_ver["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertIn("Unsupported CallbackVersion", rep_ver["reason"])
+
+        # Missing event data "0x"
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = "0x"
+        rep_empty = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep_empty["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+
+        # Invalid/corrupted configuration bytes
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = "0x" + "00" * 96
+        rep_cfg = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep_cfg["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+
+        # Configuration payload mismatch vs latestCallback stored payload
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = encode_callback_request_data(
+            1301, cb_adapter, 300_000, "0xdeadbeef"
+        )
+        rep_pay = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep_pay["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertIn("payload", rep_pay["reason"].lower())
+
+        # Sub-100k gasLimit inside CallbackConfiguration -> RETRY_BLOCKED
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = encode_callback_request_data(
+            1301, cb_adapter, 99_999, "0x11223344"
+        )
+        rep_gas = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep_gas["status"], RecoveryStatus.RETRY_BLOCKED.value)
+
+        # Legacy CallbackRequestedV1 signature rejected fail-closed
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1] = {
+            "address": sys_contract,
+            "topics": [UNSUPPORTED_LEGACY_CALLBACK_REQUESTED_V1_TOPIC, "0x" + "0" * 60 + "0515", "0x" + "0" * 24 + cb_adapter[2:]],
+            "data": "0x" + "00" * 64,
+        }
+        rep_leg = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep_leg["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertIn("CallbackRequestedV1", rep_leg["reason"])
+
+        # Unrecognized event signature in System Contract (only random topic) -> RETRY_UNKNOWN
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["topics"][0] = "0x" + "ab" * 32
+        rep_unrec = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep_unrec["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+
+        # Wrong sender in CallbackRequest -> RETRY_UNKNOWN
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["topics"][2] = "0x" + "0" * 24 + "99" * 20
+        rep_snd = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep_snd["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+
+        # Suppress unused variable lint
+        self.assertTrue(len(reactive) == 42)
+
+    # =========================================================================
+    # M006.2 ADVERSARIAL TESTS — WORKSTREAM D (CALLBACK RECORDS CORRELATION)
+    # =========================================================================
+
+    # 103. Workstream D: Strict formatted record validation & correlation diagnostics
+    def test_103_callback_records_strict_validation_and_correlation_metadata(self):
+        # Truncated reactiveContract address in tuple must return error (no silent zfill!)
+        recs, err = decode_callback_records("[(100, 0x1234, 1, 1301, 8888, 0x08c379a0)]")
+        self.assertIsNone(recs)
+        self.assertIsNotNone(err)
+
+        # Negative field or trailing garbage tokens must return error
+        recs2, err2 = decode_callback_records("[(100, 0x2222222222222222222222222222222222222222, -1, 1301, 8888, 0x)]")
+        self.assertIsNone(recs2)
+        self.assertIsNotNone(err2)
+        recs3, err3 = decode_callback_records("[(100, 0x2222222222222222222222222222222222222222, 1, 1301, 8888, 0x)] junk")
+        self.assertIsNone(recs3)
+        self.assertIsNotNone(err3)
+
+        # Verify correlation metadata in preflight output
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        rep = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        corr = rep["callback_record_correlation"]
+        self.assertTrue(corr["unambiguous_match"])
+        self.assertEqual(corr["matched_records"], 1)
+        self.assertEqual(rep["callback_record"]["callback_index"], 1)
+        self.assertEqual(rep["callback_record"]["block_number"], 100)
+
+    # 104. Workstream C & D: Strict CallbackRequest ABI roundtrip & non-exact topics rejection
+    def test_104_callback_request_roundtrip_and_topic_count_check(self):
+        encoded = encode_callback_request_data(1301, "0x3333333333333333333333333333333333333333", 300_000, "0x11223344")
+        decoded = decode_callback_request_data_strict(encoded)
+        self.assertEqual(decoded["version"], 0)
+        self.assertEqual(decoded["chain_id"], 1301)
+        self.assertEqual(decoded["recipient"], "0x3333333333333333333333333333333333333333")
+        self.assertEqual(decoded["gas_limit"], 300_000)
+        self.assertEqual(decoded["payload"], "0x11223344")
+
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["topics"].pop()
+        rep = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertIn("exactly 4 topics", rep["reason"])
 
 
 if __name__ == "__main__":

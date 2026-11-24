@@ -1,7 +1,7 @@
-# M006 & M006.1 — Controlled Callback Recovery & Cross-Chain Threat Model
+# M006, M006.1 & M006.2 — Controlled Callback Recovery & Cross-Chain Threat Model
 
-**Document Version:** 1.1.0  
-**Milestones:** M006 (Controlled Callback Recovery) & M006.1 (Recovery Preflight Integrity, Durable Event Dispatch & Failure Reconciliation)  
+**Document Version:** 1.2.0  
+**Milestones:** M006 (Controlled Callback Recovery), M006.1 (Preflight Integrity & Durable Dispatch), & M006.2 (Configuration Drift & Fee-Model Reconciliation)  
 **Repository:** `mahitss/Cross-Chain-Risk-Response-`  
 **Working Branch:** `fix/m002-2-omni-callback-correctness`  
 **Topology:**  
@@ -14,9 +14,9 @@
 
 ## 1. Executive Summary
 
-Missions M006 and M006.1 establish protocol-level resilience against asynchronous cross-chain message failures, network partitioning, unconfigured-destination race windows, event replay, out-of-order deliveries, and false-positive recovery diagnostics. In cross-chain risk systems, failure to deliver an automated risk pause leaves borrowing markets vulnerable to insolvent collateral drain. Conversely, unrestricted or malformed recovery mechanisms introduce replay attack vectors or premature retry consumption.
+Missions M006, M006.1, and M006.2 establish protocol-level resilience against asynchronous cross-chain message failures, network partitioning, unconfigured-destination race windows, event replay, out-of-order deliveries, destination callback configuration drift, and diagnostic fee/ABI ambiguity.
 
-This threat model analyzes 29 adversarial and operational failure vectors across CrossGuard's M006 and M006.1 architecture:
+This threat model analyzes 34 adversarial and operational failure vectors across CrossGuard's recovery architecture:
 1. **Origin Event Idempotency:** Transition-only event emission in `RiskController.sol`.
 2. **Reactive Monotonic Nonce Ordering & Durable Pending Dispatch:** Per-position ordering gates, `DispatchStatus.PENDING_DISPATCH` / `REQUESTED` lifecycle, and `dispatchPendingCallback()` in `CrossGuardReactive.sol`.
 3. **Controlled Same-Nonce Retry:** Bounded (max 3), owner-gated recovery using exact stored payloads (`retryFailedCallback()`, restricted strictly to `REQUESTED` callbacks).
@@ -365,6 +365,56 @@ This threat model analyzes 29 adversarial and operational failure vectors across
 
 ---
 
+### Threat Vector 30: Destination Callback Configuration Drift Between Initial Dispatch and Retry (P1)
+- **Threat Description:** A callback initially failed against `callbackA`. Between initial dispatch and recovery preflight, the owner updated `CrossGuardReactive.destinationCallback` to `callbackB`. Because `retryFailedCallback()` dispatches to the **current** `destinationCallback`, historical `CallbackRequest` evidence pointing to `callbackA` would falsely approve a retry targeting `callbackB` unless all three addresses are validated together.
+- **Attacker / Failure Mode:** Asynchronous contract migration or owner misconfiguration between failure and recovery.
+- **Expected Behavior:** `RETRY_ELIGIBLE` requires exact 20-byte EVM equality `expected_callback == historical_callback_request_recipient == current_destination_callback`. `DISPATCH_REQUIRED` requires `expected_callback == current_destination_callback`. Any mismatch fails closed as `RETRY_BLOCKED` (or `RETRY_UNKNOWN` on historical mismatch/malformed address) with explicit `configuration_comparison` and never auto-adopts a drifted address.
+- **Protocol Mitigation:** 3-way recipient validation in `run_recovery_preflight()`, strict `validate_evm_address()` rejecting truncated/zero-padded strings, and explicit `config_comparison` diagnostics.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_91` through `test_96`, `test/unit/M006Recovery.t.sol::test17_OnChainConfigDriftTargetsNewCallbackOnRetry`.
+- **Residual Risk & Remaining Limitations:** Operators must execute an explicitly reviewed configuration migration when rotating `CrossGuardCallback`.
+
+---
+
+### Threat Vector 31: `_maxChargeGas` Conflated With Execution Fee Formula or Gas Cap (P2)
+- **Threat Description:** Modeling `_maxChargeGas` as a ceiling on `gas_limit + _extraGas` or adding it into the fee equation produces spurious `exceeds_max_charge_gas` errors (since Callback Proxy settlement allowance `_maxChargeGas`, e.g., `50_000`, is smaller than `callbackGasLimit + _extraGas`), misleading operators about fee adequacy and payment-settlement risk.
+- **Attacker / Failure Mode:** Economic model error in diagnostic tooling.
+- **Expected Behavior:** Fee follows `fee = p_base * (C / 1000) * (g_used + K)` with `_maxChargeGas` excluded from fee math and evaluated strictly against payment-settlement gas requirements (`_maxChargeGas == 0` or `< settlement_gas_requirement` blocks recovery). Configured `callbackGasLimit` is never claimed as exact forwarded destination gas.
+- **Protocol Mitigation:** `estimate_callback_fee_wei()` removes `exceeds_max_charge_gas`, separates `_maxChargeGas` settlement validation, distinguishes System Contract vs Callback Proxy payment paths, and rejects uint256 overflows / invalid numeric values fail-closed.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_52`, `test_80`, `test_81`, `test_97` through `test_100`.
+- **Residual Risk & Remaining Limitations:** Exact effective forwarded gas and proxy internal settlement cost cannot be observed purely from static configured gas limit.
+
+---
+
+### Threat Vector 32: Legacy or Unverified Event Signature (`CallbackRequestedV1`) Bypassing Validation
+- **Threat Description:** Receipt parsers accepting legacy or mock-only topics (`CallbackRequestedV1`) without indexed/data ABI verification allow spoofed or malformed receipts to bypass `CallbackRequest` chain ID, sender, recipient, version, and configuration checks.
+- **Attacker / Failure Mode:** Spoofed receipt fixture or legacy ABI mismatch.
+- **Expected Behavior:** Only authoritative modern `CallbackRequest(uint256,address,address,uint8,bytes)` (`version == 0` / `V_1_0` and valid inner `CallbackConfiguration_V_1_0` matching chain `1301`, sender, recipient, gas >= `100_000`, and stored payload) is accepted. Any missing data, unsupported version, corrupt config, or `CallbackRequestedV1` event fails closed as `RETRY_UNKNOWN`.
+- **Protocol Mitigation:** Removed `CALLBACK_REQUESTED_V1_TOPIC` fallback; added strict `decode_callback_request_data_strict()` in `crossguard_healthcheck.py`.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_101`, `test_102`, `test_104`.
+- **Residual Risk & Remaining Limitations:** Assumes Reactive Omni System Contract uses `CallbackVersion.V_1_0 (0)` and `CallbackConfiguration_V_1_0`.
+
+---
+
+### Threat Vector 33: Indiscriminate Payment-Path Blocking Between Reactive `react()` and Destination `CallbackProxy`
+- **Threat Description:** Blocking manual owner `dispatchPendingCallback()` / `retryFailedCallback()` whenever Reactive System Contract (`0x8888...8888`) has debt or low reserves conflates RVM `react()` execution billing with destination Unichain `CallbackProxy` callback delivery billing, potentially stalling urgent manual risk containment when `CallbackProxy` on Unichain is properly funded.
+- **Attacker / Failure Mode:** Emergency manual pause needed while Lasna System Contract reserves ran low.
+- **Expected Behavior:** Preflight queries and validates both paths fail-closed, strictly blocks (`RETRY_BLOCKED`) on Unichain `CallbackProxy` debt or reserve shortfall, and emits explicit `REACTIVE_PATH_WARNING` advisories when Lasna `SystemContract` has debt/low reserves without falsely equating it to `CallbackProxy` failure (unless `--require-reactive-reserves` strict mode is enabled).
+- **Protocol Mitigation:** Explicit `reactive_event_processing_path` vs `destination_callback_delivery_path` breakdown in `economics` output and `warnings`.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_52`, `test_80`.
+- **Residual Risk & Remaining Limitations:** Live `SystemContract.requestCallbackV_1_0` behavior when indebted cannot be established in offline mocks.
+
+---
+
+### Threat Vector 34: Silent Address Padding / Corrupted Tuple Strings in Address & Record Decoders
+- **Threat Description:** Permissive `normalize_address()` zfill padding converts truncated strings like `"0x1234"` into `"0x000...1234"`, hiding malformed addresses across operator inputs or `getCallbacks` record decoding.
+- **Attacker / Failure Mode:** Truncated operator CLI argument or corrupted RPC tuple field.
+- **Expected Behavior:** `validate_evm_address()` and strict `decode_callback_records()` reject truncated, negative, oversized, or trailing-junk inputs fail-closed (`RETRY_UNKNOWN`).
+- **Protocol Mitigation:** Exact 20-byte (40-hex-char) validation in `validate_evm_address()` and `decode_callback_records()`.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_95`, `test_103`.
+- **Residual Risk & Remaining Limitations:** None within standard 20-byte EVM address validation.
+
+---
+
 ## 3. Summary of Invariant Verifications
 
 | Invariant ID | Security Property | Enforcing Contract / Component | Verification Test |
@@ -383,3 +433,6 @@ This threat model analyzes 29 adversarial and operational failure vectors across
 | **INV-12** | Mandatory 3-Key Preflight Correlation & Keccak-256 Receipts | `crossguard_healthcheck.py` | `test_68_missing_mandatory_inputs_return_unknown` through `test_74`, `test_84_ethereum_keccak256_event_signature_verification` |
 | **INV-13** | Fail-Closed Economic Decoding & Reserve Adequacy | `crossguard_healthcheck.py` | `test_79_economic_queries_fail_closed_never_zero`, `test_80_insufficient_or_zero_reserves_blocked`, `test_81_fee_estimator_formula_and_assumptions`, `test_85_strict_decoders`, `test_89_newer_reactive_nonce_and_zero_gas_price_fail_closed` |
 | **INV-14** | No Emitted Mutating Command (`suggested_command = None`) | `crossguard_healthcheck.py` | `test_66_preflight_report_safety_disclaimer_and_no_cast_send`, `test_75_dispatch_required_on_deferred_event`, `test_90_cli_missing_mandatory_args_exits_nonzero_with_unknown` |
+| **INV-15** | 3-Way Callback Recipient Equality & Zero-Padding Rejection | `crossguard_healthcheck.py` | `test_91` through `test_96`, `test17_OnChainConfigDriftTargetsNewCallbackOnRetry` |
+| **INV-16** | Reconciled Fee Equation & `_maxChargeGas` / Payment Path Separation | `crossguard_healthcheck.py` | `test_52`, `test_80`, `test_81`, `test_97` through `test_100` |
+| **INV-17** | Strict Modern `CallbackRequest` ABI & Record Integrity | `crossguard_healthcheck.py` | `test_101` through `test_104`, `test18_WorkstreamEUnauthorizedDispatchAndRetryGuardsRemainStrict` |
