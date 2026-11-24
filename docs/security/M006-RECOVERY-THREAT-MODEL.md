@@ -1,7 +1,7 @@
-# M006 — Controlled Callback Recovery & Cross-Chain Threat Model
+# M006 & M006.1 — Controlled Callback Recovery & Cross-Chain Threat Model
 
-**Document Version:** 1.0.0  
-**Milestone:** M006 — Controlled Callback Recovery, Event Idempotency & Cross-Chain Reconciliation  
+**Document Version:** 1.1.0  
+**Milestones:** M006 (Controlled Callback Recovery) & M006.1 (Recovery Preflight Integrity, Durable Event Dispatch & Failure Reconciliation)  
 **Repository:** `mahitss/Cross-Chain-Risk-Response-`  
 **Working Branch:** `fix/m002-2-omni-callback-correctness`  
 **Topology:**  
@@ -14,14 +14,15 @@
 
 ## 1. Executive Summary
 
-Mission M006 establishes protocol-level resilience against asynchronous cross-chain message failures, network partitioning, event replay, and out-of-order deliveries. In cross-chain risk systems, failure to deliver an automated risk pause leaves borrowing markets vulnerable to insolvent collateral drain. Conversely, unrestricted or malformed recovery mechanisms introduce replay attack vectors that could permanently freeze healthy borrowing positions or bypass legitimate state transitions.
+Missions M006 and M006.1 establish protocol-level resilience against asynchronous cross-chain message failures, network partitioning, unconfigured-destination race windows, event replay, out-of-order deliveries, and false-positive recovery diagnostics. In cross-chain risk systems, failure to deliver an automated risk pause leaves borrowing markets vulnerable to insolvent collateral drain. Conversely, unrestricted or malformed recovery mechanisms introduce replay attack vectors or premature retry consumption.
 
-This threat model analyzes the 18 critical failure modes and adversarial vectors governing CrossGuard's M006 architecture:
+This threat model analyzes 29 adversarial and operational failure vectors across CrossGuard's M006 and M006.1 architecture:
 1. **Origin Event Idempotency:** Transition-only event emission in `RiskController.sol`.
-2. **Reactive Monotonic Nonce Ordering:** Per-position ordering gates in `CrossGuardReactive.sol`.
-3. **Controlled Same-Nonce Retry:** Bounded (max 3), owner-gated recovery using exact stored payloads.
-4. **Destination Replay Protection:** Strictly monotonic nonce enforcement in `BorrowingController.sol`.
-5. **Read-Only Preflight Verification:** Comprehensive state classification via `crossguard_healthcheck.py`.
+2. **Reactive Monotonic Nonce Ordering & Durable Pending Dispatch:** Per-position ordering gates, `DispatchStatus.PENDING_DISPATCH` / `REQUESTED` lifecycle, and `dispatchPendingCallback()` in `CrossGuardReactive.sol`.
+3. **Controlled Same-Nonce Retry:** Bounded (max 3), owner-gated recovery using exact stored payloads (`retryFailedCallback()`, restricted strictly to `REQUESTED` callbacks).
+4. **Consistent Destination Minimum Gas Enforcement:** `MIN_CALLBACK_GAS_LIMIT = 100_000` enforced across constructor (including Stage-1 nonzero gas), `setDestinationConfig()`, `dispatchPendingCallback()`, and `retryFailedCallback()`.
+5. **Destination Replay Protection:** Strictly monotonic nonce enforcement in `BorrowingController.sol`.
+6. **Fail-Closed Read-Only Preflight Verification:** Mandatory 3-key correlation (`--position-id`, `--expected-nonce`, `--reactive-tx-hash`), pure-Python Ethereum Keccak-256 receipt matching, strict ABI decoding, fail-closed fee/reserve adequacy, and `suggested_command = None` in `crossguard_healthcheck.py`.
 
 ---
 
@@ -155,18 +156,22 @@ This threat model analyzes the 18 critical failure modes and adversarial vectors
 
 ---
 
-### Threat Vector 11: Retrying Callback When Destination Adapter Is Unconfigured or Misconfigured
-- **Threat Description:** An operator calls `retryFailedCallback()` before `destinationCallback` has been set or after an invalid configuration update.
-- **Attacker Capability:** Invoking retry during unconfigured or invalid destination state.
-- **Expected Behavior:** Reactive contract reverts fail-closed with `DestinationNotConfigured()`.
+### Threat Vector 11: Callback Handling or Retry When Destination Adapter Is Unconfigured or Misconfigured
+- **Threat Description:** A valid origin risk event arrives while `destinationCallback == address(0)` (e.g., Stage-1 deployment), or an operator attempts `dispatchPendingCallback()` / `retryFailedCallback()` while destination config is unset or invalid.
+- **Attacker Capability:** Event timing during deployment window or invoking recovery during invalid configuration state.
+- **Expected Behavior:** During `react()`, valid events are durably stored with `DispatchStatus.PENDING_DISPATCH` and `CallbackDispatchDeferred` is emitted (preventing silent event loss). Both `dispatchPendingCallback()` and `retryFailedCallback()` revert fail-closed with `DestinationNotConfigured()` until valid configuration is active (`destinationCallback != address(0)`, `destinationChainId == 1301`, `callbackGasLimit >= 100_000`).
 - **Protocol Mitigation:**
   ```solidity
-  if (destinationCallback == address(0) || destinationChainId != UNICHAIN_SEPOLIA_CHAIN_ID || callbackGasLimit == 0) {
+  // In dispatchPendingCallback() and retryFailedCallback():
+  if (
+      destinationCallback == address(0) || destinationChainId != UNICHAIN_SEPOLIA_CHAIN_ID
+          || callbackGasLimit < MIN_CALLBACK_GAS_LIMIT
+  ) {
       revert DestinationNotConfigured();
   }
   ```
-- **Test Evidence:** `test/unit/M006Recovery.t.sol::test13_ConfigurationCorrection`, `test/unit/CrossGuardReactive.t.sol::testRetryFailedCallbackRevertsOnInvalidConditions`.
-- **Residual Risk & Remaining Limitations:** Operator must configure destination via `setDestinationConfig` before retrying.
+- **Test Evidence:** `test/unit/M006Recovery.t.sol::test13_ConfigurationCorrection`, `test/unit/CrossGuardReactive.t.sol::testRetryFailedCallbackRevertsOnInvalidConditions`, `test/unit/CrossGuardReactive.t.sol::testDurablePendingDispatchLifecycle`.
+- **Residual Risk & Remaining Limitations:** Operator must configure destination via `setDestinationConfig` before dispatching or retrying.
 
 ---
 
@@ -230,35 +235,151 @@ This threat model analyzes the 18 critical failure modes and adversarial vectors
 
 ### Threat Vector 17: Incomplete Destination Callback Execution Due to Gas Limit Exhaustion
 - **Threat Description:** `callbackGasLimit` configured in `CrossGuardReactive` is insufficient to complete destination state updates and emit events, causing destination revert.
-- **Attacker Capability:** Misconfiguring callback gas limit below execution requirements.
-- **Expected Behavior:** Transaction reverts on destination EVM; destination nonce is not advanced; retry preflight flags low gas limit and blocks retry until configured >= 100,000 gas.
+- **Attacker Capability:** Misconfiguring callback gas limit below the minimum safe threshold (`100_000`).
+- **Expected Behavior:** Configuration updates, constructors (including Stage-1 nonzero gas limits), `dispatchPendingCallback()`, and `retryFailedCallback()` reject values below `MIN_CALLBACK_GAS_LIMIT` (`100_000`), and preflight blocks retry/dispatch below `100_000` gas.
 - **Protocol Mitigation:**
-  1. `CrossGuardReactive.setDestinationConfig` requires `_gasLimit > 0`.
+  1. `CrossGuardReactive` enforces `callbackGasLimit >= MIN_CALLBACK_GAS_LIMIT (100_000)` uniformly across constructor, `setDestinationConfig()`, `dispatchPendingCallback()`, and `retryFailedCallback()` (`InvalidGasLimit` / `DestinationNotConfigured`).
   2. Preflight tool requires `callbackGasLimit >= 100_000` (recommends 300,000).
-- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_56_preflight_blocked_gas_limit_too_low`, `test/unit/M006Recovery.t.sol::test04_SuccessfulSameNonceRecovery`.
-- **Residual Risk & Remaining Limitations:** Gas limits must be verified against destination contract bytecode complexity.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_56_preflight_blocked_gas_limit_too_low`, `test/unit/CrossGuardReactive.t.sol::testGasLimitMinimumValidation`, `test/unit/CrossGuardReactive.t.sol::testConstructorStageOneRejectsNonzeroGasBelowMinimum`, `test/unit/M006Recovery.t.sol::test04_SuccessfulSameNonceRecovery`.
+- **Residual Risk & Remaining Limitations:** Gas limits must still be sized above the `100_000` floor for destination contract complexity (300,000 recommended).
 
 ---
 
 ### Threat Vector 18: Front-Running Retry Transaction by Malicious Actor
-- **Threat Description:** An adversary sees an owner's retry transaction in the Reactive Lasna mempool and attempts to front-run or sandwich it.
+- **Threat Description:** An adversary sees an owner's retry or deferred-dispatch transaction in the Reactive Lasna mempool and attempts to front-run or sandwich it.
 - **Attacker Capability:** Mempool monitoring on Reactive Lasna.
-- **Expected Behavior:** Since `retryFailedCallback` is strictly `onlyOwner`, unauthorized third parties cannot execute the retry. If an attacker submits a duplicate owner transaction, only one succeeds; subsequent attempts increment retry counter or revert if limit is reached.
-- **Protocol Mitigation:** Strict access control (`onlyOwner`) and destination nonce watermark (`nonce > lastProcessedNonce`) prevent third-party exploitation.
-- **Test Evidence:** `test/unit/CrossGuardReactive.t.sol::testRetryFailedCallbackRevertsOnInvalidConditions`, `test/unit/M006Recovery.t.sol::test05_RetryAfterSuccessfulDeliveryRevertsOnDestination`.
-- **Residual Risk & Remaining Limitations:** Once the first retry succeeds on destination, any subsequent redundant delivery is safely rejected by `InvalidNonce`.
+- **Expected Behavior:** Since both `dispatchPendingCallback` and `retryFailedCallback` are strictly `onlyOwner`, unauthorized third parties cannot execute either. Duplicate owner submissions revert (`DispatchNotPending` on second dispatch; destination `InvalidNonce` once delivered).
+- **Protocol Mitigation:** Strict access control (`onlyOwner`), `DispatchStatus` state transitions, and destination nonce watermark (`nonce > lastProcessedNonce`) prevent third-party exploitation.
+- **Test Evidence:** `test/unit/CrossGuardReactive.t.sol::testRetryFailedCallbackRevertsOnInvalidConditions`, `test/unit/CrossGuardReactive.t.sol::testDurablePendingDispatchLifecycle`, `test/unit/M006Recovery.t.sol::test05_RetryAfterSuccessfulDeliveryRevertsOnDestination`.
+- **Residual Risk & Remaining Limitations:** Once delivery succeeds on destination, any subsequent redundant delivery is safely rejected by `InvalidNonce`.
+
+---
+
+### Threat Vector 19: Valid Origin Risk Event Lost Forever During Stage-1 Unconfigured Destination Window
+- **Threat Description:** Under M006, if a valid `RiskBreach` or `RiskResolved` event arrived before `ConfigureReactive.s.sol` linked `destinationCallback`, `CrossGuardReactive.react()` rejected it with `"DESTINATION_NOT_CONFIGURED"` without recording `latestOriginNonce` or `latestCallback`. Because `RiskController` suppresses duplicate emissions, that transition was permanently lost for retry.
+- **Attacker / Failure Mode:** Asynchronous timing gap between `DeployOrigin`/`DeployReactive` and `ConfigureReactive.s.sol`.
+- **Expected Behavior:** Valid origin events are durably stored (`DispatchStatus.PENDING_DISPATCH`, `retryCount = 0`) even when destination configuration is incomplete, emitting `CallbackDispatchDeferred`.
+- **Protocol Mitigation:** `CrossGuardReactive.react()` validates event integrity first, commits `latestOriginNonce` and `CallbackState` (`PENDING_DISPATCH`), and defers only the `systemContract.requestCallbackV_1_0(...)` call until owner configures destination and calls `dispatchPendingCallback()`.
+- **Test Evidence:** `test/unit/CrossGuardReactive.t.sol::testDurablePendingDispatchLifecycle`, `test/unit/CrossGuardReactive.t.sol::testDeployWithUnsetDestinationCallbackAndConfigureLater`, `test/integration/CrossGuardE2E.t.sol::testEndToEndDeferredDispatchAndControlledRecovery`.
+- **Residual Risk & Remaining Limitations:** Operator monitoring must alert on `CallbackDispatchDeferred` / `DISPATCH_REQUIRED` and run `dispatchPendingCallback()`.
+
+---
+
+### Threat Vector 20: Duplicate Manual Dispatch via `dispatchPendingCallback()`
+- **Threat Description:** Operator accidentally submits two `dispatchPendingCallback(positionId, expectedNonce)` transactions for the same pending event, or attempts to re-dispatch after initial dispatch succeeded or failed.
+- **Attacker Capability:** Double-submission by operator or mempool replay of owner transaction.
+- **Expected Behavior:** The first call atomically transitions `status` from `PENDING_DISPATCH` to `REQUESTED` before external call; the second call reverts fail-closed with `DispatchNotPending()`.
+- **Protocol Mitigation:** Strict Checks-Effects-Interactions transition (`if (state.status != DispatchStatus.PENDING_DISPATCH) revert DispatchNotPending(); state.status = DispatchStatus.REQUESTED;`) and revert propagation on `requestCallbackV_1_0` failure.
+- **Test Evidence:** `test/unit/CrossGuardReactive.t.sol::testDurablePendingDispatchLifecycle`, `test/unit/CrossGuardReactive.t.sol::testExternalSystemRequestFailureRevertsAtomicallyAndPreservesState`, `test/unit/M006Recovery.t.sol::invariant_PendingAndRequestedNeverConfused`.
+- **Residual Risk & Remaining Limitations:** If the first `dispatchPendingCallback` succeeds at Reactive Lasna but fails at destination, subsequent recovery must use `retryFailedCallback()`.
+
+---
+
+### Threat Vector 21: Premature Consumption of Retry Quota While Event Is Still `PENDING_DISPATCH`
+- **Threat Description:** Operator mistakenly calls `retryFailedCallback()` instead of `dispatchPendingCallback()` on a deferred event, burning the limited 3-attempt retry quota or dispatching without `CallbackDispatchSubmitted` provenance.
+- **Attacker Capability:** Operator tooling/runbook confusion between deferred dispatch and destination failure retry.
+- **Expected Behavior:** `retryFailedCallback()` reverts fail-closed with `CallbackNotRequested()` whenever `state.status != DispatchStatus.REQUESTED`; initial dispatch must use `dispatchPendingCallback()`, leaving `retryCount == 0`.
+- **Protocol Mitigation:** `DispatchStatus` enum separation in `CrossGuardReactive.sol` plus `DISPATCH_REQUIRED` status separation in `crossguard_healthcheck.py`.
+- **Test Evidence:** `test/unit/M006Recovery.t.sol::test16_DeferredPendingDispatchCannotBeRetriedUntilSubmitted`, `test/unit/M006Recovery.t.sol::invariant_PendingAndRequestedNeverConfused`, `test/ops/test_crossguard_healthcheck.py::test_75_dispatch_required_on_deferred_event`.
+- **Residual Risk & Remaining Limitations:** Strict on-chain state gating guarantees `retryFailedCallback` cannot run on `PENDING_DISPATCH` states.
+
+---
+
+### Threat Vector 22: False-Positive `RETRY_ELIGIBLE` Classification When Delivery Actually Succeeded or Is In-Flight
+- **Threat Description:** Under incomplete evidence, a preflight check misclassifies an unconfirmed callback or destination-lagging read as `RETRY_ELIGIBLE`, prompting unnecessary retries that waste quota.
+- **Attacker / Failure Mode:** Race condition with relayer delivery (`destinationTxHash == 0`) or stale read across chains.
+- **Expected Behavior:** `RETRY_ELIGIBLE` requires explicit destination failure evidence (`non-empty error` AND `nonzero destinationTxHash`) alongside `lastProcessedNonce < expectedNonce`, clear debts, adequate reserves, and verified receipt correlation. Records with `destinationTxHash == 0` and empty error stay `RETRY_PENDING`; records with `error` bytes and `destinationTxHash == 0` fail closed as `RETRY_UNKNOWN`.
+- **Protocol Mitigation:** Strict multi-condition gate in `run_recovery_preflight()` (`crossguard_healthcheck.py`) plus `CallbackRequest` correlation.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_48_preflight_contradictory_empty_error_with_dest_behind`, `test_49_preflight_pending_zero_destination_tx_hash`, `test_78_error_bytes_with_zero_destination_tx_hash`, `test_82_three_state_contradictions_return_unknown`.
+- **Residual Risk & Remaining Limitations:** If relayer confirmed delivery with a receipt after the snapshot, destination `BorrowingController` still blocks duplicate execution via `InvalidNonce`.
+
+---
+
+### Threat Vector 23: Wrong `--reactive-tx-hash` Receipt Supplied During Preflight Correlation
+- **Threat Description:** Operator pastes a Reactive transaction hash belonging to an unrelated transaction, failed tx (`status == 0`), wrong contract emitter, or missing `CallbackRequest`.
+- **Attacker / Failure Mode:** Human copy-paste error or spoofed/malformed receipt data.
+- **Expected Behavior:** Preflight fails closed as `RETRY_UNKNOWN` if receipt is missing, reverted (`status != 0x1`), malformed JSON, emitted by wrong `CrossGuardReactive` address, missing valid `CallbackRequest` log, or missing expected event topic.
+- **Protocol Mitigation:** Pure-Python Ethereum Keccak-256 event signature derivation (`keccak256_topic`, using `0x01` Keccak domain separator verified against `cast keccak`) matching `ReactiveBreachProcessed`, `ReactiveResolvedProcessed`, `CallbackDispatchDeferred`, `CallbackDispatchSubmitted`, `CallbackRetryRequested`, and Omni `CallbackRequest`.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_69_receipt_missing_or_reverted`, `test_70_malformed_receipt_json`, `test_74_receipt_callback_request_validation_failures`, `test_84_ethereum_keccak256_event_signature_verification`, `test_87_wrong_crossguard_emitter_and_multiple_callback_requests`.
+- **Residual Risk & Remaining Limitations:** Relies on authentic Reactive Lasna JSON-RPC receipt responses.
+
+---
+
+### Threat Vector 24: Wrong `--position-id` or Wrong `--expected-nonce` Supplied to Preflight
+- **Threat Description:** Operator investigates Position A using Position B's receipt hash or passes an outdated/mismatched `--expected-nonce`.
+- **Attacker / Failure Mode:** Operator confusion during multi-position incidents.
+- **Expected Behavior:** Preflight checks indexed `positionId`, `nonce`, and `eventType` inside the receipt events against CLI inputs and `latestCallback(positionId)` / origin `positionNonce(positionId)` / destination `lastProcessedNonce(positionId)`; mismatches return `RETRY_UNKNOWN` (or `RETRY_SUPERSEDED` if superseded by a newer nonce).
+- **Protocol Mitigation:** Mandatory `--position-id`, `--expected-nonce`, and `--reactive-tx-hash` CLI flags and cross-chain nonce/type consistency checks in `run_recovery_preflight()`.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_68_missing_mandatory_inputs_return_unknown`, `test_71_receipt_position_mismatch`, `test_72_receipt_nonce_mismatch`, `test_73_receipt_multiple_conflicting_events`, `test_76_deferred_receipt_superseded_and_mismatch_states`, `test_90_cli_missing_mandatory_args_exits_nonzero_with_unknown`.
+- **Residual Risk & Remaining Limitations:** None within documented 3-chain lookup semantics.
+
+---
+
+### Threat Vector 25: Ambiguous Matching Across Multiple `getCallbacks` Records
+- **Threat Description:** `getCallbacks(uint256)` returns multiple records for a block/transaction or contains records for multiple chains/contracts/indices, risking evaluating the wrong callback's `error` or `destinationTxHash`.
+- **Attacker / Failure Mode:** Multiple Reactive callbacks originating from the same reactive block or multi-callback batch.
+- **Expected Behavior:** Preflight filters strictly for `reactiveContract == reactive_address` and `destinationChainId == 1301`. If ambiguity remains (multiple non-uniform valid records that cannot be deterministically disambiguated) or if `callbackRequest` correlation cannot isolate the record, preflight fails closed with `RETRY_UNKNOWN`.
+- **Protocol Mitigation:** Unambiguous record matching logic in `run_recovery_preflight()` (`crossguard_healthcheck.py`).
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_77_callback_records_unambiguous_and_ambiguous_matching`, `test_86_callback_lookup_exception_and_malformed_abi`.
+- **Residual Risk & Remaining Limitations:** Operators must resolve ambiguous historical transactions via block-explorer forensic trace before intervening.
+
+---
+
+### Threat Vector 26: RPC Query Failure or Malformed ABI Response Treated as Zero Debt or Healthy State
+- **Threat Description:** An unstable RPC endpoint returns `"0x"`, malformed hex, timeout, or non-integer response during debt, reserve, nonce, or `getLatestCallback` inspection. If coerced silently to `0`, tooling might report `debt == 0` and approve an unsafe retry.
+- **Attacker / Failure Mode:** Degraded RPC infrastructure, rate-limiting HTML/JSON error leaked into parser, or proxy upgrade schema drift.
+- **Expected Behavior:** Strict typed decoders (`decode_uint_strict`, `decode_bool_strict`, `decode_address_strict`, `decode_bytes_strict`, `decode_get_latest_callback_strict`) raise exceptions on empty/non-canonical/oversized inputs, immediately classifying preflight as `RETRY_UNKNOWN`.
+- **Protocol Mitigation:** Fail-closed parsing across all origin, reactive, destination, economic, and fee queries (`_safe_int` / heuristic zero fallback completely eliminated from preflight economic & state paths).
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_79_economic_queries_fail_closed_never_zero`, `test_85_strict_decoders`.
+- **Residual Risk & Remaining Limitations:** Temporary RPC downtime blocks preflight automation (intended fail-closed behavior).
+
+---
+
+### Threat Vector 27: Callback Reserve Exhaustion Falsely Masked by `reserves > debt` Check
+- **Threat Description:** A Callback Proxy account holds `debt == 0` and `1 wei` in `reserves` — enough to pass a naive `reserves >= debt` check, yet completely insufficient to cover an actual destination callback gas fee, causing an immediate post-retry out-of-funds hold.
+- **Attacker / Failure Mode:** Near-depleted proxy ETH reserve on Unichain Sepolia during elevated base fees.
+- **Expected Behavior:** Preflight queries Callback Proxy parameters (`_gasPriceCoeffPer1000()`, `_extraGas()`, `_maxChargeGas()`) and Unichain fee telemetry (`gas-price`, `base-fee`), computes `estimated_callback_fee_wei`, enforces `net_reserves >= estimated_callback_fee_wei * safety_multiplier` (default integer `2`), and classifies shortfalls as `RETRY_BLOCKED` (or missing/zero fee telemetry as `RETRY_UNKNOWN`).
+- **Protocol Mitigation:** Fail-closed `estimate_callback_fee_wei()` and reserve adequacy validation in `crossguard_healthcheck.py`.
+- **Test Evidence:** `test/ops/test_crossguard_healthcheck.py::test_80_insufficient_or_zero_reserves_blocked`, `test_81_fee_estimator_formula_and_assumptions`, `test_89_newer_reactive_nonce_and_zero_gas_price_fail_closed`.
+- **Residual Risk & Remaining Limitations:** Assumes fee multiplier (`--safety-multiplier 2`) covers normal base-fee volatility between preflight and execution.
+
+---
+
+### Threat Vector 28: Nonzero Sub-100k Gas Limit Accepted During Stage-1 Deployment
+- **Threat Description:** During two-stage deployment (`destinationCallback == address(0)`), a constructor invocation passes `_gasLimit = 50_000` (below `MIN_CALLBACK_GAS_LIMIT = 100_000`), leaving inconsistent validation between Stage-1 constructor and `setDestinationConfig()`.
+- **Attacker / Failure Mode:** Deployment script misconfiguration.
+- **Expected Behavior:** Constructor explicitly rejects any nonzero `_gasLimit < 100_000` even when `_destCallback == address(0)` (`if (_gasLimit != 0 && _gasLimit < MIN_CALLBACK_GAS_LIMIT) revert InvalidGasLimit(_gasLimit);`).
+- **Protocol Mitigation:** Unified `MIN_CALLBACK_GAS_LIMIT = 100_000` invariant across all entrypoints in `CrossGuardReactive.sol`.
+- **Test Evidence:** `test/unit/CrossGuardReactive.t.sol::testConstructorStageOneRejectsNonzeroGasBelowMinimum`, `test/unit/CrossGuardReactive.t.sol::testGasLimitMinimumValidation`.
+- **Residual Risk & Remaining Limitations:** Stage-1 deploys with `_gasLimit == 0` remain permitted specifically because `callbackGasLimit` is stored as `0` until `setDestinationConfig` sets a value `>= 100_000`.
+
+---
+
+### Threat Vector 29: Dispatch of Superseded `PENDING_DISPATCH` Event After Newer Origin Transition
+- **Threat Description:** Position transitions `Breach (nonce 1, PENDING_DISPATCH)` and before owner calls `dispatchPendingCallback(pos, 1)`, position transitions to `Resolved (nonce 2)` which supersedes nonce 1. Operator subsequently submits `dispatchPendingCallback(pos, 1)`.
+- **Attacker / Failure Mode:** Asynchronous race between origin state recovery and delayed operator action.
+- **Expected Behavior:** When nonce 2 arrives while nonce 1 is `PENDING_DISPATCH`, `react()` emits `PendingCallbackSuperseded(pos, 1, 2)` and overwrites `latestCallback[pos]` with nonce 2. Subsequent `dispatchPendingCallback(pos, 1)` reverts fail-closed with `NonceMismatch(1, 2)`.
+- **Protocol Mitigation:** `PendingCallbackSuperseded` audit event plus strict `state.nonce == expectedNonce` guard in `dispatchPendingCallback()` and `retryFailedCallback()`.
+- **Test Evidence:** `test/unit/CrossGuardReactive.t.sol::testPendingDispatchSupersededByNewerOriginEvent`, `test/ops/test_crossguard_healthcheck.py::test_89_newer_reactive_nonce_and_zero_gas_price_fail_closed`.
+- **Residual Risk & Remaining Limitations:** Operator must monitor for `PendingCallbackSuperseded` and re-run preflight with the latest nonce (`2`).
 
 ---
 
 ## 3. Summary of Invariant Verifications
 
-| Invariant ID | Security Property | Enforcing Contract | Verification Test |
+| Invariant ID | Security Property | Enforcing Contract / Component | Verification Test |
 |---|---|---|---|
 | **INV-01** | Transition-Only Risk Breach Emission | `RiskController.sol` | `testRepeatedBreachAssessmentsDoNotIncrementNonceOrEmitEvents` |
-| **INV-02** | Monotonic Origin Nonce Gating | `CrossGuardReactive.sol` | `testReactRejectsDuplicateNonce`, `testReactRejectsLowerNonce` |
-| **INV-03** | Exact Stored Payload Retry Integrity | `CrossGuardReactive.sol` | `testRetryFailedCallbackFullLifecycle` |
-| **INV-04** | Bounded Retry Budget ($\le 3$) | `CrossGuardReactive.sol` | `test08_RetryLimitEnforcement` |
-| **INV-05** | Destination Nonce Monotonicity | `BorrowingController.sol` | `testRevertWhenDuplicateNonce`, `test05_RetryAfterSuccessfulDeliveryRevertsOnDestination` |
-| **INV-06** | Multi-Position Isolation | All Contracts | `test11_MultiPositionIsolation` |
+| **INV-02** | Monotonic Origin Nonce Gating | `CrossGuardReactive.sol` | `testReactRejectsDuplicateNonce`, `testReactRejectsLowerNonce`, `invariant_AcceptedNoncesNeverDecrease` |
+| **INV-03** | Exact Stored Payload Retry Integrity | `CrossGuardReactive.sol` | `testRetryFailedCallbackFullLifecycle`, `invariant_NoDuplicateOrStaleDestinationApplication` |
+| **INV-04** | Bounded Retry Budget ($\le 3$) | `CrossGuardReactive.sol` | `test08_RetryLimitEnforcement`, `invariant_RetryCountNeverExceedsThree` |
+| **INV-05** | Destination Nonce Monotonicity | `BorrowingController.sol` | `testRevertWhenDuplicateNonce`, `test05_RetryAfterSuccessfulDeliveryRevertsOnDestination`, `invariant_DestinationProcessedNoncesNeverDecrease` |
+| **INV-06** | Multi-Position Isolation | All Contracts | `test11_MultiPositionIsolation`, `invariant_PositionIsolationPreserved` |
 | **INV-07** | Administrative Pause Invariance | `BorrowingController.sol` | `test12_AdministrativePauseProtection` |
-| **INV-08** | Read-Only Recovery Preflight Safety | `crossguard_healthcheck.py` | `test_46_preflight_eligible_destination_failure` through `test_67` |
+| **INV-08** | Read-Only Recovery Preflight Safety | `crossguard_healthcheck.py` | `test_46_preflight_eligible_destination_failure` through `test_67_recovery_exit_code_behavior` |
+| **INV-09** | Durable `PENDING_DISPATCH` & `REQUESTED` Separation | `CrossGuardReactive.sol` | `test16_DeferredPendingDispatchCannotBeRetriedUntilSubmitted`, `invariant_PendingAndRequestedNeverConfused` |
+| **INV-10** | Atomic Revert Preservation on External Call Failure | `CrossGuardReactive.sol` | `testExternalSystemRequestFailureRevertsAtomicallyAndPreservesState` |
+| **INV-11** | Uniform Minimum Callback Gas Limit ($100,000$) | `CrossGuardReactive.sol` | `testGasLimitMinimumValidation`, `testConstructorStageOneRejectsNonzeroGasBelowMinimum` |
+| **INV-12** | Mandatory 3-Key Preflight Correlation & Keccak-256 Receipts | `crossguard_healthcheck.py` | `test_68_missing_mandatory_inputs_return_unknown` through `test_74`, `test_84_ethereum_keccak256_event_signature_verification` |
+| **INV-13** | Fail-Closed Economic Decoding & Reserve Adequacy | `crossguard_healthcheck.py` | `test_79_economic_queries_fail_closed_never_zero`, `test_80_insufficient_or_zero_reserves_blocked`, `test_81_fee_estimator_formula_and_assumptions`, `test_85_strict_decoders`, `test_89_newer_reactive_nonce_and_zero_gas_price_fail_closed` |
+| **INV-14** | No Emitted Mutating Command (`suggested_command = None`) | `crossguard_healthcheck.py` | `test_66_preflight_report_safety_disclaimer_and_no_cast_send`, `test_75_dispatch_required_on_deferred_event`, `test_90_cli_missing_mandatory_args_exits_nonzero_with_unknown` |

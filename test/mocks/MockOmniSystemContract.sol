@@ -74,7 +74,7 @@ contract MockOmniSystemContract is ISystemContract {
         emit CallbackRequestedV1(cfg.chainId, cfg.recipient, cfg.gasLimit, cfg.payload);
     }
 
-    function requestCallbackV_1_0(CallbackConfiguration_V_1_0 memory config_) external override {
+    function requestCallbackV_1_0(CallbackConfiguration_V_1_0 memory config_) external virtual override {
         requestedCallbacks.push(config_);
         emit CallbackRequestedV1(config_.chainId, config_.recipient, config_.gasLimit, config_.payload);
     }

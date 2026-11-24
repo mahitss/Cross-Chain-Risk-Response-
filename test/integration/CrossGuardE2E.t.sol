@@ -464,4 +464,97 @@ contract CrossGuardE2ETest is Test {
         assertFalse(borrowingController.isBorrowingPaused(positionId));
         assertEq(borrowingController.lastProcessedNonce(positionId), 2);
     }
+
+    /// @notice M006.1 End-to-End Test: Valid breach accepted while destination unconfigured -> durable pending
+    ///         storage -> configuration corrected -> dispatchPendingCallback() -> destination failure ->
+    ///         retryFailedCallback() -> destination paused -> later collateral replenishment & resolution.
+    function testEndToEndDeferredDispatchAndControlledRecovery() public {
+        // Deploy a fresh Reactive contract in Stage 1 (unconfigured destination)
+        vm.startPrank(owner);
+        MockOmniSystemContract freshSys = new MockOmniSystemContract();
+        address predictedReactive = vm.computeCreateAddress(owner, vm.getNonce(owner));
+        CrossGuardReactive unconfReactive = new CrossGuardReactive(
+            owner, address(freshSys), ORIGIN_CHAIN_ID, address(riskController), 0, address(0), 0
+        );
+        assertEq(address(unconfReactive), predictedReactive);
+
+        // Fresh destination adapter pointing to the unconfigured reactive instance
+        CrossGuardCallback deferredCb = new CrossGuardCallback(
+            owner, address(callbackProxy), address(borrowingController), address(unconfReactive)
+        );
+        borrowingController.setCallbackAdapter(address(deferredCb));
+        vm.stopPrank();
+
+        // 1. Alice borrows additional $2,000 while healthy (total $4,000 debt on $6,000 collateral -> 66.66% LTV)
+        // Then collateral drops to $2,300 -> $4,600 collateral, $4,000 debt -> 86.95% LTV >= 80% threshold
+        vm.prank(alice);
+        vault.recordBorrow(positionId, mockUsdc, 2000e18);
+
+        vm.prank(owner);
+        oracle.setAssetPrice(mockWeth, 2300e8);
+
+        vm.recordLogs();
+        vault.evaluatePositionRisk(positionId);
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 breachTopic = unconfReactive.RISK_BREACH_TOPIC_0();
+        Vm.Log memory breachLog;
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].emitter == address(riskController) && entries[i].topics[0] == breachTopic) {
+                breachLog = entries[i];
+                break;
+            }
+        }
+
+        // 2. Reactive intercepts log BEFORE destination is configured -> deferred durably as PENDING_DISPATCH
+        vm.prank(address(freshSys));
+        unconfReactive.react(
+            IReactive.LogRecord({
+                chain_id: ORIGIN_CHAIN_ID,
+                _contract: address(riskController),
+                topic_0: uint256(breachLog.topics[0]),
+                topic_1: uint256(breachLog.topics[1]),
+                topic_2: uint256(breachLog.topics[2]),
+                topic_3: uint256(breachLog.topics[3]),
+                data: breachLog.data,
+                block_number: block.number,
+                op_code: 0,
+                block_hash: 0,
+                tx_hash: 0,
+                log_index: 0
+            })
+        );
+        assertEq(freshSys.requestedCallbackCount(), 0, "Deferred breach must not request callback yet");
+        assertEq(unconfReactive.latestOriginNonce(positionId), 1, "Accepted nonce must advance");
+        (,,,, CrossGuardReactive.DispatchStatus stPending) = unconfReactive.getLatestCallback(positionId);
+        assertEq(uint8(stPending), uint8(CrossGuardReactive.DispatchStatus.PENDING_DISPATCH));
+
+        // 3. Owner corrects configuration and manually dispatches pending event (without burning retryCount)
+        vm.startPrank(owner);
+        unconfReactive.setDestinationConfig(DEST_CHAIN_ID, address(deferredCb), CALLBACK_GAS_LIMIT);
+        unconfReactive.dispatchPendingCallback(positionId, 1);
+        vm.stopPrank();
+
+        assertEq(freshSys.requestedCallbackCount(), 1);
+        (,,, uint8 retriesAfterDispatch, CrossGuardReactive.DispatchStatus stRequested) =
+            unconfReactive.getLatestCallback(positionId);
+        assertEq(retriesAfterDispatch, 0);
+        assertEq(uint8(stRequested), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
+
+        // 4. First dispatched callback fails on Unichain (out of gas), then owner retries with same nonce
+        ISystemContract.CallbackConfiguration_V_1_0 memory cb1 = freshSys.getLastRequestedCallback();
+        (bool failExec,) = callbackProxy.executeCallback(cb1.recipient, cb1.payload, 1000, address(unconfReactive));
+        assertFalse(failExec);
+        assertEq(borrowingController.lastProcessedNonce(positionId), 0);
+
+        vm.prank(owner);
+        unconfReactive.retryFailedCallback(positionId, 1, bytes32("RECOVERY_GAS_EXHAUSTION"));
+        assertEq(freshSys.requestedCallbackCount(), 2);
+
+        ISystemContract.CallbackConfiguration_V_1_0 memory retryCb = freshSys.getLastRequestedCallback();
+        (bool okExec,) =
+            callbackProxy.executeCallback(retryCb.recipient, retryCb.payload, retryCb.gasLimit, address(unconfReactive));
+        assertTrue(okExec);
+        assertTrue(borrowingController.isBorrowingPaused(positionId));
+        assertEq(borrowingController.lastProcessedNonce(positionId), 1);
+    }
 }

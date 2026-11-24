@@ -193,16 +193,15 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 
 - **Destination Deployment Limitation:** In `DeployDestination.s.sol`, the script rejects zero address (`address(0)`) and the deployer's own EOA address for `REACTIVE_CROSSGUARD`. However, because `REACTIVE_CROSSGUARD` lives on Reactive Lasna (`5318007`) while the script executes on Unichain Sepolia (`1301`), the Unichain node cannot inspect bytecode on the foreign chain (`extcodesize` on Unichain for a Lasna address is 0). Verification across chains depends on strict deployment sequencing and operational address verification.
 
-### 10. Controlled Callback Recovery, Event Idempotency & Monotonic Nonce Gating (M006)
-- **Origin Event Idempotency:** `RiskController.assessRisk()` enforces transition-only event emission. When an evaluated position remains in the breached state across multiple evaluations, `isPositionBreached` remains true, `positionNonce` does not advance, and redundant `RiskBreach` events are suppressed. Events are emitted strictly on state transitions (`Healthy -> Breached` and `Breached -> Healthy`).
-- **Reactive Monotonic Nonce Ordering:** `CrossGuardReactive.react()` tracks `latestOriginNonce[positionId]`. Any duplicate or stale origin event arriving with `nonce <= latestOriginNonce[positionId]` is safely dropped with audit event `StaleOriginEventIgnored(positionId, nonce, latestNonce)`, eliminating redundant callback requests and downstream mempool flooding.
-- **Controlled Same-Nonce Recovery:** If a destination callback reverts or fails to deliver (e.g., temporary gas exhaustion, network partitioning, or unconfirmed relayer execution), the authorized contract owner can trigger `retryFailedCallback(positionId, expectedNonce, reasonCode)` on Reactive Lasna:
-  - Re-dispatches the exact origin payload and nonce stored during the initial valid event interception.
-  - Re-uses the same nonce so destination `BorrowingController.pauseBorrowing()` (`require(nonce > lastProcessedNonce)`) accepts it once the root cause is resolved (since destination EVM rollback leaves `lastProcessedNonce` unchanged).
-  - Strictly rate-limited to 3 retries (`MAX_RETRIES = 3`). A 4th attempt reverts fail-closed with `RetryLimitExceeded`.
-  - New origin events automatically reset the retry budget to 0.
-- **Destination Monotonic Gating:** `BorrowingController` enforces `require(nonce > lastProcessedNonce[positionId])`. Succeeded callbacks advance `lastProcessedNonce` and permanently reject retries with `InvalidNonce`, while failed callbacks leave the destination nonce unchanged and ready for same-nonce recovery.
-- **Read-Only Preflight Verification:** `crossguard_healthcheck.py --recovery-preflight --position-id <ID>` inspects origin, reactive, and destination states along with debts and callback records to deterministically classify positions into `RETRY_ELIGIBLE`, `RETRY_BLOCKED`, `RETRY_PENDING`, `RETRY_ALREADY_SUCCEEDED`, `RETRY_SUPERSEDED`, or `RETRY_UNKNOWN` without mutating state or broadcasting transactions.
+### 10. Controlled Callback Recovery, Durable Event Dispatch & Cross-Chain Reconciliation (M006 & M006.1)
+- **Origin Event Idempotency:** `RiskController.assessRisk()` enforces transition-only event emission. When an evaluated position remains breached across multiple evaluations, `isPositionBreached` remains true, `positionNonce` does not advance, and redundant `RiskBreach` events are suppressed. Events emit strictly on state transitions (`Healthy -> Breached` and `Breached -> Healthy`).
+- **Reactive Monotonic Nonce Ordering & Durable Pending Dispatch (M006.1):** `CrossGuardReactive.react()` enforces monotonic per-position nonces (`latestOriginNonce[positionId]`), dropping duplicate or out-of-order events via `StaleOriginEventIgnored`. When a valid origin event arrives while destination configuration is incomplete (`destinationCallback == address(0)` or `callbackGasLimit < MIN_CALLBACK_GAS_LIMIT`), `CrossGuardReactive` durably stores the payload with `DispatchStatus.PENDING_DISPATCH`, emits `CallbackDispatchDeferred`, and emits `PendingCallbackSuperseded` if superseded by a newer transition.
+  - Once configured (`destinationCallback != address(0)`, `destinationChainId == 1301`, `callbackGasLimit >= 100_000`), the authorized owner dispatches the stored event via `dispatchPendingCallback(positionId, expectedNonce)` with `retryCount == 0` preserved and emits `CallbackDispatchSubmitted`.
+- **Uniform Callback Gas Minimum (`MIN_CALLBACK_GAS_LIMIT = 100_000`):** Enforced across constructor (including Stage-1 nonzero gas limits), `setDestinationConfig()`, `dispatchPendingCallback()`, and `retryFailedCallback()`.
+- **Controlled Same-Nonce Retry:** If a `DispatchStatus.REQUESTED` destination callback fails (e.g., transient revert, gas exhaustion, or proxy funding issue), the authorized owner calls `retryFailedCallback(positionId, expectedNonce, reasonCode)` on Reactive Lasna:
+  - Strictly requires `status == DispatchStatus.REQUESTED` (reverts with `CallbackNotRequested` if still `PENDING_DISPATCH`), validates non-zero `reasonCode`, reuses exact stored payload and origin nonce, and is strictly bounded to 3 retries (`MAX_RETRIES = 3`). New origin transitions reset `retryCount` to 0.
+- **Destination Monotonic Gating:** `BorrowingController` enforces `require(nonce > lastProcessedNonce[positionId])`. Delivered callbacks advance `lastProcessedNonce` and reject duplicates via `InvalidNonce`, while failed deliveries leave destination state unmutated for safe same-nonce recovery.
+- **Fail-Closed Read-Only Preflight Verification:** `crossguard_healthcheck.py --recovery-preflight` requires all three correlation keys (`--position-id`, `--expected-nonce`, `--reactive-tx-hash`), verifies transaction receipts and Omni `CallbackRequest` correlation using pure-Python Ethereum Keccak-256 topics, performs strict typed ABI decoding (`decode_uint_strict`, `decode_get_latest_callback_strict`, etc.), verifies fee reserves (`estimate_callback_fee_wei`), and classifies deterministically into `DISPATCH_REQUIRED`, `RETRY_ELIGIBLE`, `RETRY_BLOCKED`, `RETRY_PENDING`, `RETRY_ALREADY_SUCCEEDED`, `RETRY_SUPERSEDED`, or `RETRY_UNKNOWN` while keeping `suggested_command = None`.
 
 ---
 
@@ -215,12 +214,13 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 ├── docs/
 │   ├── operations/
 │   │   ├── CROSSGUARD-OPERATIONS-RUNBOOK.md # Multi-chain operational incident runbook & diagnostic guide
-│   │   └── CROSSGUARD-RECOVERY-RUNBOOK.md   # M006 SOP for incident response, failure diagnosis & retry
+│   │   └── CROSSGUARD-RECOVERY-RUNBOOK.md   # M006/M006.1 SOP for preflight, deferred dispatch & retry
 │   ├── reports/                        # Milestone verification and audit reports
-│   │   └── M006-VERIFICATION-REPORT.md # M006 formal verification & reconciliation report
+│   │   ├── M006-VERIFICATION-REPORT.md   # M006 formal verification & reconciliation report
+│   │   └── M006.1-VERIFICATION-REPORT.md # M006.1 remediation & invariant verification report
 │   └── security/
 │       ├── M004-THREAT-MODEL.md        # Comprehensive multi-chain threat model & adversarial matrix
-│       └── M006-RECOVERY-THREAT-MODEL.md # M006 recovery & callback retry threat model (18 vectors)
+│       └── M006-RECOVERY-THREAT-MODEL.md # M006/M006.1 recovery & preflight threat model (29 vectors)
 ├── script/
 │   ├── ops/
 │   │   └── crossguard_healthcheck.py   # Read-only health check & recovery preflight diagnostic CLI
@@ -251,15 +251,15 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 │   ├── mocks/
 │   │   └── MockOmniSystemContract.sol  # In-memory mock of Reactive Omni System Contract
 │   ├── ops/
-│   │   └── test_crossguard_healthcheck.py # Offline unit tests for operational health check & preflight (67 tests)
+│   │   └── test_crossguard_healthcheck.py # Offline unit tests for operational health check & preflight (90 tests)
 │   └── unit/
 │       ├── BorrowingController.t.sol   # Unit tests for destination lending & nonce mechanics
 │       ├── CollateralVault.t.sol       # Unit tests for collateral vault & borrow safety
 │       ├── ConfigurationConsistency.t.sol # Cross-chain configuration & topology consistency tests
 │       ├── CrossGuardCallback.t.sol    # Unit tests for callback proxy & sender authentication
-│       ├── CrossGuardReactive.t.sol    # Unit tests for reactive event filtering, storage & retry
+│       ├── CrossGuardReactive.t.sol    # Unit tests for reactive event filtering, pending storage & retry
 │       ├── M004AdversarialSecurity.t.sol # Adversarial security, out-of-order delivery & invariant fuzzing
-│       ├── M006Recovery.t.sol          # 15 mandatory M006 recovery, idempotency & retry scenarios
+│       ├── M006Recovery.t.sol          # 16 unit recovery scenarios + 6 stateful handler invariants (256 runs)
 │       ├── RiskController.t.sol        # Unit tests for fixed-point LTV math & transition idempotency
 │       ├── ScriptPreflight.t.sol       # Unit tests for all 4 deployment network guards
 │       └── TestValuationSource.t.sol   # Unit tests for valuation oracle
@@ -295,10 +295,10 @@ forge fmt --check
 # 3. Compile contracts and check bytecode sizes
 forge build --sizes
 
-# 4. Execute all 159 unit, recovery, invariant, and integration tests with detailed traces
+# 4. Execute all 167 unit, recovery, invariant, and integration tests with detailed traces
 forge test -vvv
 
-# 5. Execute 67 operational health-check and recovery preflight unit tests (mocked RPC)
+# 5. Execute 90 operational health-check and recovery preflight unit tests (mocked RPC)
 python -m unittest discover -s test/ops -p "test_*.py"
 
 # 6. Generate local coverage report
@@ -308,23 +308,24 @@ forge coverage --ir-minimum
 ### Verified Test Results
 
 ```text
-Ran 11 Foundry test suites:
-- test/unit/BorrowingController.t.sol: 20 passed, 0 failed, 0 skipped
-- test/unit/CrossGuardReactive.t.sol: 28 passed, 0 failed, 0 skipped
-- test/unit/CollateralVault.t.sol: 19 passed, 0 failed, 0 skipped
-- test/unit/RiskController.t.sol: 21 passed, 0 failed, 0 skipped
-- test/unit/CrossGuardCallback.t.sol: 14 passed, 0 failed, 0 skipped
-- test/unit/ConfigurationConsistency.t.sol: 10 passed, 0 failed, 0 skipped
-- test/unit/TestValuationSource.t.sol: 4 passed, 0 failed, 0 skipped
-- test/unit/ScriptPreflight.t.sol: 4 passed, 0 failed, 0 skipped
-- test/unit/M004AdversarialSecurity.t.sol: 21 passed, 0 failed, 0 skipped
-- test/unit/M006Recovery.t.sol: 15 passed, 0 failed, 0 skipped
-- test/integration/CrossGuardE2E.t.sol: 3 passed, 0 failed, 0 skipped
+Ran 12 Foundry test suites:
+- test/unit/BorrowingController.t.sol:BorrowingControllerTest: 20 passed, 0 failed, 0 skipped
+- test/unit/CrossGuardReactive.t.sol:CrossGuardReactiveTest: 33 passed, 0 failed, 0 skipped
+- test/unit/CollateralVault.t.sol:CollateralVaultTest: 19 passed, 0 failed, 0 skipped
+- test/unit/RiskController.t.sol:RiskControllerTest: 21 passed, 0 failed, 0 skipped
+- test/unit/CrossGuardCallback.t.sol:CrossGuardCallbackTest: 14 passed, 0 failed, 0 skipped
+- test/unit/ConfigurationConsistency.t.sol:ConfigurationConsistencyTest: 10 passed, 0 failed, 0 skipped
+- test/unit/TestValuationSource.t.sol:TestValuationSourceTest: 4 passed, 0 failed, 0 skipped
+- test/unit/ScriptPreflight.t.sol:ScriptPreflightTest: 4 passed, 0 failed, 0 skipped
+- test/unit/M004AdversarialSecurity.t.sol:M004AdversarialSecurityTest: 21 passed, 0 failed, 0 skipped
+- test/unit/M006Recovery.t.sol:M006RecoveryTest: 16 passed, 0 failed, 0 skipped
+- test/unit/M006Recovery.t.sol:M006RecoveryInvariantTest: 1 passed, 0 failed, 0 skipped (6 stateful invariants; 256 runs, 128,000 calls, 0 reverts)
+- test/integration/CrossGuardE2E.t.sol:CrossGuardE2ETest: 4 passed, 0 failed, 0 skipped
 
-Total Foundry Tests: 159 passed, 0 failed, 0 skipped (100% pass rate)
+Total Foundry Tests: 167 passed, 0 failed, 0 skipped (100% pass rate)
 
 Ran Operational Health Check & Recovery Preflight Test Suite:
-- test/ops/test_crossguard_healthcheck.py: 67 passed, 0 failed, 0 errors (100% pass rate)
+- test/ops/test_crossguard_healthcheck.py: 90 passed, 0 failed, 0 errors (100% pass rate)
 ```
 
 ### Verified Contract Bytecode Sizes
@@ -334,11 +335,11 @@ Ran Operational Health Check & Recovery Preflight Test Suite:
 | `BorrowingController` | 2,829 B | 24,576 B | 21,747 B (88.5% margin) |
 | `CollateralVault` | 3,499 B | 24,576 B | 21,077 B (85.8% margin) |
 | `CrossGuardCallback` | 2,314 B | 24,576 B | 22,262 B (90.6% margin) |
-| `CrossGuardReactive` | 6,115 B | 24,576 B | 18,461 B (75.1% margin) |
+| `CrossGuardReactive` | 6,689 B | 24,576 B | 17,887 B (72.8% margin) |
 | `RiskController` | 1,847 B | 24,576 B | 22,729 B (92.5% margin) |
 | `TestValuationSource` | 695 B | 24,576 B | 23,881 B (97.2% margin) |
 
-### Local Code Coverage (`forge coverage --ir-minimum`)
+### Local Code Coverage Snapshot (`forge coverage --ir-minimum`, M006 Baseline)
 
 > [!NOTE]
 > Coverage numbers are measured locally using `forge coverage --ir-minimum`. The GitHub Actions CI workflow runs automated compilation, formatting, and unit tests, but does not run `forge coverage`.
@@ -444,7 +445,7 @@ CrossGuard includes an automated, read-only operational health check CLI and an 
 ### 1. Read-Only Health Check CLI (`script/ops/crossguard_healthcheck.py`)
 
 A standalone Python utility using Foundry's `cast` binary under strict operational constraints:
-- **Strict Read-Only Command Whitelist:** Only permits `cast chain-id`, `cast code`, `cast call`, and `cast balance`. Automatically rejects mutating or state-modifying subcommands (`send`, `publish`, `mktx`, `--broadcast`, `--private-key`).
+- **Strict Read-Only Command Whitelist:** Only permits `cast chain-id`, `cast code`, `cast call`, `cast balance`, `cast receipt`, `cast gas-price`, and `cast base-fee`. Automatically rejects mutating or state-modifying subcommands (`send`, `publish`, `mktx`, `--broadcast`, `--private-key`).
 - **Zero Third-Party Python Dependencies:** Built strictly using Python's standard library (`subprocess`, `json`, `argparse`, `sys`, `urllib.parse`).
 - **Centralized RPC Credential Redaction:** Automatically scrubs user-info, sensitive path segments, and query parameters from all terminal outputs, JSON reports, and error messages.
 - **Bounded Query Execution:** Enforces a configurable timeout (default: 15.0s) on all subprocess queries to prevent hanging on stalled RPC endpoints.
@@ -478,38 +479,40 @@ python script/ops/crossguard_healthcheck.py \
   --borrowing-controller-address 0x... \
   --reactive-tx-hash 0x...
 
-# Execute the 36-scenario offline unit test suite (100% mocked RPC)
+# Execute the 90-scenario offline unit test suite (100% mocked RPC)
 python -m unittest discover -s test/ops -p "test_*.py"
 ```
 
 ### 2. Read-Only Recovery Preflight Diagnostic Tool (`--recovery-preflight`)
 
-When a cross-chain delivery failure occurs or a callback state is suspect, operators run the preflight tool before initiating on-chain transactions:
+When a cross-chain delivery failure or deferred pending dispatch occurs, operators run the strict fail-closed preflight tool before initiating any manual on-chain recovery action:
 ```bash
 python script/ops/crossguard_healthcheck.py \
   --recovery-preflight \
   --position-id 0x<POSITION_ID> \
+  --expected-nonce <EXPECTED_NONCE> \
   --reactive-tx-hash 0x<REACTIVE_ORIGINATING_TX_HASH>
 ```
 
-- **Deterministic State Classification:**
-  - `RETRY_ELIGIBLE`: Delivery failed, destination nonce unadvanced, retry budget available ($< 3$).
-  - `RETRY_ALREADY_SUCCEEDED`: Destination already processed nonce or callback transaction confirmed.
-  - `RETRY_PENDING`: Callback recorded on Reactive Lasna but pending relayer execution.
-  - `RETRY_SUPERSEDED`: Stored callback nonce superseded by newer origin risk state.
-  - `RETRY_BLOCKED`: Debt outstanding, unconfigured destination, or 3-retry limit exhausted.
-  - `RETRY_UNKNOWN`: RPC connectivity failure or invalid position ID format.
-- **Safety Guarantee:** Tool is strictly read-only; prints `Execution: NOT PERFORMED (read-only preflight diagnostic)`.
+- **Deterministic State Classification (7 States):**
+  - `DISPATCH_REQUIRED`: Valid event stored on Reactive as `PENDING_DISPATCH` due to incomplete destination config during `react()`; eligible for `dispatchPendingCallback()` (`retryCount == 0` preserved) after config/economics pass.
+  - `RETRY_ELIGIBLE`: `REQUESTED` delivery confirmed failed (`error` bytes present with nonzero `destinationTxHash`), destination nonce unadvanced, retry budget available ($< 3$), debts clear, and reserves cover `estimated_fee * safety_multiplier`.
+  - `RETRY_ALREADY_SUCCEEDED`: Destination already processed nonce and confirmed state without contradictions.
+  - `RETRY_PENDING`: Callback requested on Reactive Lasna but pending relayer execution (`destinationTxHash == 0` with empty error, or empty callback array).
+  - `RETRY_SUPERSEDED`: Origin `positionNonce` or Reactive `latestOriginNonce` has exceeded `expectedNonce`.
+  - `RETRY_BLOCKED`: Debt outstanding, insufficient fee reserves, unconfigured destination, `callbackGasLimit < 100_000`, or 3-retry limit exhausted.
+  - `RETRY_UNKNOWN`: Missing mandatory inputs, RPC/ABI failure, unparseable fee telemetry, invalid/missing receipt `CallbackRequest` correlation, ambiguous callback records, or cross-chain contradictions.
+- **Safety Guarantee:** Tool is strictly read-only, keeps `suggested_command = None` (never emits copy-paste `cast send` commands), and prints `Execution: NOT PERFORMED (read-only preflight diagnostic)`.
 
 ### 3. Incident Response & Recovery Runbooks
 
 - **Operations Runbook (`docs/operations/CROSSGUARD-OPERATIONS-RUNBOOK.md`):** Multi-chain failure scenarios, RPC outages, debt settlement, and telemetry diagnosis.
-- **Recovery Runbook (`docs/operations/CROSSGUARD-RECOVERY-RUNBOOK.md`):** 6-phase SOP for controlled callback recovery, root-cause remediation, and `retryFailedCallback()` execution.
+- **Recovery Runbook (`docs/operations/CROSSGUARD-RECOVERY-RUNBOOK.md`):** 6-phase SOP for fail-closed preflight, **Path A** deferred dispatch recovery (`dispatchPendingCallback()`), and **Path B** controlled retry (`retryFailedCallback()`).
 
-#### Controlled Same-Nonce Recovery (M006):
-- In the event of destination delivery failure, `CrossGuardReactive.sol` enables the authorized contract owner to re-dispatch the exact initial payload and nonce via `retryFailedCallback(positionId, expectedNonce, reasonCode)`.
-- Destination EVM reverts leave `lastProcessedNonce` unadvanced; retrying with the same origin nonce safely passes `require(nonce > lastProcessedNonce)` without risking duplicate execution if the initial callback had succeeded.
-- Strictly rate-limited to 3 retries (`MAX_RETRIES = 3`) to eliminate destination griefing. Origin transitions reset the budget.
+#### Controlled Recovery Lifecycle (M006 & M006.1):
+- **Path A (Deferred Initial Dispatch):** If `react()` stored an event as `PENDING_DISPATCH`, `dispatchPendingCallback(positionId, expectedNonce)` submits the initial callback without consuming retry quota (`retryCount == 0`).
+- **Path B (Same-Nonce Failure Retry):** Once submitted (`REQUESTED`), if destination execution fails, `retryFailedCallback(positionId, expectedNonce, reasonCode)` re-dispatches the exact stored payload and nonce (rate-limited to `MAX_RETRIES = 3`; new origin transitions reset the budget).
+- Destination EVM reverts leave `lastProcessedNonce` unadvanced; both recovery paths safely rely on destination monotonic nonce gating (`require(nonce > lastProcessedNonce)`).
 
 ---
 

@@ -36,6 +36,16 @@ contract CrossGuardReactiveTest is Test {
     event ReactiveEventRejected(
         bytes32 indexed topic0, bytes32 indexed positionId, uint256 indexed nonce, string reason
     );
+    event CallbackDispatchDeferred(
+        bytes32 indexed positionId,
+        uint256 indexed nonce,
+        CrossGuardReactive.CallbackType indexed eventType,
+        string reason
+    );
+    event CallbackDispatchSubmitted(
+        bytes32 indexed positionId, uint256 indexed nonce, CrossGuardReactive.CallbackType indexed eventType
+    );
+    event PendingCallbackSuperseded(bytes32 indexed positionId, uint256 indexed oldNonce, uint256 indexed newNonce);
 
     function setUp() public {
         mockSystem = new MockOmniSystemContract();
@@ -556,7 +566,7 @@ contract CrossGuardReactiveTest is Test {
         assertEq(lazyReactive.destinationChainId(), 0);
         assertEq(lazyReactive.callbackGasLimit(), 0);
 
-        // When log arrives before destination is set, react() returns early without dispatching
+        // When log arrives before destination is set, react() defers dispatch and stores pending state
         IReactive.LogRecord memory log = IReactive.LogRecord({
             chain_id: ORIGIN_CHAIN_ID,
             _contract: originRiskController,
@@ -573,14 +583,25 @@ contract CrossGuardReactiveTest is Test {
         });
 
         vm.expectEmit(true, true, true, true);
-        emit ReactiveEventRejected(RISK_BREACH_TOPIC_0, positionId, 1, "DESTINATION_NOT_CONFIGURED");
+        emit CallbackDispatchDeferred(
+            positionId, 1, CrossGuardReactive.CallbackType.BREACH, "DESTINATION_NOT_CONFIGURED"
+        );
         vm.prank(address(mockSystem));
         lazyReactive.react(log);
         assertEq(mockSystem.requestedCallbackCount(), 0);
+        assertEq(lazyReactive.latestOriginNonce(positionId), 1);
+
+        (,,,, CrossGuardReactive.DispatchStatus status) = lazyReactive.getLatestCallback(positionId);
+        assertEq(uint8(status), uint8(CrossGuardReactive.DispatchStatus.PENDING_DISPATCH));
 
         // Now link destination callback post-deployment
         vm.prank(owner);
         lazyReactive.setDestinationConfig(DEST_CHAIN_ID, destCallback, GAS_LIMIT);
+
+        // Dispatch the deferred event
+        vm.prank(owner);
+        lazyReactive.dispatchPendingCallback(positionId, 1);
+        assertEq(mockSystem.requestedCallbackCount(), 1);
 
         assertEq(lazyReactive.destinationCallback(), destCallback);
         assertEq(lazyReactive.destinationChainId(), DEST_CHAIN_ID);
@@ -789,11 +810,17 @@ contract CrossGuardReactiveTest is Test {
         reactiveContract.react(log);
         assertEq(mockSystem.requestedCallbackCount(), 1);
 
-        (uint256 storedNonce, CrossGuardReactive.CallbackType cType, bytes memory payload, uint8 retries) =
-            reactiveContract.getLatestCallback(positionId);
+        (
+            uint256 storedNonce,
+            CrossGuardReactive.CallbackType cType,
+            bytes memory payload,
+            uint8 retries,
+            CrossGuardReactive.DispatchStatus status
+        ) = reactiveContract.getLatestCallback(positionId);
         assertEq(storedNonce, 1);
         assertEq(uint8(cType), uint8(CrossGuardReactive.CallbackType.BREACH));
         assertEq(retries, 0);
+        assertEq(uint8(status), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
         assertTrue(payload.length > 0);
 
         bytes32 reason = bytes32("RECOVERY_GAS_EXHAUSTION");
@@ -815,7 +842,7 @@ contract CrossGuardReactiveTest is Test {
         reactiveContract.retryFailedCallback(positionId, 1, reason);
         assertEq(mockSystem.requestedCallbackCount(), 4);
 
-        (,,, uint8 retries3) = reactiveContract.getLatestCallback(positionId);
+        (,,, uint8 retries3,) = reactiveContract.getLatestCallback(positionId);
         assertEq(retries3, 3);
 
         // Retry 4 -> Reverts with RetryLimitExceeded
@@ -845,11 +872,16 @@ contract CrossGuardReactiveTest is Test {
         reactiveContract.react(log2);
         assertEq(mockSystem.requestedCallbackCount(), 5);
 
-        (uint256 newNonce, CrossGuardReactive.CallbackType newType,, uint8 newRetries) =
-            reactiveContract.getLatestCallback(positionId);
+        (
+            uint256 newNonce,
+            CrossGuardReactive.CallbackType newType,,
+            uint8 newRetries,
+            CrossGuardReactive.DispatchStatus newStatus
+        ) = reactiveContract.getLatestCallback(positionId);
         assertEq(newNonce, 2);
         assertEq(uint8(newType), uint8(CrossGuardReactive.CallbackType.RESOLVED));
         assertEq(newRetries, 0);
+        assertEq(uint8(newStatus), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
 
         // Can retry nonce 2 now
         vm.prank(owner);
@@ -902,5 +934,264 @@ contract CrossGuardReactiveTest is Test {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.NonceMismatch.selector, 2, 1));
         reactiveContract.retryFailedCallback(positionId, 2, reason);
+    }
+
+    function testGasLimitMinimumValidation() public {
+        // Constructor rejects < 100,000
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidGasLimit.selector, uint64(99_999)));
+        new CrossGuardReactive(
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, destCallback, 99_999
+        );
+
+        // Constructor accepts exactly 100,000
+        CrossGuardReactive minGasReactive = new CrossGuardReactive(
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, destCallback, 100_000
+        );
+        assertEq(minGasReactive.callbackGasLimit(), 100_000);
+
+        // setDestinationConfig rejects < 100,000
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidGasLimit.selector, uint64(99_999)));
+        reactiveContract.setDestinationConfig(DEST_CHAIN_ID, destCallback, 99_999);
+
+        // setDestinationConfig accepts 100,000
+        vm.prank(owner);
+        reactiveContract.setDestinationConfig(DEST_CHAIN_ID, destCallback, 100_000);
+        assertEq(reactiveContract.callbackGasLimit(), 100_000);
+
+        // setDestinationConfig accepts 300,000
+        vm.prank(owner);
+        reactiveContract.setDestinationConfig(DEST_CHAIN_ID, destCallback, 300_000);
+        assertEq(reactiveContract.callbackGasLimit(), 300_000);
+    }
+
+    function testDurablePendingDispatchLifecycle() public {
+        // Deploy reactive contract unconfigured
+        CrossGuardReactive unconf = new CrossGuardReactive(
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, address(0), 0
+        );
+
+        IReactive.LogRecord memory log = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_BREACH_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: 1,
+            data: abi.encode(8500, 8000, block.timestamp),
+            block_number: 100,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+
+        // Event accepted and deferred without sending callback
+        vm.prank(address(mockSystem));
+        unconf.react(log);
+        assertEq(mockSystem.requestedCallbackCount(), 0, "Must not request callback while unconfigured");
+        assertEq(unconf.latestOriginNonce(positionId), 1, "Must advance accepted nonce");
+
+        (
+            uint256 nonce,
+            CrossGuardReactive.CallbackType cType,,
+            uint8 retries,
+            CrossGuardReactive.DispatchStatus status
+        ) = unconf.getLatestCallback(positionId);
+        assertEq(nonce, 1);
+        assertEq(uint8(cType), uint8(CrossGuardReactive.CallbackType.BREACH));
+        assertEq(retries, 0);
+        assertEq(uint8(status), uint8(CrossGuardReactive.DispatchStatus.PENDING_DISPATCH));
+
+        // Retry reverts because status is PENDING_DISPATCH
+        vm.prank(owner);
+        vm.expectRevert(CrossGuardReactive.CallbackNotRequested.selector);
+        unconf.retryFailedCallback(positionId, 1, bytes32("RETRY"));
+
+        // Non-owner dispatch reverts
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        unconf.dispatchPendingCallback(positionId, 1);
+
+        // Expected nonce mismatch reverts
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.NonceMismatch.selector, 2, 1));
+        unconf.dispatchPendingCallback(positionId, 2);
+
+        // Still unconfigured reverts
+        vm.prank(owner);
+        vm.expectRevert(CrossGuardReactive.DestinationNotConfigured.selector);
+        unconf.dispatchPendingCallback(positionId, 1);
+
+        // Configure destination
+        vm.prank(owner);
+        unconf.setDestinationConfig(DEST_CHAIN_ID, destCallback, 150_000);
+
+        // Owner dispatches pending callback (does not increment retryCount)
+        vm.prank(owner);
+        vm.expectEmit(true, true, true, false);
+        emit CallbackDispatchSubmitted(positionId, 1, CrossGuardReactive.CallbackType.BREACH);
+        unconf.dispatchPendingCallback(positionId, 1);
+        assertEq(mockSystem.requestedCallbackCount(), 1, "Callback must be requested");
+
+        (,,, uint8 retriesAfter, CrossGuardReactive.DispatchStatus statusAfter) = unconf.getLatestCallback(positionId);
+        assertEq(retriesAfter, 0, "Initial dispatch must not consume retry budget");
+        assertEq(uint8(statusAfter), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
+
+        // Calling dispatchPendingCallback again reverts with DispatchNotPending
+        vm.prank(owner);
+        vm.expectRevert(CrossGuardReactive.DispatchNotPending.selector);
+        unconf.dispatchPendingCallback(positionId, 1);
+    }
+
+    function testPendingDispatchSupersededByNewerOriginEvent() public {
+        CrossGuardReactive unconf = new CrossGuardReactive(
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, address(0), 0
+        );
+
+        // Breach at nonce 1 deferred
+        IReactive.LogRecord memory log1 = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_BREACH_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: 1,
+            data: abi.encode(8500, 8000, block.timestamp),
+            block_number: 100,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+        vm.prank(address(mockSystem));
+        unconf.react(log1);
+
+        // Resolution at nonce 2 arrives while still unconfigured -> supersedes breach and emits event
+        IReactive.LogRecord memory log2 = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_RESOLVED_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: 2,
+            data: abi.encode(4000, 8000, block.timestamp + 10),
+            block_number: 101,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+        vm.prank(address(mockSystem));
+        vm.expectEmit(true, true, true, false);
+        emit PendingCallbackSuperseded(positionId, 1, 2);
+        unconf.react(log2);
+
+        // Now configure destination
+        vm.prank(owner);
+        unconf.setDestinationConfig(DEST_CHAIN_ID, destCallback, 200_000);
+
+        // Attempting to dispatch old superseded nonce 1 reverts with NonceMismatch
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.NonceMismatch.selector, 1, 2));
+        unconf.dispatchPendingCallback(positionId, 1);
+
+        // Dispatching latest nonce 2 succeeds with exact stored resolution payload
+        vm.prank(owner);
+        unconf.dispatchPendingCallback(positionId, 2);
+        assertEq(mockSystem.requestedCallbackCount(), 1);
+
+        (
+            uint256 finalNonce,
+            CrossGuardReactive.CallbackType finalType,
+            bytes memory finalPayload,
+            uint8 retries,
+            CrossGuardReactive.DispatchStatus finalStatus
+        ) = unconf.getLatestCallback(positionId);
+        assertEq(finalNonce, 2);
+        assertEq(uint8(finalType), uint8(CrossGuardReactive.CallbackType.RESOLVED));
+        assertEq(retries, 0);
+        assertEq(uint8(finalStatus), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
+        assertEq(mockSystem.getLastRequestedCallback().payload, finalPayload);
+    }
+
+    function testConstructorStageOneRejectsNonzeroGasBelowMinimum() public {
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidGasLimit.selector, uint64(99_999)));
+        new CrossGuardReactive(
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, address(0), 99_999
+        );
+    }
+
+    function testExternalSystemRequestFailureRevertsAtomicallyAndPreservesState() public {
+        RevertableOmniSystemContract revertSystem = new RevertableOmniSystemContract();
+        CrossGuardReactive localReactive = new CrossGuardReactive(
+            owner, address(revertSystem), ORIGIN_CHAIN_ID, originRiskController, DEST_CHAIN_ID, address(0), 0
+        );
+
+        // Store pending breach at nonce 1 while unconfigured
+        IReactive.LogRecord memory log = IReactive.LogRecord({
+            chain_id: ORIGIN_CHAIN_ID,
+            _contract: originRiskController,
+            topic_0: uint256(RISK_BREACH_TOPIC_0),
+            topic_1: uint256(positionId),
+            topic_2: uint256(uint160(user)),
+            topic_3: 1,
+            data: abi.encode(8500, 8000, block.timestamp),
+            block_number: 100,
+            op_code: 0,
+            block_hash: 0,
+            tx_hash: 0,
+            log_index: 0
+        });
+        vm.prank(address(revertSystem));
+        localReactive.react(log);
+
+        vm.prank(owner);
+        localReactive.setDestinationConfig(DEST_CHAIN_ID, destCallback, 200_000);
+
+        // Inject failure in external System Contract
+        revertSystem.setShouldRevert(true);
+
+        // dispatchPendingCallback reverts atomically -> state must stay PENDING_DISPATCH
+        vm.prank(owner);
+        vm.expectRevert(bytes("Mock system callback failed"));
+        localReactive.dispatchPendingCallback(positionId, 1);
+
+        (,,, uint8 retriesAfterFailedDispatch, CrossGuardReactive.DispatchStatus statusStillPending) =
+            localReactive.getLatestCallback(positionId);
+        assertEq(uint8(statusStillPending), uint8(CrossGuardReactive.DispatchStatus.PENDING_DISPATCH));
+        assertEq(retriesAfterFailedDispatch, 0);
+
+        // Recover system contract and dispatch cleanly
+        revertSystem.setShouldRevert(false);
+        vm.prank(owner);
+        localReactive.dispatchPendingCallback(positionId, 1);
+
+        // Now test retryFailedCallback atomic revert when external request fails
+        revertSystem.setShouldRevert(true);
+        vm.prank(owner);
+        vm.expectRevert(bytes("Mock system callback failed"));
+        localReactive.retryFailedCallback(positionId, 1, bytes32("RECOVERY_TEST"));
+
+        (,,, uint8 retriesAfterFailedRetry, CrossGuardReactive.DispatchStatus statusAfter) =
+            localReactive.getLatestCallback(positionId);
+        assertEq(retriesAfterFailedRetry, 0, "Failed retry call must not consume retryCount");
+        assertEq(uint8(statusAfter), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
+    }
+}
+
+contract RevertableOmniSystemContract is MockOmniSystemContract {
+    bool public shouldRevert;
+
+    function setShouldRevert(bool _shouldRevert) external {
+        shouldRevert = _shouldRevert;
+    }
+
+    function requestCallbackV_1_0(CallbackConfiguration_V_1_0 memory config_) external override {
+        if (shouldRevert) {
+            revert("Mock system callback failed");
+        }
+        requestedCallbacks.push(config_);
+        emit CallbackRequestedV1(config_.chainId, config_.recipient, config_.gasLimit, config_.payload);
     }
 }

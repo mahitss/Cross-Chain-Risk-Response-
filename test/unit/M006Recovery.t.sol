@@ -238,7 +238,7 @@ contract M006RecoveryTest is Test {
         assertEq(borrowingController.lastProcessedNonce(positionId), 0);
 
         // Reactive contract holds stored callback state ready for recovery
-        (uint256 nonce, CrossGuardReactive.CallbackType cType,, uint8 retries) =
+        (uint256 nonce, CrossGuardReactive.CallbackType cType,, uint8 retries,) =
             reactiveContract.getLatestCallback(positionId);
         assertEq(nonce, 1);
         assertEq(uint8(cType), uint8(CrossGuardReactive.CallbackType.BREACH));
@@ -428,7 +428,7 @@ contract M006RecoveryTest is Test {
         for (uint8 i = 1; i <= 3; i++) {
             vm.prank(owner);
             reactiveContract.retryFailedCallback(positionId, 1, reason);
-            (,,, uint8 count) = reactiveContract.getLatestCallback(positionId);
+            (,,, uint8 count,) = reactiveContract.getLatestCallback(positionId);
             assertEq(count, i);
         }
 
@@ -457,13 +457,13 @@ contract M006RecoveryTest is Test {
         vm.prank(address(mockSystem));
         reactiveContract.react(log2);
 
-        (,,, uint8 resetCount) = reactiveContract.getLatestCallback(positionId);
+        (,,, uint8 resetCount,) = reactiveContract.getLatestCallback(positionId);
         assertEq(resetCount, 0, "New origin event must reset retry count");
 
         // Retry on nonce 2 succeeds
         vm.prank(owner);
         reactiveContract.retryFailedCallback(positionId, 2, reason);
-        (,,, uint8 countAfterReset) = reactiveContract.getLatestCallback(positionId);
+        (,,, uint8 countAfterReset,) = reactiveContract.getLatestCallback(positionId);
         assertEq(countAfterReset, 1);
     }
 
@@ -564,8 +564,8 @@ contract M006RecoveryTest is Test {
         reactiveContract.retryFailedCallback(positionId, 1, bytes32("RETRY_A"));
         vm.stopPrank();
 
-        (,,, uint8 retriesA) = reactiveContract.getLatestCallback(positionId);
-        (,,, uint8 retriesB) = reactiveContract.getLatestCallback(posB);
+        (,,, uint8 retriesA,) = reactiveContract.getLatestCallback(positionId);
+        (,,, uint8 retriesB,) = reactiveContract.getLatestCallback(posB);
 
         assertEq(retriesA, 2, "Position A retries should be 2");
         assertEq(retriesB, 0, "Position B retries must remain 0");
@@ -663,16 +663,36 @@ contract M006RecoveryTest is Test {
         unconfiguredReactive.react(log);
         assertEq(mockSystem.requestedCallbackCount(), startCount, "No callback while unconfigured");
 
+        // Check durable storage: pending dispatch created without emitting callback
+        (
+            uint256 nonce,
+            CrossGuardReactive.CallbackType cType,,
+            uint8 retries,
+            CrossGuardReactive.DispatchStatus status
+        ) = unconfiguredReactive.getLatestCallback(positionId);
+        assertEq(nonce, 1);
+        assertEq(uint8(cType), uint8(CrossGuardReactive.CallbackType.BREACH));
+        assertEq(retries, 0);
+        assertEq(uint8(status), uint8(CrossGuardReactive.DispatchStatus.PENDING_DISPATCH));
+
         // Owner corrects configuration
         vm.prank(owner);
         unconfiguredReactive.setDestinationConfig(
             UNICHAIN_SEPOLIA_CHAIN_ID, address(crossGuardCallback), CALLBACK_GAS_LIMIT
         );
 
-        // Now event succeeds
+        // Now owner dispatches pending callback
+        vm.prank(owner);
+        unconfiguredReactive.dispatchPendingCallback(positionId, 1);
+        assertEq(mockSystem.requestedCallbackCount(), startCount + 1, "Callback succeeds after dispatchPendingCallback");
+
+        (,,,, CrossGuardReactive.DispatchStatus statusAfter) = unconfiguredReactive.getLatestCallback(positionId);
+        assertEq(uint8(statusAfter), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
+
+        // Attempting to react same log again is rejected as duplicate
         vm.prank(address(mockSystem));
         unconfiguredReactive.react(log);
-        assertEq(mockSystem.requestedCallbackCount(), startCount + 1, "Callback succeeds after config correction");
+        assertEq(mockSystem.requestedCallbackCount(), startCount + 1, "Duplicate origin event must be rejected");
     }
 
     // ==========================================
@@ -726,7 +746,7 @@ contract M006RecoveryTest is Test {
             reactiveContract.retryFailedCallback(positionId, 1, bytes32("FUZZ_RETRY"));
         }
 
-        (uint256 storedNonce, CrossGuardReactive.CallbackType cType, bytes memory payload, uint8 count) =
+        (uint256 storedNonce, CrossGuardReactive.CallbackType cType, bytes memory payload, uint8 count,) =
             reactiveContract.getLatestCallback(positionId);
 
         assertEq(storedNonce, 1);
@@ -739,5 +759,375 @@ contract M006RecoveryTest is Test {
             selector := mload(add(payload, 32))
         }
         assertEq(selector, ICrossGuardCallback.handleRiskBreach.selector);
+    }
+
+    function test16_DeferredPendingDispatchCannotBeRetriedUntilSubmitted() public {
+        vm.prank(owner);
+        CrossGuardReactive unconf = new CrossGuardReactive(
+            owner,
+            address(mockSystem),
+            BASE_SEPOLIA_CHAIN_ID,
+            address(riskController),
+            UNICHAIN_SEPOLIA_CHAIN_ID,
+            address(0),
+            0
+        );
+
+        Vm.Log memory breachLog = _triggerOriginBreach();
+        vm.prank(address(mockSystem));
+        unconf.react(_toLogRecord(breachLog));
+
+        // Configure destination
+        vm.prank(owner);
+        unconf.setDestinationConfig(UNICHAIN_SEPOLIA_CHAIN_ID, address(crossGuardCallback), CALLBACK_GAS_LIMIT);
+
+        // retryFailedCallback reverts because status is PENDING_DISPATCH (not REQUESTED)
+        vm.prank(owner);
+        vm.expectRevert(CrossGuardReactive.CallbackNotRequested.selector);
+        unconf.retryFailedCallback(positionId, 1, bytes32("WRONG_PATH"));
+
+        // dispatchPendingCallback succeeds with 0 retryCount consumed
+        vm.prank(owner);
+        unconf.dispatchPendingCallback(positionId, 1);
+        (,,, uint8 retries, CrossGuardReactive.DispatchStatus st) = unconf.getLatestCallback(positionId);
+        assertEq(retries, 0);
+        assertEq(uint8(st), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
+    }
+}
+
+/// @title M006RecoveryHandler
+/// @notice Stateful handler driving valid, deferred, failed, replayed, and retried multi-chain sequences.
+contract M006RecoveryHandler is Test {
+    RiskController public riskController;
+    CrossGuardReactive public reactiveContract;
+    CrossGuardReactive public deferredReactive;
+    MockOmniSystemContract public mockSystem;
+    MockCallbackProxy public callbackProxy;
+    CrossGuardCallback public crossGuardCallback;
+    CrossGuardCallback public deferredCallback;
+    BorrowingController public borrowingController;
+
+    address public owner;
+    address public vaultAddr;
+    bytes32 public posA = keccak256("inv-position-A");
+    bytes32 public posB = keccak256("inv-position-B");
+    address public userA = address(0xA11C);
+    address public userB = address(0xB0B0);
+
+    uint256 constant BASE_CHAIN = 84532;
+    uint256 constant DEST_CHAIN = 1301;
+
+    uint256[2] public ghostMaxAcceptedNonce;
+    uint256[2] public ghostMaxDestNonce;
+    uint256 public ghostLastTouchedIndex;
+    uint256[2] public ghostPosBNonceBeforeAOp;
+    uint256 public ghostUnexpectedSuccessCount;
+    bool public ghostIsolationViolated;
+    bool public ghostConfusedPendingRetrySucceeded;
+
+    mapping(bytes32 => mapping(uint256 => uint256)) public nonceSuccessCount;
+    mapping(bytes32 => bytes) public recordedPayload;
+    mapping(bytes32 => uint256) public recordedPayloadNonce;
+
+    constructor(
+        address _owner,
+        address _vaultAddr,
+        RiskController _riskController,
+        CrossGuardReactive _reactiveContract,
+        CrossGuardReactive _deferredReactive,
+        MockOmniSystemContract _mockSystem,
+        MockCallbackProxy _callbackProxy,
+        CrossGuardCallback _crossGuardCallback,
+        CrossGuardCallback _deferredCallback,
+        BorrowingController _borrowingController
+    ) {
+        owner = _owner;
+        vaultAddr = _vaultAddr;
+        riskController = _riskController;
+        reactiveContract = _reactiveContract;
+        deferredReactive = _deferredReactive;
+        mockSystem = _mockSystem;
+        callbackProxy = _callbackProxy;
+        crossGuardCallback = _crossGuardCallback;
+        deferredCallback = _deferredCallback;
+        borrowingController = _borrowingController;
+    }
+
+    function _pos(uint256 idx) internal view returns (bytes32, address) {
+        if (idx % 2 == 0) return (posA, userA);
+        return (posB, userB);
+    }
+
+    function deliverOriginTransition(uint256 posIdx, bool breach) external {
+        uint256 idx = posIdx % 2;
+        (bytes32 pos, address usr) = _pos(idx);
+        uint256 otherIdx = 1 - idx;
+        (bytes32 otherPos,) = _pos(otherIdx);
+
+        uint256 otherOriginBefore = reactiveContract.latestOriginNonce(otherPos);
+        uint256 otherDestBefore = borrowingController.lastProcessedNonce(otherPos);
+
+        uint256 colVal = 10_000e8;
+        uint256 debtVal = breach ? 9_000e8 : 4_000e8;
+
+        uint256 prevOriginNonce = riskController.positionNonce(pos);
+
+        vm.prank(vaultAddr);
+        (bool isBreached, uint256 ltvBps, uint256 originNonce) = riskController.assessRisk(pos, usr, colVal, debtVal);
+
+        if (originNonce > prevOriginNonce) {
+            bytes32 expectedTopic =
+                isBreached ? reactiveContract.RISK_BREACH_TOPIC_0() : reactiveContract.RISK_RESOLVED_TOPIC_0();
+
+            IReactive.LogRecord memory rec = IReactive.LogRecord({
+                chain_id: BASE_CHAIN,
+                _contract: address(riskController),
+                topic_0: uint256(expectedTopic),
+                topic_1: uint256(pos),
+                topic_2: uint256(uint160(usr)),
+                topic_3: originNonce,
+                data: abi.encode(ltvBps, riskController.riskThresholdBps(), block.timestamp),
+                block_number: block.number,
+                op_code: 0,
+                block_hash: 0,
+                tx_hash: 0,
+                log_index: 0
+            });
+
+            vm.startPrank(address(mockSystem));
+            reactiveContract.react(rec);
+            deferredReactive.react(rec);
+            vm.stopPrank();
+
+            recordedPayload[pos] = mockSystem.getLastRequestedCallback().payload;
+            recordedPayloadNonce[pos] = originNonce;
+        } else if (originNonce > 0 && posIdx % 5 == 0) {
+            // Re-submit duplicate/stale origin log directly to reactive to exercise idempotency guard
+            bytes32 staleTopic =
+                isBreached ? reactiveContract.RISK_BREACH_TOPIC_0() : reactiveContract.RISK_RESOLVED_TOPIC_0();
+            IReactive.LogRecord memory staleRec = IReactive.LogRecord({
+                chain_id: BASE_CHAIN,
+                _contract: address(riskController),
+                topic_0: uint256(staleTopic),
+                topic_1: uint256(pos),
+                topic_2: uint256(uint160(usr)),
+                topic_3: originNonce,
+                data: abi.encode(ltvBps, riskController.riskThresholdBps(), block.timestamp),
+                block_number: block.number,
+                op_code: 0,
+                block_hash: 0,
+                tx_hash: 0,
+                log_index: 0
+            });
+            vm.prank(address(mockSystem));
+            reactiveContract.react(staleRec);
+        }
+
+        uint256 acceptedNow = reactiveContract.latestOriginNonce(pos);
+        if (acceptedNow > ghostMaxAcceptedNonce[idx]) {
+            ghostMaxAcceptedNonce[idx] = acceptedNow;
+        }
+        if (
+            reactiveContract.latestOriginNonce(otherPos) != otherOriginBefore
+                || borrowingController.lastProcessedNonce(otherPos) != otherDestBefore
+        ) {
+            ghostIsolationViolated = true;
+        }
+    }
+
+    function exerciseDeferredContract(uint256 posIdx, bool configureAndDispatch) external {
+        uint256 idx = posIdx % 2;
+        (bytes32 pos,) = _pos(idx);
+        (uint256 dNonce,,,, CrossGuardReactive.DispatchStatus dStatus) = deferredReactive.getLatestCallback(pos);
+        if (dNonce == 0) return;
+
+        if (dStatus == CrossGuardReactive.DispatchStatus.PENDING_DISPATCH) {
+            // Attempting retryFailedCallback while PENDING_DISPATCH must ALWAYS revert!
+            vm.prank(owner);
+            try deferredReactive.retryFailedCallback(pos, dNonce, bytes32("BAD_RETRY_WHILE_PENDING")) {
+                ghostConfusedPendingRetrySucceeded = true;
+            } catch {}
+
+            if (configureAndDispatch) {
+                vm.startPrank(owner);
+                if (deferredReactive.destinationCallback() == address(0)) {
+                    deferredReactive.setDestinationConfig(DEST_CHAIN, address(deferredCallback), 300_000);
+                }
+                deferredReactive.dispatchPendingCallback(pos, dNonce);
+                vm.stopPrank();
+            }
+        }
+    }
+
+    function executeStoredCallback(uint256 posIdx, bool sufficientGas) external {
+        uint256 idx = posIdx % 2;
+        (bytes32 pos,) = _pos(idx);
+        (bytes32 otherPos,) = _pos(1 - idx);
+
+        (uint256 nonce,, bytes memory payload,, CrossGuardReactive.DispatchStatus status) =
+            reactiveContract.getLatestCallback(pos);
+        if (status != CrossGuardReactive.DispatchStatus.REQUESTED || payload.length == 0) return;
+
+        uint256 otherOriginBefore = reactiveContract.latestOriginNonce(otherPos);
+        uint256 otherDestBefore = borrowingController.lastProcessedNonce(otherPos);
+        uint64 gasLim = sufficientGas ? 300_000 : 1_000;
+
+        uint256 prevDestNonce = borrowingController.lastProcessedNonce(pos);
+        (bool ok,) =
+            callbackProxy.executeCallback(address(crossGuardCallback), payload, gasLim, address(reactiveContract));
+
+        if (ok) {
+            nonceSuccessCount[pos][nonce]++;
+            if (nonceSuccessCount[pos][nonce] > 1) {
+                ghostUnexpectedSuccessCount++;
+            }
+        } else {
+            // Reverting callback must never advance dest nonce
+            if (borrowingController.lastProcessedNonce(pos) != prevDestNonce) {
+                ghostUnexpectedSuccessCount++;
+            }
+        }
+
+        uint256 destNow = borrowingController.lastProcessedNonce(pos);
+        if (destNow > ghostMaxDestNonce[idx]) {
+            ghostMaxDestNonce[idx] = destNow;
+        }
+
+        if (
+            reactiveContract.latestOriginNonce(otherPos) != otherOriginBefore
+                || borrowingController.lastProcessedNonce(otherPos) != otherDestBefore
+        ) {
+            ghostIsolationViolated = true;
+        }
+    }
+
+    function tryRetryLatestCallback(uint256 posIdx) external {
+        uint256 idx = posIdx % 2;
+        (bytes32 pos,) = _pos(idx);
+        (uint256 nonce,,,, CrossGuardReactive.DispatchStatus status) = reactiveContract.getLatestCallback(pos);
+        if (nonce == 0) return;
+
+        vm.prank(owner);
+        try reactiveContract.retryFailedCallback(pos, nonce, bytes32("INV_RETRY")) {
+            if (status == CrossGuardReactive.DispatchStatus.PENDING_DISPATCH) {
+                ghostConfusedPendingRetrySucceeded = true;
+            }
+        } catch {}
+    }
+
+    function tryReplayOldPayload(uint256 posIdx) external {
+        uint256 idx = posIdx % 2;
+        (bytes32 pos,) = _pos(idx);
+        bytes memory oldPayload = recordedPayload[pos];
+        uint256 oldNonce = recordedPayloadNonce[pos];
+        if (oldPayload.length == 0) return;
+
+        uint256 destNow = borrowingController.lastProcessedNonce(pos);
+        if (oldNonce <= destNow) {
+            (bool ok,) = callbackProxy.executeCallback(
+                address(crossGuardCallback), oldPayload, 300_000, address(reactiveContract)
+            );
+            if (ok) {
+                ghostUnexpectedSuccessCount++;
+            }
+        }
+    }
+}
+
+/// @title M006RecoveryInvariantTest
+/// @notice Handler-based stateful invariant test suite for CrossGuard M006.1 recovery semantics.
+contract M006RecoveryInvariantTest is Test {
+    RiskController riskController;
+    CrossGuardReactive reactiveContract;
+    CrossGuardReactive deferredReactive;
+    MockOmniSystemContract mockSystem;
+    MockCallbackProxy callbackProxy;
+    CrossGuardCallback crossGuardCallback;
+    CrossGuardCallback deferredCallback;
+    BorrowingController borrowingController;
+    M006RecoveryHandler handler;
+
+    address owner = address(0xAA);
+    address vaultAddr = address(0x5555);
+
+    function setUp() public {
+        vm.startPrank(owner);
+        riskController = new RiskController(owner, 8000);
+        riskController.setAuthorizedVault(vaultAddr, true);
+
+        mockSystem = new MockOmniSystemContract();
+        address predictedReactive = vm.computeCreateAddress(owner, vm.getNonce(owner));
+        reactiveContract =
+            new CrossGuardReactive(owner, address(mockSystem), 84532, address(riskController), 1301, address(0), 0);
+        assertEq(address(reactiveContract), predictedReactive);
+
+        // Second Stage-1 unconfigured reactive instance to genuinely exercise PENDING_DISPATCH transitions
+        deferredReactive =
+            new CrossGuardReactive(owner, address(mockSystem), 84532, address(riskController), 0, address(0), 0);
+
+        callbackProxy = new MockCallbackProxy();
+        borrowingController = new BorrowingController(owner);
+        crossGuardCallback = new CrossGuardCallback(
+            owner, address(callbackProxy), address(borrowingController), address(reactiveContract)
+        );
+        deferredCallback = new CrossGuardCallback(
+            owner, address(callbackProxy), address(borrowingController), address(deferredReactive)
+        );
+        borrowingController.setCallbackAdapter(address(crossGuardCallback));
+        reactiveContract.setDestinationConfig(1301, address(crossGuardCallback), 300_000);
+        vm.stopPrank();
+
+        handler = new M006RecoveryHandler(
+            owner,
+            vaultAddr,
+            riskController,
+            reactiveContract,
+            deferredReactive,
+            mockSystem,
+            callbackProxy,
+            crossGuardCallback,
+            deferredCallback,
+            borrowingController
+        );
+
+        vm.prank(handler.userA());
+        borrowingController.registerPosition(handler.posA());
+        vm.prank(handler.userB());
+        borrowingController.registerPosition(handler.posB());
+
+        targetContract(address(handler));
+    }
+
+    function invariant_AcceptedNoncesNeverDecrease() public view {
+        assertGe(reactiveContract.latestOriginNonce(handler.posA()), handler.ghostMaxAcceptedNonce(0));
+        assertGe(reactiveContract.latestOriginNonce(handler.posB()), handler.ghostMaxAcceptedNonce(1));
+    }
+
+    function invariant_DestinationProcessedNoncesNeverDecrease() public view {
+        assertGe(borrowingController.lastProcessedNonce(handler.posA()), handler.ghostMaxDestNonce(0));
+        assertGe(borrowingController.lastProcessedNonce(handler.posB()), handler.ghostMaxDestNonce(1));
+    }
+
+    function invariant_RetryCountNeverExceedsThree() public view {
+        (,,, uint8 retriesA,) = reactiveContract.getLatestCallback(handler.posA());
+        (,,, uint8 retriesB,) = reactiveContract.getLatestCallback(handler.posB());
+        (,,, uint8 defRetriesA,) = deferredReactive.getLatestCallback(handler.posA());
+        (,,, uint8 defRetriesB,) = deferredReactive.getLatestCallback(handler.posB());
+        assertLe(retriesA, 3);
+        assertLe(retriesB, 3);
+        assertLe(defRetriesA, 3);
+        assertLe(defRetriesB, 3);
+    }
+
+    function invariant_PendingAndRequestedNeverConfused() public view {
+        assertFalse(handler.ghostConfusedPendingRetrySucceeded());
+    }
+
+    function invariant_PositionIsolationPreserved() public view {
+        assertFalse(handler.ghostIsolationViolated());
+    }
+
+    function invariant_NoDuplicateOrStaleDestinationApplication() public view {
+        assertEq(handler.ghostUnexpectedSuccessCount(), 0);
     }
 }
