@@ -24,6 +24,7 @@ interface IBorrowingController {
     function borrow(bytes32 positionId, uint256 amount) external;
     function isBorrowingPaused(bytes32 positionId) external view returns (bool);
     function pausedByRiskBreach(bytes32 positionId) external view returns (bool);
+    function pausedByAdmin(bytes32 positionId) external view returns (bool);
     function lastProcessedNonce(bytes32 positionId) external view returns (uint256);
     function lastRiskBreachTimestamp(bytes32 positionId) external view returns (uint256);
     function positionOwners(bytes32 positionId) external view returns (address);

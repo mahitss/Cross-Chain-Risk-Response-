@@ -22,7 +22,13 @@ contract MockOmniSystemContract is ISystemContract {
     Subscription[] public subscriptions;
     CallbackConfiguration_V_1_0[] public requestedCallbacks;
 
-    event CallbackRequestedV1(uint256 indexed chainId, address indexed recipient, uint64 gasLimit, bytes payload);
+    event CallbackRequest(
+        uint256 indexed chainId,
+        address indexed sender,
+        address indexed recipient,
+        CallbackVersion version,
+        bytes configuration
+    );
 
     function subscribe(
         uint256 chain_id,
@@ -68,15 +74,15 @@ contract MockOmniSystemContract is ISystemContract {
         revert("MockOmniSystemContract: subscription not found");
     }
 
-    function requestCallback(CallbackVersion, bytes memory config_) external override {
+    function requestCallback(CallbackVersion version_, bytes memory config_) external override {
         CallbackConfiguration_V_1_0 memory cfg = abi.decode(config_, (CallbackConfiguration_V_1_0));
         requestedCallbacks.push(cfg);
-        emit CallbackRequestedV1(cfg.chainId, cfg.recipient, cfg.gasLimit, cfg.payload);
+        emit CallbackRequest(cfg.chainId, msg.sender, cfg.recipient, version_, config_);
     }
 
-    function requestCallbackV_1_0(CallbackConfiguration_V_1_0 memory config_) external override {
+    function requestCallbackV_1_0(CallbackConfiguration_V_1_0 memory config_) external virtual override {
         requestedCallbacks.push(config_);
-        emit CallbackRequestedV1(config_.chainId, config_.recipient, config_.gasLimit, config_.payload);
+        emit CallbackRequest(config_.chainId, msg.sender, config_.recipient, CallbackVersion.V_1_0, abi.encode(config_));
     }
 
     function requestedCallbackCount() external view returns (uint256) {

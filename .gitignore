@@ -11,10 +11,18 @@ out/
 /broadcast/*/31337/
 /broadcast/**/dry-run/
 
+# Python cache
+__pycache__/
+*.py[cod]
+
 # Docs (unignore tracked documentation reports)
 docs/*
+!docs/operations/
+!docs/operations/**
 !docs/reports/
 !docs/reports/**
+!docs/security/
+!docs/security/**
 
 # Dotenv file
 .env

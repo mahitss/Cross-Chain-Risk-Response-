@@ -33,3 +33,11 @@ jobs:
 
       - name: Run Forge tests
         run: forge test -vvv
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Operational Health Check Unit Tests
+        run: python -m unittest discover -s test/ops -p "test_*.py"

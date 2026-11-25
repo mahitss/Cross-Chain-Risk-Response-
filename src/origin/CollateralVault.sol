@@ -16,6 +16,7 @@ import {IRiskController} from "../interfaces/IRiskController.sol";
 contract CollateralVault is ICollateralVault, Ownable {
     error ZeroAmount();
     error ZeroAddress();
+    error InvalidPositionId();
     error UnauthorizedUser(address caller, address positionOwner);
     error PositionNotInitialized();
     error AssetMismatch(address provided, address expected);
@@ -32,10 +33,10 @@ contract CollateralVault is ICollateralVault, Ownable {
     }
 
     event ValuationSourceUpdated(address indexed oldOracle, address indexed newOracle);
-    event RiskControllerUpdated(address indexed oldController, address indexed newController);
 
     ITestValuationSource public valuationSource;
-    IRiskController public riskController;
+    /// @notice Authoritative risk controller, configured immutably at deployment to preserve breach state continuity.
+    IRiskController public immutable riskController;
 
     mapping(bytes32 => Position) private _positions;
     mapping(bytes32 => address) public override positionCollateralAsset;
@@ -57,17 +58,10 @@ contract CollateralVault is ICollateralVault, Ownable {
         emit ValuationSourceUpdated(oldOracle, _newOracle);
     }
 
-    /// @notice Updates the risk controller address.
-    function setRiskController(address _newController) external onlyOwner {
-        if (_newController == address(0)) revert ZeroAddress();
-        address oldController = address(riskController);
-        riskController = IRiskController(_newController);
-        emit RiskControllerUpdated(oldController, _newController);
-    }
-
     /// @notice Deposits collateral into a position.
     /// @dev Enforces exactly one collateral asset per position for MVP.
     function depositCollateral(bytes32 positionId, address asset, uint256 amount) external override {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         if (amount == 0) revert ZeroAmount();
         if (asset == address(0)) revert ZeroAddress();
 
@@ -94,6 +88,7 @@ contract CollateralVault is ICollateralVault, Ownable {
     /// @dev Rejects debt increases if position has zero collateral, is already breached,
     ///      or if the projected borrow would exceed the risk threshold.
     function recordBorrow(bytes32 positionId, address asset, uint256 amount) external override {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         if (amount == 0) revert ZeroAmount();
         if (asset == address(0)) revert ZeroAddress();
 
@@ -147,6 +142,7 @@ contract CollateralVault is ICollateralVault, Ownable {
         override
         returns (bool isBreached, uint256 ltvBps, uint256 nonce)
     {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         Position storage pos = _positions[positionId];
         if (pos.user == address(0)) revert PositionNotInitialized();
 

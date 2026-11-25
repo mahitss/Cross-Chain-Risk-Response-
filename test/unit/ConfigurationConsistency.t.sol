@@ -21,8 +21,8 @@ contract ConfigurationConsistencyTest is Test {
     address destCallback = address(0x22);
     address stranger = address(0x99);
 
-    uint256 constant ORIGIN_CHAIN_ID = 84532;
-    uint256 constant DEST_CHAIN_ID = 1301;
+    uint256 constant ORIGIN_CHAIN_ID = 84532; // Base Sepolia
+    uint256 constant DEST_CHAIN_ID = 1301; // Unichain Sepolia
     uint64 constant GAS_LIMIT = 300_000;
     bytes32 positionId = keccak256("position-config-1");
     address user = address(0x5555);
@@ -51,10 +51,8 @@ contract ConfigurationConsistencyTest is Test {
 
     function testAuthoritativeOriginBreachDispatchedWithoutSecondaryFilterSuppression() public {
         // Origin threshold: 8,000 BPS.
-        // Previously, if Reactive had an independent 9,000 BPS threshold,
-        // a breach at 8,500 BPS was suppressed.
-        // Under M003.3 single authoritative policy: a valid origin breach at 8,500 BPS
-        // MUST dispatch the destination callback.
+        // Under M003.3/M003.4 single authoritative policy: a valid origin breach at 8,500 BPS
+        // MUST dispatch the destination callback without secondary threshold suppression.
 
         // Collateral = $10,000 (10000e8), Debt = $8,500 (8500e8) -> LTV = 8500 bps (85%)
         vm.prank(authorizedVault);
@@ -113,10 +111,13 @@ contract ConfigurationConsistencyTest is Test {
         vm.stopPrank();
     }
 
-    function testDestinationConfigRejectsZeroChainId() public {
+    function testDestinationConfigRejectsUnsupportedChainId() public {
         vm.startPrank(owner);
-        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.InvalidChainId.selector, 0));
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.UnsupportedChainId.selector, 0));
         reactiveContract.setDestinationConfig(0, destCallback, GAS_LIMIT);
+
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.UnsupportedChainId.selector, 11155111));
+        reactiveContract.setDestinationConfig(11155111, destCallback, GAS_LIMIT);
         vm.stopPrank();
     }
 
@@ -125,6 +126,20 @@ contract ConfigurationConsistencyTest is Test {
         vm.expectRevert(CrossGuardReactive.ZeroAddress.selector);
         reactiveContract.setDestinationConfig(DEST_CHAIN_ID, address(0), GAS_LIMIT);
         vm.stopPrank();
+    }
+
+    function testConstructorRejectsUnsupportedChains() public {
+        // Origin must be Base Sepolia (84532)
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.UnsupportedChainId.selector, 1));
+        new CrossGuardReactive(
+            owner, address(mockSystem), 1, address(riskController), DEST_CHAIN_ID, destCallback, GAS_LIMIT
+        );
+
+        // Destination must be Unichain Sepolia (1301)
+        vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.UnsupportedChainId.selector, 11155111));
+        new CrossGuardReactive(
+            owner, address(mockSystem), ORIGIN_CHAIN_ID, address(riskController), 11155111, destCallback, GAS_LIMIT
+        );
     }
 
     function testUnauthorizedConfigChangesRevert() public {

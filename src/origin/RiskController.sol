@@ -19,6 +19,7 @@ import {IRiskController} from "../interfaces/IRiskController.sol";
 ///      - Unrepresentable quotients (> type(uint256).max) deterministically return type(uint256).max.
 contract RiskController is IRiskController, Ownable {
     error ZeroAddress();
+    error InvalidPositionId();
     error UnauthorizedVault(address caller);
     error InvalidThreshold(uint256 thresholdBps);
 
@@ -103,13 +104,20 @@ contract RiskController is IRiskController, Ownable {
         onlyAuthorizedVault
         returns (bool isBreached, uint256 currentLtvBps, uint256 nonce)
     {
+        if (positionId == bytes32(0)) revert InvalidPositionId();
         currentLtvBps = calculateLtvBps(collateralValueUsd, debtValueUsd);
 
         if (currentLtvBps >= riskThresholdBps) {
             isBreached = true;
-            isPositionBreached[positionId] = true;
-            nonce = ++positionNonce[positionId];
-            emit RiskBreach(positionId, user, nonce, currentLtvBps, riskThresholdBps, block.timestamp);
+            if (!isPositionBreached[positionId]) {
+                // State Transition: Healthy -> Breached
+                isPositionBreached[positionId] = true;
+                nonce = ++positionNonce[positionId];
+                emit RiskBreach(positionId, user, nonce, currentLtvBps, riskThresholdBps, block.timestamp);
+            } else {
+                // Idempotent: Position remains breached; do not increment nonce or emit redundant event
+                nonce = positionNonce[positionId];
+            }
         } else {
             isBreached = false;
             if (isPositionBreached[positionId]) {
@@ -118,6 +126,7 @@ contract RiskController is IRiskController, Ownable {
                 nonce = ++positionNonce[positionId];
                 emit RiskResolved(positionId, user, nonce, currentLtvBps, riskThresholdBps, block.timestamp);
             } else {
+                // Idempotent: Position remains healthy; do not increment nonce or emit redundant event
                 nonce = positionNonce[positionId];
             }
         }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity >=0.8.20;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {RiskController} from "../../src/origin/RiskController.sol";
 import {IRiskController} from "../../src/interfaces/IRiskController.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -48,11 +48,11 @@ contract RiskControllerTest is Test {
         assertEq(nonce, 1);
         assertEq(controller.positionNonce(positionId), 1);
 
-        // Subsequent breach on same position increments nonce monotonically to 2
+        // Subsequent breach on same position does not increment nonce (Idempotency)
         vm.prank(vault);
         (,, uint256 nonce2) = controller.assessRisk(positionId, user, 10_000e8, 9_000e8);
-        assertEq(nonce2, 2);
-        assertEq(controller.positionNonce(positionId), 2);
+        assertEq(nonce2, 1);
+        assertEq(controller.positionNonce(positionId), 1);
     }
 
     function testAssessRiskZeroCollateralWithDebt() public {
@@ -199,16 +199,107 @@ contract RiskControllerTest is Test {
         vm.stopPrank();
     }
 
-    function testRepeatedBreachAssessmentsIncrementNonceMonotonically() public {
+    function testRepeatedBreachAssessmentsDoNotIncrementNonceOrEmitEvents() public {
         vm.startPrank(vault);
-        for (uint256 i = 1; i <= 5; i++) {
-            (bool isBreached, uint256 ltv, uint256 nonce) = controller.assessRisk(positionId, user, 10_000e8, 8_500e8);
-            assertTrue(isBreached);
-            assertEq(ltv, 8500);
-            assertEq(nonce, i);
-            assertEq(controller.positionNonce(positionId), i);
+        // First breach increments nonce to 1
+        vm.expectEmit(true, true, true, true);
+        emit IRiskController.RiskBreach(positionId, user, 1, 8500, 8000, block.timestamp);
+        (bool isBreached, uint256 ltv, uint256 nonce) = controller.assessRisk(positionId, user, 10_000e8, 8_500e8);
+        assertTrue(isBreached);
+        assertEq(ltv, 8500);
+        assertEq(nonce, 1);
+        assertEq(controller.positionNonce(positionId), 1);
+
+        // Repeated 5 evaluations while breached: nonce remains 1 and NO events are emitted
+        vm.recordLogs();
+        for (uint256 i = 0; i < 5; i++) {
+            (bool stillBreached,, uint256 repeatNonce) =
+                controller.assessRisk(positionId, user, 10_000e8, 8_500e8 + i * 100e8);
+            assertTrue(stillBreached);
+            assertEq(repeatNonce, 1);
+            assertEq(controller.positionNonce(positionId), 1);
         }
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        assertEq(entries.length, 0, "No RiskBreach events should be emitted during repeated breached assessments");
         vm.stopPrank();
+    }
+
+    function testLaterNewBreachIncrementsNonceAgain() public {
+        vm.startPrank(vault);
+        // Step 1: First breach -> nonce 1
+        controller.assessRisk(positionId, user, 10_000e8, 8_500e8);
+        assertEq(controller.positionNonce(positionId), 1);
+        assertTrue(controller.isPositionBreached(positionId));
+
+        // Step 2: Recovery to healthy -> nonce 2
+        controller.assessRisk(positionId, user, 20_000e8, 8_500e8);
+        assertEq(controller.positionNonce(positionId), 2);
+        assertFalse(controller.isPositionBreached(positionId));
+
+        // Step 3: Repeated healthy -> nonce remains 2
+        controller.assessRisk(positionId, user, 20_000e8, 8_500e8);
+        assertEq(controller.positionNonce(positionId), 2);
+
+        // Step 4: Second breach -> transitions to breached, increments nonce to 3
+        vm.expectEmit(true, true, true, true);
+        emit IRiskController.RiskBreach(positionId, user, 3, 8500, 8000, block.timestamp);
+        (bool breachedAgain,, uint256 nonce3) = controller.assessRisk(positionId, user, 10_000e8, 8_500e8);
+        assertTrue(breachedAgain);
+        assertEq(nonce3, 3);
+        assertEq(controller.positionNonce(positionId), 3);
+        assertTrue(controller.isPositionBreached(positionId));
+        vm.stopPrank();
+    }
+
+    function testSeparatePositionsMaintainSeparateNonceSequences() public {
+        bytes32 posA = keccak256("pos-A");
+        bytes32 posB = keccak256("pos-B");
+        address userB = address(0xEE);
+
+        vm.startPrank(vault);
+        // Position A breaches -> nonce 1
+        (,, uint256 nonceA1) = controller.assessRisk(posA, user, 10_000e8, 8_500e8);
+        assertEq(nonceA1, 1);
+        assertEq(controller.positionNonce(posA), 1);
+        assertEq(controller.positionNonce(posB), 0);
+
+        // Repeated A breach -> nonce stays 1
+        (,, uint256 nonceA1_rep) = controller.assessRisk(posA, user, 10_000e8, 9_000e8);
+        assertEq(nonceA1_rep, 1);
+
+        // Position B breaches -> nonce 1 for B, independent of A
+        (,, uint256 nonceB1) = controller.assessRisk(posB, userB, 10_000e8, 8_500e8);
+        assertEq(nonceB1, 1);
+        assertEq(controller.positionNonce(posB), 1);
+        assertEq(controller.positionNonce(posA), 1);
+
+        // Position A recovers -> nonce 2 for A
+        (,, uint256 nonceA2) = controller.assessRisk(posA, user, 20_000e8, 8_500e8);
+        assertEq(nonceA2, 2);
+        assertEq(controller.positionNonce(posA), 2);
+        assertEq(controller.positionNonce(posB), 1);
+        vm.stopPrank();
+    }
+
+    function testRiskThresholdUpdateRespectedAtNextEvaluation() public {
+        vm.prank(vault);
+        // LTV = 75% (7500 bps) < 8000 bps initial threshold -> Healthy (nonce 0)
+        (bool breached1,, uint256 nonce1) = controller.assessRisk(positionId, user, 10_000e8, 7_500e8);
+        assertFalse(breached1);
+        assertEq(nonce1, 0);
+
+        // Owner lowers risk threshold to 7000 bps (70%)
+        vm.prank(owner);
+        controller.setRiskThreshold(7000);
+
+        // Next evaluation with same collateral/debt now breaches (7500 >= 7000)
+        vm.prank(vault);
+        vm.expectEmit(true, true, true, true);
+        emit IRiskController.RiskBreach(positionId, user, 1, 7500, 7000, block.timestamp);
+        (bool breached2,, uint256 nonce2) = controller.assessRisk(positionId, user, 10_000e8, 7_500e8);
+        assertTrue(breached2);
+        assertEq(nonce2, 1);
+        assertEq(controller.positionNonce(positionId), 1);
     }
 
     function testRecoveryLifecycleFromBreachedToHealthyEmitsRiskResolved() public {
@@ -247,5 +338,11 @@ contract RiskControllerTest is Test {
         } else if (col == 0) {
             assertEq(ltv, 10_000);
         }
+    }
+
+    function testRevertAssessRiskZeroPositionId() public {
+        vm.prank(vault);
+        vm.expectRevert(RiskController.InvalidPositionId.selector);
+        controller.assessRisk(bytes32(0), user, 10_000e8, 5000e8);
     }
 }

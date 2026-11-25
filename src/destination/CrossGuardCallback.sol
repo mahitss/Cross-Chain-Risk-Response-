@@ -11,6 +11,7 @@ import {ICrossGuardCallback} from "../interfaces/ICrossGuardCallback.sol";
 ///         Enforces dual-layer authentication: official Callback Proxy sender check and authenticated ReactVM ID check.
 contract CrossGuardCallback is ICrossGuardCallback, AbstractCallback, Ownable {
     error ZeroAddress();
+    error InvalidPositionId();
     error UnauthorizedReactiveSender(address receivedSender, address expectedSender);
     error UnauthorizedRvmSender(address receivedSender, address expectedSender);
     error UnconfiguredReactiveSender();
@@ -66,6 +67,9 @@ contract CrossGuardCallback is ICrossGuardCallback, AbstractCallback, Ownable {
         uint256 riskLevel,
         uint256 timestamp
     ) external override authorizedSenderOnly {
+        if (positionId == bytes32(0)) {
+            revert InvalidPositionId();
+        }
         if (authorizedReactiveSender == address(0)) {
             revert UnconfiguredReactiveSender();
         }
@@ -85,6 +89,9 @@ contract CrossGuardCallback is ICrossGuardCallback, AbstractCallback, Ownable {
         uint256 riskLevel,
         uint256 timestamp
     ) external override authorizedSenderOnly {
+        if (positionId == bytes32(0)) {
+            revert InvalidPositionId();
+        }
         if (authorizedReactiveSender == address(0)) {
             revert UnconfiguredReactiveSender();
         }

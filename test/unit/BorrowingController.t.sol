@@ -209,11 +209,13 @@ contract BorrowingControllerTest is Test {
         vm.stopPrank();
     }
 
-    function testRevertResolveBorrowingWhenNotPaused() public {
-        // Attempting to resolve when not paused must revert
+    function testResolveBorrowingWhenNotPausedSucceedsAndSetsNonce() public {
+        // Safe out-of-order resolution arrival when not paused succeeds and updates nonce
         vm.prank(callbackAdapter);
-        vm.expectRevert(abi.encodeWithSelector(BorrowingController.PositionNotPaused.selector, positionId));
         controller.resolveBorrowing(positionId, 1, 4500, 2000);
+        assertEq(controller.lastProcessedNonce(positionId), 1);
+        assertFalse(controller.isBorrowingPaused(positionId));
+        assertFalse(controller.pausedByRiskBreach(positionId));
     }
 
     function testEmergencyResumeWithAuditReason() public {
@@ -263,5 +265,47 @@ contract BorrowingControllerTest is Test {
         vm.prank(impostor);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, impostor));
         controller.emergencyResumeBorrowing(positionId, "Unauthorized call");
+    }
+
+    function testRevertWhenZeroPositionIdUsed() public {
+        // User registration reverts with InvalidPositionId
+        vm.prank(borrower);
+        vm.expectRevert(BorrowingController.InvalidPositionId.selector);
+        controller.registerPosition(bytes32(0));
+
+        // Admin registration reverts with InvalidPositionId
+        vm.prank(owner);
+        vm.expectRevert(BorrowingController.InvalidPositionId.selector);
+        controller.registerPositionFor(bytes32(0), borrower);
+
+        // Borrow reverts with InvalidPositionId
+        vm.prank(borrower);
+        vm.expectRevert(BorrowingController.InvalidPositionId.selector);
+        controller.borrow(bytes32(0), 100e18);
+
+        // Callback pause reverts with InvalidPositionId
+        vm.prank(callbackAdapter);
+        vm.expectRevert(BorrowingController.InvalidPositionId.selector);
+        controller.pauseBorrowing(bytes32(0), 1, 8500, 1000);
+
+        // Callback resolve reverts with InvalidPositionId
+        vm.prank(callbackAdapter);
+        vm.expectRevert(BorrowingController.InvalidPositionId.selector);
+        controller.resolveBorrowing(bytes32(0), 1, 5000, 1000);
+
+        // Emergency pause reverts with InvalidPositionId
+        vm.prank(owner);
+        vm.expectRevert(BorrowingController.InvalidPositionId.selector);
+        controller.emergencyPauseBorrowing(bytes32(0));
+
+        // Resume borrowing reverts with InvalidPositionId
+        vm.prank(owner);
+        vm.expectRevert(BorrowingController.InvalidPositionId.selector);
+        controller.resumeBorrowing(bytes32(0));
+
+        // Emergency resume reverts with InvalidPositionId
+        vm.prank(owner);
+        vm.expectRevert(BorrowingController.InvalidPositionId.selector);
+        controller.emergencyResumeBorrowing(bytes32(0), "Valid justification");
     }
 }
