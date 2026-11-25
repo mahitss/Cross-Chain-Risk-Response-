@@ -324,26 +324,39 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
     # 2. Try parsing raw ABI-encoded hex response
     if s.startswith("0x"):
         try:
-            raw_bytes = bytes.fromhex(s[2:])
-            if len(raw_bytes) < 64:
-                return None, "Hex response too short for dynamic ABI array"
+            hex_body = s[2:]
+            if len(hex_body) % 2 != 0 or not all(c in "0123456789abcdefABCDEF" for c in hex_body):
+                return None, "Malformed hex characters or odd length in callback records"
+            raw_bytes = bytes.fromhex(hex_body)
+            if len(raw_bytes) < 64 or len(raw_bytes) % 32 != 0:
+                return None, "Hex response too short or unaligned for dynamic ABI array"
             arr_offset = int.from_bytes(raw_bytes[:32], "big")
-            if arr_offset >= len(raw_bytes):
-                return None, f"Invalid array offset {arr_offset}"
-            arr_len = int.from_bytes(raw_bytes[arr_offset:arr_offset+32], "big")
+            if arr_offset != 32:
+                return None, f"Non-canonical array offset {arr_offset} (expected 32)"
+            arr_len = int.from_bytes(raw_bytes[32:64], "big")
             if arr_len == 0:
+                if len(raw_bytes) != 64:
+                    return None, f"Unexpected trailing bytes after empty callback array ({len(raw_bytes)} bytes != 64)"
                 return [], None
 
-            elements_start = arr_offset + 32
+            elements_start = 64
+            if arr_len > (len(raw_bytes) - elements_start) // 256:
+                return None, f"Truncated or overflowing callback array length {arr_len}"
+
             records = []
+            expected_rel_offset = arr_len * 32
             for i in range(arr_len):
                 elem_offset_loc = elements_start + i * 32
                 if elem_offset_loc + 32 > len(raw_bytes):
                     return None, f"Truncated element offset pointer at index {i}"
                 elem_offset = int.from_bytes(raw_bytes[elem_offset_loc:elem_offset_loc+32], "big")
+                if elem_offset < arr_len * 32:
+                    return None, f"Element offset {elem_offset} at index {i} points into array offset table"
+                if elem_offset != expected_rel_offset:
+                    return None, f"Non-canonical or overlapping element offset {elem_offset} at index {i} (expected {expected_rel_offset})"
                 tuple_start = elements_start + elem_offset
-                if tuple_start + 192 > len(raw_bytes):
-                    return None, f"Truncated tuple head at index {i}"
+                if tuple_start + 224 > len(raw_bytes):
+                    return None, f"Truncated tuple head/error length at index {i}"
 
                 block_number = int.from_bytes(raw_bytes[tuple_start:tuple_start+32], "big")
                 reactive_contract = decode_address_strict(
@@ -354,14 +367,21 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
                 dest_chain_id = int.from_bytes(raw_bytes[tuple_start+96:tuple_start+128], "big")
                 dest_tx_hash = int.from_bytes(raw_bytes[tuple_start+128:tuple_start+160], "big")
                 bytes_offset = int.from_bytes(raw_bytes[tuple_start+160:tuple_start+192], "big")
+                if bytes_offset != 192:
+                    return None, f"Non-canonical or head-aliasing error bytes offset {bytes_offset} at index {i} (expected 192)"
 
                 bytes_start = tuple_start + bytes_offset
-                if bytes_start + 32 > len(raw_bytes):
-                    return None, f"Truncated error bytes length at index {i}"
                 bytes_len = int.from_bytes(raw_bytes[bytes_start:bytes_start+32], "big")
                 data_start = bytes_start + 32
-                if data_start + bytes_len > len(raw_bytes):
+                available_tail = len(raw_bytes) - data_start
+                if bytes_len > available_tail:
                     return None, f"Truncated error bytes payload at index {i}"
+                err_padded_len = ((bytes_len + 31) // 32) * 32
+                if data_start + err_padded_len > len(raw_bytes):
+                    return None, f"Truncated error bytes padding at index {i}"
+                err_pad = raw_bytes[data_start + bytes_len : data_start + err_padded_len]
+                if err_pad != b"\x00" * len(err_pad):
+                    return None, f"Non-zero error bytes padding at index {i}"
 
                 err_data = raw_bytes[data_start:data_start+bytes_len]
                 err_hex = "0x" + err_data.hex()
@@ -382,6 +402,10 @@ def decode_callback_records(raw_data: str) -> Tuple[Optional[List[Dict[str, Any]
                     "success": is_success,
                     "is_pending": is_pending,
                 })
+                expected_rel_offset += 224 + err_padded_len
+
+            if elements_start + expected_rel_offset != len(raw_bytes):
+                return None, f"Unexpected trailing bytes after callback records array (expected {elements_start + expected_rel_offset}, got {len(raw_bytes)})"
             return records, None
         except Exception as e:
             return None, f"Hex ABI decoding error: {str(e)}"
@@ -1562,17 +1586,23 @@ def encode_callback_request_data(
 
 def decode_callback_request_data_strict(raw_data: Any) -> Dict[str, Any]:
     """
-    Strictly decodes and validates CallbackRequest non-indexed ABI data:
-      (CallbackVersion version, bytes configuration)
-    where version == 0 (V_1_0) and configuration decodes as CallbackConfiguration_V_1_0:
+    Strictly decodes and validates canonical CallbackRequest non-indexed ABI data:
+      abi.encode(CallbackVersion version, bytes configuration)
+    where version == 0 (V_1_0) and configuration == abi.encode(CallbackConfiguration_V_1_0):
       (uint256 chainId, address recipient, uint64 gasLimit, bytes payload).
-    Raises ValueError on missing, truncated, malformed, or unsupported version/config data.
+
+    Enforces canonical Solidity ABI layout:
+      - Exact outer bytes offset (64), 32-byte padded extent, zero outer padding, zero trailing bytes.
+      - Exact inner tuple offset (32) and payload offset (128), zero inner padding, zero trailing bytes.
+      - Valid uint8 version, clean 20-byte address upper bits, uint64 gasLimit, non-empty payload.
+    Raises ValueError on missing, truncated, non-canonical, overlapping, trailing, or malformed data.
     """
     norm_hex = decode_bytes_strict(raw_data, "CallbackRequest.data")
     raw_bytes = bytes.fromhex(norm_hex[2:])
     if len(raw_bytes) < 96:
         raise ValueError(f"CallbackRequest.data missing or too short ({len(raw_bytes)} bytes < 96)")
 
+    # 1. Event version word must be canonical ABI uint8
     version_word = raw_bytes[0:32]
     if version_word[:31] != b"\x00" * 31:
         raise ValueError("Dirty upper bits in CallbackRequest.version")
@@ -1580,23 +1610,56 @@ def decode_callback_request_data_strict(raw_data: Any) -> Dict[str, Any]:
     if version not in SUPPORTED_CALLBACK_VERSIONS:
         raise ValueError(f"Unsupported CallbackVersion {version} in CallbackRequest (only V_1_0=0 supported)")
 
+    # 2 & 11. Outer configuration bytes offset must be exact canonical offset 64
     cfg_offset = int.from_bytes(raw_bytes[32:64], "big")
-    if cfg_offset < 64 or cfg_offset + 32 > len(raw_bytes):
-        raise ValueError(f"Invalid configuration bytes offset {cfg_offset} in CallbackRequest.data")
-    cfg_len = int.from_bytes(raw_bytes[cfg_offset : cfg_offset + 32], "big")
-    cfg_start = cfg_offset + 32
-    if cfg_len < 192 or cfg_start + cfg_len > len(raw_bytes):
-        raise ValueError(f"Invalid or truncated CallbackConfiguration length ({cfg_len}) in CallbackRequest.data")
+    if cfg_offset < 64:
+        raise ValueError(
+            f"Invalid configuration bytes offset {cfg_offset} in CallbackRequest.data: points into outer head (< 64)"
+        )
+    if cfg_offset != 64:
+        raise ValueError(
+            f"Non-canonical configuration bytes offset {cfg_offset} in CallbackRequest.data: expected exact offset 64"
+        )
+
+    # 3, 4, 5, 10. Configuration length, 32-byte padded extent, zero padding, and no trailing bytes
+    cfg_start = cfg_offset + 32  # 96
+    cfg_len = int.from_bytes(raw_bytes[cfg_offset:cfg_start], "big")
+    available_outer = len(raw_bytes) - cfg_start
+    if cfg_len > available_outer:
+        raise ValueError(
+            f"Truncated or overflowing CallbackConfiguration length ({cfg_len} > available {available_outer}) in CallbackRequest.data"
+        )
+    cfg_padded_len = ((cfg_len + 31) // 32) * 32
+    if cfg_start + cfg_padded_len > len(raw_bytes):
+        raise ValueError(
+            f"Truncated outer dynamic-byte padding in CallbackRequest.data (expected {cfg_start + cfg_padded_len} bytes, got {len(raw_bytes)})"
+        )
+    outer_pad = raw_bytes[cfg_start + cfg_len : cfg_start + cfg_padded_len]
+    if outer_pad != b"\x00" * len(outer_pad):
+        raise ValueError("Non-zero outer dynamic-byte padding in CallbackRequest.data")
+    if len(raw_bytes) != cfg_start + cfg_padded_len:
+        raise ValueError(
+            f"Unexpected trailing bytes in CallbackRequest.data (expected {cfg_start + cfg_padded_len} bytes, got {len(raw_bytes)})"
+        )
+    if cfg_len < 192:
+        raise ValueError(
+            f"Invalid or truncated CallbackConfiguration length ({cfg_len} < 192) in CallbackRequest.data"
+        )
+
     cfg_bytes = raw_bytes[cfg_start : cfg_start + cfg_len]
 
+    # 6 & 11. Inner configuration wrapper offset from abi.encode(CallbackConfiguration_V_1_0) must be exact 32
     tuple_offset = int.from_bytes(cfg_bytes[0:32], "big")
     if tuple_offset != 32:
-        raise ValueError(f"Invalid outer tuple offset ({tuple_offset}) in CallbackConfiguration_V_1_0")
+        raise ValueError(
+            f"Non-canonical outer tuple offset ({tuple_offset}) in CallbackConfiguration_V_1_0: expected 32"
+        )
 
     t_start = 32
-    if t_start + 160 > len(cfg_bytes):
+    if t_start + 128 > len(cfg_bytes):
         raise ValueError("Truncated CallbackConfiguration_V_1_0 tuple body")
 
+    # 13. Static struct fields with strict ABI bounds
     cfg_chain_id = int.from_bytes(cfg_bytes[t_start : t_start + 32], "big")
     cfg_recipient = decode_address_strict(
         "0x" + cfg_bytes[t_start + 32 : t_start + 64].hex(), "CallbackConfiguration.recipient"
@@ -1605,13 +1668,43 @@ def decode_callback_request_data_strict(raw_data: Any) -> Dict[str, Any]:
     if cfg_gas_limit > UINT64_MAX:
         raise ValueError(f"CallbackConfiguration.gasLimit ({cfg_gas_limit}) overflows uint64")
 
+    # 7, 11, 12. Payload offset inside CallbackConfiguration_V_1_0 must be exact canonical offset 128 (relative to t_start)
     payload_offset = int.from_bytes(cfg_bytes[t_start + 96 : t_start + 128], "big")
-    if payload_offset < 128 or t_start + payload_offset + 32 > len(cfg_bytes):
-        raise ValueError(f"Invalid payload offset ({payload_offset}) in CallbackConfiguration_V_1_0")
-    payload_len = int.from_bytes(cfg_bytes[t_start + payload_offset : t_start + payload_offset + 32], "big")
-    payload_start = t_start + payload_offset + 32
-    if payload_len == 0 or payload_start + payload_len > len(cfg_bytes):
-        raise ValueError(f"Missing or truncated payload in CallbackConfiguration_V_1_0 (len={payload_len})")
+    if payload_offset < 128:
+        raise ValueError(
+            f"Invalid payload offset ({payload_offset}) in CallbackConfiguration_V_1_0: points into tuple head (< 128)"
+        )
+    if payload_offset != 128:
+        raise ValueError(
+            f"Non-canonical payload offset ({payload_offset}) in CallbackConfiguration_V_1_0: expected canonical offset 128"
+        )
+
+    # 8, 9, 10. Payload length, padded extent, zero padding, and no trailing bytes inside configuration
+    payload_len_pos = t_start + payload_offset  # 160
+    if payload_len_pos + 32 > len(cfg_bytes):
+        raise ValueError("Truncated payload length word in CallbackConfiguration_V_1_0")
+    payload_len = int.from_bytes(cfg_bytes[payload_len_pos : payload_len_pos + 32], "big")
+    payload_start = payload_len_pos + 32  # 192
+    if payload_len == 0:
+        raise ValueError("Missing or empty payload in CallbackConfiguration_V_1_0 (len=0)")
+    available_cfg = len(cfg_bytes) - payload_start
+    if payload_len > available_cfg:
+        raise ValueError(
+            f"Truncated or overflowing payload in CallbackConfiguration_V_1_0 (len={payload_len} > available={available_cfg})"
+        )
+    payload_padded_len = ((payload_len + 31) // 32) * 32
+    if payload_start + payload_padded_len > len(cfg_bytes):
+        raise ValueError(
+            f"Truncated inner payload dynamic-byte padding in CallbackConfiguration_V_1_0 (expected {payload_start + payload_padded_len} bytes, got {len(cfg_bytes)})"
+        )
+    inner_pad = cfg_bytes[payload_start + payload_len : payload_start + payload_padded_len]
+    if inner_pad != b"\x00" * len(inner_pad):
+        raise ValueError("Non-zero inner payload dynamic-byte padding in CallbackConfiguration_V_1_0")
+    if len(cfg_bytes) != payload_start + payload_padded_len:
+        raise ValueError(
+            f"Unexpected trailing bytes inside CallbackConfiguration_V_1_0 (expected {payload_start + payload_padded_len} bytes, got {len(cfg_bytes)})"
+        )
+
     cfg_payload = "0x" + cfg_bytes[payload_start : payload_start + payload_len].hex()
 
     return {
@@ -2284,7 +2377,10 @@ def run_recovery_preflight(
                 "Verify Omni System Contract ABI.",
             )
         try:
-            req_chain_id = int(req_topics[1], 16)
+            norm_t1 = decode_bytes_strict(req_topics[1], "CallbackRequest.chainId")
+            if len(norm_t1) != 66:
+                raise ValueError(f"Expected 32-byte indexed chainId topic (66 chars), got '{req_topics[1]}'")
+            req_chain_id = int(norm_t1, 16)
             req_sender = decode_address_strict(req_topics[2], "CallbackRequest.sender")
             req_recipient = decode_address_strict(req_topics[3], "CallbackRequest.recipient")
         except Exception as e:

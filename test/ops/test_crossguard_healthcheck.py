@@ -2428,6 +2428,335 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         self.assertEqual(rep["status"], RecoveryStatus.RETRY_UNKNOWN.value)
         self.assertIn("exactly 4 topics", rep["reason"])
 
+    # =========================================================================
+    # M006.2.1 ADVERSARIAL TESTS — CANONICAL ABI & CALLBACK RECORD BOUNDARIES
+    # =========================================================================
+
+    def _build_canonical_raw_callback_request_bytes(self, payload_hex: str = "0x11223344", gas_limit: int = 300_000) -> bytearray:
+        cb_adapter = "0x3333333333333333333333333333333333333333"
+        encoded = encode_callback_request_data(1301, cb_adapter, gas_limit, payload_hex)
+        return bytearray(bytes.fromhex(encoded[2:]))
+
+    def _assert_malformed_callback_request_data(self, raw_data_hex: str, label: str, expected_substr: Optional[str] = None) -> None:
+        with self.subTest(case=label):
+            with self.assertRaises(ValueError) as ctx:
+                decode_callback_request_data_strict(raw_data_hex)
+            if expected_substr:
+                self.assertIn(expected_substr.lower(), str(ctx.exception).lower())
+
+            config = create_base_config()
+            pos_id = self._get_test_position_id()
+            tx_hash = self._get_test_tx_hash()
+            runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+            runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = raw_data_hex
+            rep = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+            self.assertEqual(rep["status"], RecoveryStatus.RETRY_UNKNOWN.value, f"Preflight must fail closed on {label}")
+            self.assertFalse(rep["safe_to_consider_recovery"], f"safe_to_consider_recovery must be False on {label}")
+
+    # 105. Canonical V1.0 Solidity fixture parity & payload boundary lengths (31, 32, 33, 63, 64, 65 bytes)
+    def test_105_canonical_callback_request_solidity_parity_and_boundary_lengths(self):
+        # Exact Solidity `cast abi-encode` vector for:
+        #   abi.encode(uint8(0), abi.encode(CallbackConfiguration_V_1_0(1301, 0x3333..., 300000, 0x11223344)))
+        solidity_cast_hex = (
+            "0x"
+            + "00" * 31 + "00"
+            + "00" * 31 + "40"
+            + "00" * 30 + "00e0"
+            + "00" * 31 + "20"
+            + "00" * 30 + "0515"
+            + "00" * 12 + "33" * 20
+            + "00" * 29 + "0493e0"
+            + "00" * 31 + "80"
+            + "00" * 31 + "04"
+            + "11223344" + "00" * 28
+        )
+        py_encoded = encode_callback_request_data(
+            1301, "0x3333333333333333333333333333333333333333", 300_000, "0x11223344"
+        )
+        self.assertEqual(py_encoded, solidity_cast_hex)
+        decoded_solidity = decode_callback_request_data_strict(solidity_cast_hex)
+        self.assertEqual(decoded_solidity["payload"], "0x11223344")
+
+        for length in (1, 4, 31, 32, 33, 63, 64, 65):
+            with self.subTest(payload_bytes=length):
+                payload_hex = "0x" + "".join(f"{(i * 17 + 3) % 256:02x}" for i in range(length))
+                encoded = encode_callback_request_data(
+                    1301, "0x3333333333333333333333333333333333333333", 300_000, payload_hex
+                )
+                decoded = decode_callback_request_data_strict(encoded)
+                self.assertEqual(decoded["version"], 0)
+                self.assertEqual(decoded["chain_id"], 1301)
+                self.assertEqual(decoded["recipient"], "0x3333333333333333333333333333333333333333")
+                self.assertEqual(decoded["gas_limit"], 300_000)
+                self.assertEqual(decoded["payload"], payload_hex)
+
+                # Confirm preflight accepts every valid boundary payload length cleanly
+                config = create_base_config()
+                pos_id = self._get_test_position_id()
+                tx_hash = self._get_test_tx_hash()
+                runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+                reactive = config["reactive_address"].lower()
+                runner.call_map[(reactive, "getLatestCallback(bytes32)", config["reactive_rpc"])] = (
+                    f"(1, 1, {payload_hex}, 0, 2)"
+                )
+                runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["data"] = encoded
+                rep = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+                self.assertEqual(rep["status"], RecoveryStatus.RETRY_ELIGIBLE.value)
+                self.assertTrue(rep["safe_to_consider_recovery"])
+
+    # 106. Padding & trailing-byte attacks on outer CallbackRequest.data and inner CallbackConfiguration
+    def test_106_callback_request_padding_and_trailing_byte_attacks(self):
+        # A. Non-zero outer dynamic-byte padding (unaligned cfg_len=225 with 31-byte tail, dirty byte 0xff)
+        base = self._build_canonical_raw_callback_request_bytes("0x11223344")
+        outer_dirty = bytearray(base)
+        outer_dirty[64:96] = (225).to_bytes(32, "big")
+        outer_dirty.extend(b"\x00" + b"\xff" + b"\x00" * 30)
+        self._assert_malformed_callback_request_data(
+            "0x" + outer_dirty.hex(), "non_zero_outer_padding", "Non-zero outer dynamic-byte padding"
+        )
+
+        # B. Truncated outer padding (cfg_len=225, outer ends at 321 bytes instead of padded 352)
+        outer_trunc = bytearray(base)
+        outer_trunc[64:96] = (225).to_bytes(32, "big")
+        outer_trunc.extend(b"\xaa")
+        self._assert_malformed_callback_request_data(
+            "0x" + outer_trunc.hex(), "truncated_outer_padding", "Truncated outer dynamic-byte padding"
+        )
+
+        # C. Non-zero inner payload padding (4-byte payload 0x11223344, flip byte at offset 196 within cfg -> byte 292 outer)
+        inner_dirty = bytearray(base)
+        inner_dirty[96 + 196] = 0x01
+        self._assert_malformed_callback_request_data(
+            "0x" + inner_dirty.hex(), "non_zero_inner_payload_padding", "Non-zero inner payload dynamic-byte padding"
+        )
+        # Also flip the very last byte of 31-byte payload padding (length 31 -> 1 padding byte at 192+31=223 -> outer 319)
+        base_31 = self._build_canonical_raw_callback_request_bytes("0x" + "aa" * 31)
+        inner_dirty_31 = bytearray(base_31)
+        inner_dirty_31[-1] = 0x80
+        self._assert_malformed_callback_request_data(
+            "0x" + inner_dirty_31.hex(), "non_zero_inner_padding_len31", "Non-zero inner payload dynamic-byte padding"
+        )
+
+        # D. Truncated inner padding (cfg_len=223 for 4-byte payload needing 224 inner bytes, padded with 1 zero byte outer)
+        inner_trunc = bytearray(base)
+        inner_trunc[64:96] = (223).to_bytes(32, "big")
+        self._assert_malformed_callback_request_data(
+            "0x" + inner_trunc.hex(), "truncated_inner_padding", "Truncated inner payload dynamic-byte padding"
+        )
+
+        # E. Trailing bytes after complete outer encoding (+1 byte and +32 zero bytes)
+        self._assert_malformed_callback_request_data(
+            "0x" + (base + b"\xaa").hex(), "trailing_1_byte_outer", "Unexpected trailing bytes in CallbackRequest.data"
+        )
+        self._assert_malformed_callback_request_data(
+            "0x" + (base + b"\x00" * 32).hex(), "trailing_32_zero_bytes_outer", "Unexpected trailing bytes in CallbackRequest.data"
+        )
+
+        # F. Trailing bytes inside encoded configuration (cfg_len=256 with extra 32 zero bytes, and unaligned cfg_len=225)
+        trailing_inner_word = bytearray(base[:64] + (256).to_bytes(32, "big") + base[96:] + b"\x00" * 32)
+        self._assert_malformed_callback_request_data(
+            "0x" + trailing_inner_word.hex(), "trailing_32_bytes_inside_config", "Unexpected trailing bytes inside CallbackConfiguration_V_1_0"
+        )
+        trailing_inner_unaligned = bytearray(base[:64] + (225).to_bytes(32, "big") + base[96:] + b"\x00" * 32)
+        self._assert_malformed_callback_request_data(
+            "0x" + trailing_inner_unaligned.hex(), "trailing_1_byte_inside_config_zero_padded", "Unexpected trailing bytes inside CallbackConfiguration_V_1_0"
+        )
+
+    # 107. Non-canonical offsets, head pointers, and overlapping/aliased dynamic regions
+    def test_107_callback_request_non_canonical_offsets_and_aliasing(self):
+        base = self._build_canonical_raw_callback_request_bytes("0x11223344")
+        cfg_bytes = base[96:]
+
+        # A. Non-canonical outer configuration offset (96 with 32-byte zero gap)
+        gapped_outer = base[0:32] + (96).to_bytes(32, "big") + b"\x00" * 32 + base[64:]
+        self._assert_malformed_callback_request_data(
+            "0x" + gapped_outer.hex(), "non_canonical_outer_offset_96", "Non-canonical configuration bytes offset 96"
+        )
+
+        # B. Outer configuration offset pointing into outer head / overlapping (0 and 32)
+        for bad_outer_off in (0, 32):
+            alias_outer = bytearray(base)
+            alias_outer[32:64] = bad_outer_off.to_bytes(32, "big")
+            self._assert_malformed_callback_request_data(
+                "0x" + alias_outer.hex(), f"outer_offset_into_head_{bad_outer_off}", "points into outer head"
+            )
+
+        # C. Non-canonical inner tuple offset (0 = self-alias, 64 = gap)
+        alias_tuple = bytearray(base)
+        alias_tuple[96:128] = (0).to_bytes(32, "big")
+        self._assert_malformed_callback_request_data(
+            "0x" + alias_tuple.hex(), "inner_tuple_offset_0_alias", "Non-canonical outer tuple offset"
+        )
+        gapped_tuple_cfg = (64).to_bytes(32, "big") + b"\x00" * 32 + cfg_bytes[32:]
+        gapped_tuple_outer = base[0:32] + (64).to_bytes(32, "big") + len(gapped_tuple_cfg).to_bytes(32, "big") + gapped_tuple_cfg
+        self._assert_malformed_callback_request_data(
+            "0x" + gapped_tuple_outer.hex(), "inner_tuple_offset_64_gap", "Non-canonical outer tuple offset"
+        )
+
+        # D. Non-canonical payload offset (160 with 32-byte zero gap before payload length)
+        gapped_payload_cfg = cfg_bytes[:128] + (160).to_bytes(32, "big") + b"\x00" * 32 + cfg_bytes[160:]
+        gapped_payload_outer = base[0:32] + (64).to_bytes(32, "big") + len(gapped_payload_cfg).to_bytes(32, "big") + gapped_payload_cfg
+        self._assert_malformed_callback_request_data(
+            "0x" + gapped_payload_outer.hex(), "non_canonical_payload_offset_160", "Non-canonical payload offset (160)"
+        )
+
+        # E. Payload offset pointing into tuple head / aliased header slots (0, 32, 64, 96)
+        for bad_pay_off in (0, 32, 64, 96):
+            alias_pay = bytearray(base)
+            alias_pay[96 + 128 : 96 + 160] = bad_pay_off.to_bytes(32, "big")
+            self._assert_malformed_callback_request_data(
+                "0x" + alias_pay.hex(), f"payload_offset_into_head_{bad_pay_off}", "points into tuple head"
+            )
+
+    # 108. Bounds & field validation: version dirty upper bits, dirty address bits, gasLimit > uint64, empty payload, uint256 boundaries
+    def test_108_callback_request_bounds_upper_bits_empty_payload_and_extremes(self):
+        base = self._build_canonical_raw_callback_request_bytes("0x11223344")
+
+        # A. Dirty upper bits in version word (low byte still 0)
+        dirty_ver = bytearray(base)
+        dirty_ver[0] = 0x01
+        self._assert_malformed_callback_request_data("0x" + dirty_ver.hex(), "dirty_version_upper_bits", "Dirty upper bits")
+
+        # B. Invalid version enum (1 and 255)
+        for bad_ver in (1, 255):
+            inv_ver = bytearray(base)
+            inv_ver[31] = bad_ver
+            self._assert_malformed_callback_request_data("0x" + inv_ver.hex(), f"unsupported_version_{bad_ver}", "Unsupported CallbackVersion")
+
+        # C. Dirty upper 12 bytes in CallbackConfiguration.recipient
+        dirty_addr = bytearray(base)
+        dirty_addr[96 + 64] = 0x01
+        self._assert_malformed_callback_request_data("0x" + dirty_addr.hex(), "dirty_config_recipient_upper_bits", "Dirty upper bits")
+
+        # D. gasLimit overflows uint64 (2**64 and dirty MSB)
+        for bad_gas in (2**64, 2**255):
+            overflow_gas = bytearray(base)
+            overflow_gas[96 + 96 : 96 + 128] = bad_gas.to_bytes(32, "big")
+            self._assert_malformed_callback_request_data("0x" + overflow_gas.hex(), f"gas_limit_overflow_{bad_gas}", "overflows uint64")
+
+        # E. Empty payload (payload_len = 0, padded 0 bytes)
+        empty_cfg = base[96:96 + 160] + (0).to_bytes(32, "big")
+        empty_pay_outer = base[0:32] + (64).to_bytes(32, "big") + len(empty_cfg).to_bytes(32, "big") + empty_cfg
+        self._assert_malformed_callback_request_data("0x" + empty_pay_outer.hex(), "empty_payload", "empty payload")
+
+        # F. Huge uint256 boundary lengths & offsets (must fail cleanly without OOM/hang)
+        for field_name, byte_slice, huge_val in [
+            ("huge_cfg_offset_max_uint256", (32, 64), 2**256 - 1),
+            ("huge_cfg_len_max_uint256", (64, 96), 2**256 - 1),
+            ("huge_cfg_len_2_64", (64, 96), 2**64),
+            ("huge_tuple_offset_max_uint256", (96, 128), 2**256 - 1),
+            ("huge_payload_offset_max_uint256", (96 + 128, 96 + 160), 2**256 - 1),
+            ("huge_payload_len_max_uint256", (96 + 160, 96 + 192), 2**256 - 1),
+            ("huge_payload_len_2_64", (96 + 160, 96 + 192), 2**64),
+        ]:
+            huge_buf = bytearray(base)
+            huge_buf[byte_slice[0] : byte_slice[1]] = huge_val.to_bytes(32, "big")
+            self._assert_malformed_callback_request_data("0x" + huge_buf.hex(), field_name)
+
+        # G. Dirty upper bits in indexed CallbackRequest topics[3] (recipient) & short topics[1]
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.receipts[(tx_hash.lower(), config["reactive_rpc"])]["logs"][1]["topics"][3] = (
+            "0x10" + "0" * 22 + config["callback_address"][2:].lower()
+        )
+        rep = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertFalse(rep["safe_to_consider_recovery"])
+
+    # 109. Parameterized adversarial property sweep across payload lengths 1..70 (mutations fail closed)
+    def test_109_parameterized_abi_mutation_sweep(self):
+        for plen in (1, 15, 31, 32, 33, 48, 63, 64, 65, 70):
+            payload_hex = "0x" + "".join(f"{(i + plen) % 256:02x}" for i in range(plen))
+            encoded_hex = encode_callback_request_data(
+                1301, "0x3333333333333333333333333333333333333333", 300_000, payload_hex
+            )
+            raw = bytes.fromhex(encoded_hex[2:])
+            self.assertEqual(len(raw) % 32, 0)
+
+            # Truncation mutation (-1 and -32 bytes)
+            with self.assertRaises(ValueError):
+                decode_callback_request_data_strict("0x" + raw[:-1].hex())
+            with self.assertRaises(ValueError):
+                decode_callback_request_data_strict("0x" + raw[:-32].hex())
+
+            # Extension mutation (+1 and +32 bytes)
+            with self.assertRaises(ValueError):
+                decode_callback_request_data_strict("0x" + (raw + b"\x00").hex())
+            with self.assertRaises(ValueError):
+                decode_callback_request_data_strict("0x" + (raw + b"\x00" * 32).hex())
+
+            # Non-zero padding mutation whenever payload length is not a multiple of 32
+            pad_len = (32 - (plen % 32)) % 32
+            if pad_len > 0:
+                mutated = bytearray(raw)
+                mutated[-1] ^= 0x01
+                with self.assertRaises(ValueError):
+                    decode_callback_request_data_strict("0x" + mutated.hex())
+
+    # 110. Workstream C Regression: Uncovered raw-ABI boundary defects in decode_callback_records()
+    def test_110_callback_records_raw_abi_boundary_defects(self):
+        dest_tx = 0x1111111111111111111111111111111111111111111111111111111111111111
+        valid_hex = encode_abi_callback_array([
+            (100, "0x2222222222222222222222222222222222222222", 1, 1301, dest_tx, "0x08c379a0")
+        ])
+        valid_bytes = bytes.fromhex(valid_hex[2:])
+
+        bad_cases = [
+            # 1. Zero array offset + zero length word must NOT falsely return [] (empty array)
+            ("zero_arr_offset_empty", "0x" + ("00" * 64)),
+            # 2. Empty array offset 32, len 0 with trailing 32 junk bytes must NOT return []
+            ("empty_arr_trailing_bytes", "0x" + (32).to_bytes(32, "big").hex() + ("00" * 32) + ("aa" * 32)),
+            # 3. Element offset pointing back into element offset array (0 < arr_len * 32)
+            ("elem_offset_into_head", "0x" + (valid_bytes[:64] + (0).to_bytes(32, "big") + valid_bytes[96:]).hex()),
+            # 4. bytes_offset aliasing tuple header slot (0 -> reads blockNumber as bytes_len; 128 -> reads destTxHash/offset!)
+            ("bytes_offset_0_alias", "0x" + (valid_bytes[:96 + 160] + (0).to_bytes(32, "big") + valid_bytes[96 + 192:]).hex()),
+            ("bytes_offset_128_alias", "0x" + (valid_bytes[:96 + 160] + (128).to_bytes(32, "big") + valid_bytes[96 + 192:]).hex()),
+            # 5. Non-zero error bytes padding (flip last padding byte of 4-byte error 0x08c379a0)
+            ("dirty_error_padding", "0x" + (valid_bytes[:-1] + b"\xff").hex()),
+            # 6. Truncated error padding (-1 byte)
+            ("truncated_error_padding", "0x" + valid_bytes[:-1].hex()),
+            # 7. Trailing bytes after valid array (+32 zero bytes)
+            ("trailing_bytes_after_array", "0x" + (valid_bytes + b"\x00" * 32).hex()),
+            # 8. Huge arr_len overflow (2**256 - 1)
+            ("huge_arr_len", "0x" + (valid_bytes[:32] + (2**256 - 1).to_bytes(32, "big") + valid_bytes[64:]).hex()),
+            # 9. Dirty upper bits in raw ABI reactiveContract address slot
+            ("dirty_raw_reactive_contract_upper", "0x" + (valid_bytes[:96 + 32] + b"\x01" + valid_bytes[96 + 33:]).hex()),
+        ]
+
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        sys_contract = config["system_contract"].lower()
+        sig = "getCallbacks(uint256)((uint256,address,uint256,uint256,uint256,bytes)[])"
+
+        for label, bad_raw in bad_cases:
+            with self.subTest(case=label):
+                recs, err = decode_callback_records(bad_raw)
+                self.assertIsNone(recs, f"{label} must fail decoding")
+                self.assertIsNotNone(err, f"{label} must return explicit error message")
+
+                runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+                runner.call_map[(sys_contract, sig, config["reactive_rpc"])] = bad_raw
+                rep = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+                self.assertEqual(rep["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+                self.assertFalse(rep["safe_to_consider_recovery"])
+
+        # Also verify multi-record ambiguity & zero-tx with empty error remain safe under valid canonical raw ABI
+        two_matching_hex = encode_abi_callback_array([
+            (100, config["reactive_address"], 1, 1301, 8888, "0x08c379a0"),
+            (101, config["reactive_address"], 2, 1301, 8889, "0x08c379a0"),
+        ])
+        recs_two, err_two = decode_callback_records(two_matching_hex)
+        self.assertIsNone(err_two)
+        self.assertEqual(len(recs_two), 2)
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        runner.call_map[(sys_contract, sig, config["reactive_rpc"])] = two_matching_hex
+        rep_ambig = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep_ambig["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertFalse(rep_ambig["safe_to_consider_recovery"])
+
 
 if __name__ == "__main__":
     unittest.main()

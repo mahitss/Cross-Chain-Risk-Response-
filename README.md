@@ -252,7 +252,7 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 │   ├── mocks/
 │   │   └── MockOmniSystemContract.sol  # In-memory mock of Reactive Omni System Contract
 │   ├── ops/
-│   │   └── test_crossguard_healthcheck.py # Offline unit tests for operational health check & preflight (104 tests)
+│   │   └── test_crossguard_healthcheck.py # Offline unit tests for operational health check & preflight (110 tests)
 │   └── unit/
 │       ├── BorrowingController.t.sol   # Unit tests for destination lending & nonce mechanics
 │       ├── CollateralVault.t.sol       # Unit tests for collateral vault & borrow safety
@@ -299,7 +299,7 @@ forge build --sizes
 # 4. Execute all 169 unit, recovery, invariant, and integration tests with detailed traces
 forge test -vvv
 
-# 5. Execute 104 operational health-check and recovery preflight unit tests (mocked RPC)
+# 5. Execute 110 operational health-check and recovery preflight unit tests (mocked RPC)
 python -m unittest discover -s test/ops -p "test_*.py"
 
 # 6. Generate local coverage report
@@ -326,7 +326,7 @@ Ran 12 Foundry test suites:
 Total Foundry Tests: 169 passed, 0 failed, 0 skipped (100% pass rate)
 
 Ran Operational Health Check & Recovery Preflight Test Suite:
-- test/ops/test_crossguard_healthcheck.py: 104 passed, 0 failed, 0 errors (100% pass rate)
+- test/ops/test_crossguard_healthcheck.py: 110 passed, 0 failed, 0 errors (100% pass rate)
 ```
 
 ### Verified Contract Bytecode Sizes
@@ -480,7 +480,7 @@ python script/ops/crossguard_healthcheck.py \
   --borrowing-controller-address 0x... \
   --reactive-tx-hash 0x...
 
-# Execute the 104-scenario offline unit test suite (100% mocked RPC)
+# Execute the 110-scenario offline unit test suite (100% mocked RPC)
 python -m unittest discover -s test/ops -p "test_*.py"
 ```
 
