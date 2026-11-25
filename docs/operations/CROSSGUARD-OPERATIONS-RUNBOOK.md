@@ -1,8 +1,8 @@
 # CrossGuard Operations, Failure Diagnosis & Runbook
 
 **Protocol:** CrossGuard — Autonomous Cross-Chain Risk-Response Protocol
-**Milestone:** MISSION M005 / M005.1 / M005.2 — Operational Observability, Safety & ABI Correctness Patch
-**Date:** 2026-11-23
+**Milestone:** MISSION M005 / M005.1 / M005.2 / M007.1 — Operational Observability, Safety & Cross-Chain Identity Parity
+**Date:** 2026-11-25
 **Multi-Chain Topology:**
 - Origin: Base Sepolia (`84532`)  
 - Reactive Engine: Reactive Lasna (`5318007`)  
@@ -24,6 +24,7 @@ python script/ops/crossguard_healthcheck.py \
   --reactive-rpc "$REACTIVE_LASNA_RPC_URL" \
   --unichain-rpc "$UNICHAIN_SEPOLIA_RPC_URL" \
   --origin-risk-controller "$BASE_RISK_CONTROLLER" \
+  --origin-collateral-vault "$BASE_COLLATERAL_VAULT" \
   --reactive-address "$REACTIVE_CROSSGUARD" \
   --callback-address "$UNICHAIN_CALLBACK_ADAPTER" \
   --borrowing-controller-address "$BORROWING_CONTROLLER_ADDRESS" \
@@ -311,10 +312,11 @@ Every failure scenario must follow this rigorous five-step diagnostic procedure:
 
 ### What CrossGuard Can Do (Current Implementation)
 1. **Autonomous Log Interception:** `CrossGuardReactive` reliably intercepts `RiskBreach` and `RiskResolved` logs from Base Sepolia via the Omni System Contract.
-2. **Structural & Semantic Validation:** Validates origin parameters, data length (96 bytes), and threshold consistency before dispatching callbacks.
-3. **Monotonic Nonce Enforcement:** Rejects replayed, stale, or duplicated callbacks at destination lending facility via `require(nonce > lastProcessedNonce[positionId], InvalidNonce)`.
-4. **Orthogonal Pause Dimensions:** Autonomous risk resolutions clear `pausedByRiskBreach` without clobbering manual governance emergency pauses (`pausedByAdmin`).
-5. **Out-of-Order Convergence:** If resolution arrives before breach, it safely advances `lastProcessedNonce` and establishes healthy status, causing the older delayed breach to be rejected as stale.
+2. **Structural, Canonical Identity & Semantic Validation (M007.1):** Validates origin chain (`84532`), emitter (`RiskController`), 192-byte versioned payload layout (`identityVersion == 1`, `originVault == originCollateralVault`, non-zero `salt`), canonical `PositionID` preimage (`keccak256(abi.encode(POSITION_IDENTITY_DOMAIN, originChainId, originRiskController, originVault, originUser, salt))`), threshold bounds, and destination `trustedOrigin*` parity before state changes or callback dispatches.
+3. **Anti-Squatting & Cross-Wallet EIP-712 / ERC-1271 Owner Delegation (M007.1):** `CollateralVault.openPosition(salt, asset, amount)` and `BorrowingController.registerPosition(salt)` / `registerPositionWithAuthorization(...)` prevent arbitrary `bytes32 positionId` squatting while supporting same-wallet defaults (`RiskBreach` on unregistered positions sets `positionOwners = originUser`, whereas `RiskResolved` preserves `address(0)` without granting ownership).
+4. **Monotonic Nonce Enforcement:** Rejects replayed, stale, or duplicated callbacks at destination lending facility via `require(nonce > lastProcessedNonce[positionId], InvalidNonce)`.
+5. **Orthogonal Pause Dimensions:** Autonomous risk resolutions clear `pausedByRiskBreach` without clobbering manual governance emergency pauses (`pausedByAdmin`).
+6. **Out-of-Order Convergence:** If resolution arrives before breach, it safely advances `lastProcessedNonce` and establishes healthy status, causing the older delayed breach to be rejected as stale.
 
 ### What CrossGuard Cannot Currently Do
 1. **No Guaranteed Destination Execution:** Calling `systemContract.requestCallbackV_1_0()` requests relay transport; it does **not** guarantee destination inclusion or successful EVM execution.

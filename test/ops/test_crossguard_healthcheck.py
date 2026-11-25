@@ -61,6 +61,7 @@ from script.ops.crossguard_healthcheck import (
     format_terminal_report,
     keccak256,
     keccak256_topic,
+    parse_arguments,
     redact_rpc_url,
     run_recovery_preflight,
     sanitize_text,
@@ -133,6 +134,7 @@ def create_base_config() -> Dict[str, Any]:
         "reactive_rpc": "https://reactive-lasna.rpc.test",
         "unichain_rpc": "https://unichain-sepolia.rpc.test",
         "origin_risk_controller": "0x1111111111111111111111111111111111111111",
+        "origin_collateral_vault": "0x5555555555555555555555555555555555555555",
         "reactive_address": "0x2222222222222222222222222222222222222222",
         "callback_address": "0x3333333333333333333333333333333333333333",
         "borrowing_controller_address": "0x4444444444444444444444444444444444444444",
@@ -151,16 +153,25 @@ def populate_healthy_runner(config: Dict[str, Any]) -> MockRpcRunner:
     # 2. Deployed Bytecodes (non-empty)
     dummy_code = "0x608060405234801561001057600080fd5b50"
     runner.code_map[(config["origin_risk_controller"].lower(), config["base_rpc"])] = dummy_code
+    if config.get("origin_collateral_vault"):
+        runner.code_map[(config["origin_collateral_vault"].lower(), config["base_rpc"])] = dummy_code
     runner.code_map[(config["reactive_address"].lower(), config["reactive_rpc"])] = dummy_code
     runner.code_map[(config["callback_address"].lower(), config["unichain_rpc"])] = dummy_code
     runner.code_map[(config["borrowing_controller_address"].lower(), config["unichain_rpc"])] = dummy_code
     runner.code_map[(config["callback_proxy"].lower(), config["unichain_rpc"])] = dummy_code
 
     # 3. Configurations
+    if config.get("origin_collateral_vault"):
+        v_addr = config["origin_collateral_vault"].lower()
+        runner.call_map[(v_addr, "riskController()", config["base_rpc"])] = config["origin_risk_controller"]
+        runner.call_map[(config["origin_risk_controller"].lower(), "authorizedVaults(address)", config["base_rpc"])] = "true"
+
     r_addr = config["reactive_address"].lower()
     r_rpc = config["reactive_rpc"]
     runner.call_map[(r_addr, "originChainId()", r_rpc)] = hex(BASE_SEPOLIA_CHAIN_ID)
     runner.call_map[(r_addr, "originRiskController()", r_rpc)] = config["origin_risk_controller"]
+    if config.get("origin_collateral_vault"):
+        runner.call_map[(r_addr, "originCollateralVault()", r_rpc)] = config["origin_collateral_vault"]
     runner.call_map[(r_addr, "destinationChainId()", r_rpc)] = hex(UNICHAIN_SEPOLIA_CHAIN_ID)
     runner.call_map[(r_addr, "destinationCallback()", r_rpc)] = config["callback_address"]
     runner.call_map[(r_addr, "callbackGasLimit()", r_rpc)] = hex(300_000)
@@ -174,6 +185,10 @@ def populate_healthy_runner(config: Dict[str, Any]) -> MockRpcRunner:
 
     b_addr = config["borrowing_controller_address"].lower()
     runner.call_map[(b_addr, "callbackAdapter()", u_rpc)] = config["callback_address"]
+    runner.call_map[(b_addr, "trustedOriginChainId()", u_rpc)] = hex(BASE_SEPOLIA_CHAIN_ID)
+    runner.call_map[(b_addr, "trustedOriginRiskController()", u_rpc)] = config["origin_risk_controller"]
+    if config.get("origin_collateral_vault"):
+        runner.call_map[(b_addr, "trustedOriginVault()", u_rpc)] = config["origin_collateral_vault"]
 
     # 4. Funding & Debt
     sys_addr = config["system_contract"].lower()
@@ -587,6 +602,7 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
             "reactive_rpc": f"https://lasna-rpc.rnk.dev?auth={secret_token}",
             "unichain_rpc": "https://sepolia.unichain.org",
             "origin_risk_controller": "0x1111111111111111111111111111111111111111",
+            "origin_collateral_vault": "0x5555555555555555555555555555555555555555",
             "reactive_address": "0x2222222222222222222222222222222222222222",
             "callback_address": "0x3333333333333333333333333333333333333333",
             "borrowing_controller_address": "0x4444444444444444444444444444444444444444",
@@ -1344,6 +1360,7 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
             "reactive_rpc": "https://user:pass@reactive-lasna.rpc.test/v1/sec456",
             "unichain_rpc": "https://unichain-sepolia.rpc.test/?apikey=secret789",
             "origin_risk_controller": "0x1111111111111111111111111111111111111111",
+            "origin_collateral_vault": "0x5555555555555555555555555555555555555555",
             "reactive_address": "0x2222222222222222222222222222222222222222",
             "callback_address": "0x3333333333333333333333333333333333333333",
             "borrowing_controller_address": "0x4444444444444444444444444444444444444444",
@@ -2756,6 +2773,153 @@ class TestCrossGuardHealthChecker(unittest.TestCase):
         rep_ambig = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
         self.assertEqual(rep_ambig["status"], RecoveryStatus.RETRY_UNKNOWN.value)
         self.assertFalse(rep_ambig["safe_to_consider_recovery"])
+
+    # 111. M007.1: Missing, zero, or truncated origin_collateral_vault must fail closed
+    def test_111_m007_missing_or_zero_origin_collateral_vault_fails_closed(self):
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+
+        # Missing in healthcheck
+        config_missing = create_base_config()
+        runner = populate_healthy_runner(config_missing)
+        del config_missing["origin_collateral_vault"]
+        report = CrossGuardHealthChecker(config_missing, runner=runner).run_all_checks()
+        self.assertEqual(report["overall_status"], OverallStatus.CRITICAL.value)
+        chk = next(c for c in report["checks"] if c["name"] == "config_origin_collateral_vault_present")
+        self.assertEqual(chk["status"], Status.CRITICAL.value)
+
+        # Missing in preflight -> RETRY_UNKNOWN
+        runner_pf = self._setup_preflight_runner(create_base_config(), pos_id, tx_hash)
+        rep_missing = run_recovery_preflight(config_missing, pos_id, 1, tx_hash, runner=runner_pf)
+        self.assertEqual(rep_missing["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+        self.assertFalse(rep_missing["safe_to_consider_recovery"])
+
+        # Zero address in preflight -> RETRY_BLOCKED
+        config_zero = create_base_config()
+        config_zero["origin_collateral_vault"] = "0x0000000000000000000000000000000000000000"
+        rep_zero = run_recovery_preflight(config_zero, pos_id, 1, tx_hash, runner=runner_pf)
+        self.assertEqual(rep_zero["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertFalse(rep_zero["safe_to_consider_recovery"])
+
+        # Truncated address in preflight -> RETRY_UNKNOWN
+        config_trunc = create_base_config()
+        config_trunc["origin_collateral_vault"] = "0x5555"
+        rep_trunc = run_recovery_preflight(config_trunc, pos_id, 1, tx_hash, runner=runner_pf)
+        self.assertEqual(rep_trunc["status"], RecoveryStatus.RETRY_UNKNOWN.value)
+
+    # 112. M007.1: CrossGuardReactive.originCollateralVault() mismatch fails closed
+    def test_112_m007_reactive_origin_vault_mismatch_fails_closed(self):
+        config = create_base_config()
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+        runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+        reactive = config["reactive_address"].lower()
+        runner.call_map[(reactive, "originCollateralVault()", config["reactive_rpc"])] = (
+            "0x9999999999999999999999999999999999999999"
+        )
+
+        report = CrossGuardHealthChecker(config, runner=runner).run_all_checks()
+        self.assertEqual(report["overall_status"], OverallStatus.CRITICAL.value)
+        chk = next(c for c in report["checks"] if c["name"] == "config_reactive_origin_collateral_vault")
+        self.assertEqual(chk["status"], Status.CRITICAL.value)
+
+        rep = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+        self.assertEqual(rep["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("originCollateralVault", rep["reason"])
+        self.assertFalse(rep["safe_to_consider_recovery"])
+
+    # 113. M007.1: BorrowingController trustedOrigin domain mismatches fail closed
+    def test_113_m007_borrowing_controller_trusted_origin_domain_mismatch_fails_closed(self):
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+
+        cases = [
+            ("trustedOriginChainId()", "1", "config_controller_trusted_origin_chain_id", "trustedOriginChainId"),
+            (
+                "trustedOriginRiskController()",
+                "0x9999999999999999999999999999999999999999",
+                "config_controller_trusted_origin_risk_controller",
+                "trustedOriginRiskController",
+            ),
+            (
+                "trustedOriginVault()",
+                "0x9999999999999999999999999999999999999999",
+                "config_controller_trusted_origin_vault",
+                "trustedOriginVault",
+            ),
+        ]
+
+        for sig, bad_val, chk_name, reason_frag in cases:
+            with self.subTest(sig=sig):
+                config = create_base_config()
+                runner = self._setup_preflight_runner(config, pos_id, tx_hash)
+                borrow = config["borrowing_controller_address"].lower()
+                runner.call_map[(borrow, sig, config["unichain_rpc"])] = bad_val
+
+                report = CrossGuardHealthChecker(config, runner=runner).run_all_checks()
+                self.assertEqual(report["overall_status"], OverallStatus.CRITICAL.value)
+                chk = next(c for c in report["checks"] if c["name"] == chk_name)
+                self.assertEqual(chk["status"], Status.CRITICAL.value)
+
+                rep = run_recovery_preflight(config, pos_id, 1, tx_hash, runner=runner)
+                self.assertEqual(rep["status"], RecoveryStatus.RETRY_BLOCKED.value)
+                self.assertIn(reason_frag, rep["reason"])
+
+    # 114. M007.1: Vault riskController mismatch, unauthorized vault, or missing vault bytecode fails closed
+    def test_114_m007_vault_risk_controller_and_authorized_vault_mismatch_fails_closed(self):
+        pos_id = self._get_test_position_id()
+        tx_hash = self._get_test_tx_hash()
+
+        # Case A: CollateralVault.riskController() mismatch
+        config_a = create_base_config()
+        runner_a = self._setup_preflight_runner(config_a, pos_id, tx_hash)
+        runner_a.call_map[(config_a["origin_collateral_vault"].lower(), "riskController()", config_a["base_rpc"])] = (
+            "0x9999999999999999999999999999999999999999"
+        )
+        rep_a = run_recovery_preflight(config_a, pos_id, 1, tx_hash, runner=runner_a)
+        self.assertEqual(rep_a["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("riskController mismatch", rep_a["reason"])
+
+        # Case B: RiskController.authorizedVaults(vault) == false
+        config_b = create_base_config()
+        runner_b = self._setup_preflight_runner(config_b, pos_id, tx_hash)
+        runner_b.call_map[(config_b["origin_risk_controller"].lower(), "authorizedVaults(address)", config_b["base_rpc"])] = (
+            "false"
+        )
+        hc_b = CrossGuardHealthChecker(config_b, runner=runner_b).run_all_checks()
+        chk_b = next(c for c in hc_b["checks"] if c["name"] == "config_risk_controller_authorized_vault")
+        self.assertEqual(chk_b["status"], Status.CRITICAL.value)
+        rep_b = run_recovery_preflight(config_b, pos_id, 1, tx_hash, runner=runner_b)
+        self.assertEqual(rep_b["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("not authorized", rep_b["reason"])
+
+        # Case C: Missing CollateralVault bytecode
+        config_c = create_base_config()
+        runner_c = self._setup_preflight_runner(config_c, pos_id, tx_hash)
+        runner_c.code_map[(config_c["origin_collateral_vault"].lower(), config_c["base_rpc"])] = "0x"
+        rep_c = run_recovery_preflight(config_c, pos_id, 1, tx_hash, runner=runner_c)
+        self.assertEqual(rep_c["status"], RecoveryStatus.RETRY_BLOCKED.value)
+        self.assertIn("Origin CollateralVault", rep_c["reason"])
+
+    # 115. M007.1: CLI flag and environment parsing for --origin-collateral-vault / BASE_COLLATERAL_VAULT
+    def test_115_m007_cli_origin_collateral_vault_arg_and_env_parsing(self):
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"BASE_COLLATERAL_VAULT": "0x5555555555555555555555555555555555555555"}):
+            with patch.object(sys, "argv", ["crossguard_healthcheck.py"]):
+                args_env = parse_arguments()
+                self.assertEqual(
+                    args_env.origin_collateral_vault, "0x5555555555555555555555555555555555555555"
+                )
+            with patch.object(
+                sys,
+                "argv",
+                ["crossguard_healthcheck.py", "--origin-collateral-vault", "0x6666666666666666666666666666666666666666"],
+            ):
+                args_cli = parse_arguments()
+                self.assertEqual(
+                    args_cli.origin_collateral_vault, "0x6666666666666666666666666666666666666666"
+                )
 
 
 if __name__ == "__main__":

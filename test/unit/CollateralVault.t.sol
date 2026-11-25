@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {CollateralVault} from "../../src/origin/CollateralVault.sol";
 import {RiskController} from "../../src/origin/RiskController.sol";
 import {TestValuationSource} from "../../src/origin/TestValuationSource.sol";
+import {CrossGuardIdentity} from "../../src/libraries/CrossGuardIdentity.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 contract CollateralVaultTest is Test {
@@ -22,7 +23,7 @@ contract CollateralVaultTest is Test {
     address mockUsdc = address(0x2222);
     address mockDai = address(0x4444);
 
-    bytes32 positionId = keccak256("alice-position");
+    bytes32 constant ALICE_SALT = keccak256("alice-position-salt");
 
     event ValuationSourceUpdated(address indexed oldOracle, address indexed newOracle);
 
@@ -34,7 +35,6 @@ contract CollateralVaultTest is Test {
         vault = new CollateralVault(owner, address(oracle), address(riskController));
         riskController.setAuthorizedVault(address(vault), true);
 
-        // Prices: WETH = $3,000, USDC = $1, WBTC = $60,000, DAI = $1
         oracle.setAssetPrice(mockWeth, 3000e8);
         oracle.setAssetPrice(mockUsdc, 1e8);
         oracle.setAssetPrice(mockWbtc, 60000e8);
@@ -44,10 +44,9 @@ contract CollateralVaultTest is Test {
 
     function testDepositCollateralAndBorrow() public {
         vm.startPrank(alice);
-        // Deposit 2 WETH ($6,000)
-        vault.depositCollateral(positionId, mockWeth, 2e18);
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
+        assertEq(positionId, vault.computePositionId(alice, ALICE_SALT));
 
-        // Borrow 2,000 USDC ($2,000)
         vault.recordBorrow(positionId, mockUsdc, 2000e18);
         vm.stopPrank();
 
@@ -65,10 +64,8 @@ contract CollateralVaultTest is Test {
 
     function testRevertWhenMixedCollateralAsset() public {
         vm.startPrank(alice);
-        // Initial deposit in WETH
-        vault.depositCollateral(positionId, mockWeth, 2e18);
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
 
-        // Attempting to deposit WBTC into WETH position must revert
         vm.expectRevert(abi.encodeWithSelector(CollateralVault.AssetMismatch.selector, mockWbtc, mockWeth));
         vault.depositCollateral(positionId, mockWbtc, 1e18);
         vm.stopPrank();
@@ -76,11 +73,9 @@ contract CollateralVaultTest is Test {
 
     function testRevertWhenMixedDebtAsset() public {
         vm.startPrank(alice);
-        vault.depositCollateral(positionId, mockWeth, 2e18);
-        // Initial borrow in USDC
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
         vault.recordBorrow(positionId, mockUsdc, 1000e18);
 
-        // Attempting to record borrow in DAI against USDC position must revert
         vm.expectRevert(abi.encodeWithSelector(CollateralVault.AssetMismatch.selector, mockDai, mockUsdc));
         vault.recordBorrow(positionId, mockDai, 500e18);
         vm.stopPrank();
@@ -88,8 +83,8 @@ contract CollateralVaultTest is Test {
 
     function testEvaluatePositionHealthy() public {
         vm.startPrank(alice);
-        vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000
-        vault.recordBorrow(positionId, mockUsdc, 2000e18); // $2,000 -> LTV = 33.33% (3333 bps)
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
+        vault.recordBorrow(positionId, mockUsdc, 2000e18);
         vm.stopPrank();
 
         (bool isBreached, uint256 ltvBps, uint256 nonce) = vault.evaluatePositionRisk(positionId);
@@ -100,16 +95,13 @@ contract CollateralVaultTest is Test {
 
     function testEvaluatePositionBreachedAfterPriceDrop() public {
         vm.startPrank(alice);
-        vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000
-        vault.recordBorrow(positionId, mockUsdc, 4500e18); // $4,500 -> LTV = 7500 bps (Healthy)
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
+        vault.recordBorrow(positionId, mockUsdc, 4500e18);
         vm.stopPrank();
 
         (bool breachedBefore,,) = vault.evaluatePositionRisk(positionId);
         assertFalse(breachedBefore);
 
-        // Flash crash: WETH drops to $2,500
-        // New Collateral value: 2 * $2500 = $5,000. Debt = $4,500.
-        // New LTV: 4500 / 5000 = 90% (9000 bps) >= 80% (8000 bps) -> BREACH!
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 2500e8);
 
@@ -121,15 +113,20 @@ contract CollateralVaultTest is Test {
 
     function testRevertWhenUnauthorizedUserModifiesPosition() public {
         vm.prank(alice);
-        vault.depositCollateral(positionId, mockWeth, 1e18);
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 1e18);
 
         vm.prank(bob);
         vm.expectRevert(abi.encodeWithSelector(CollateralVault.UnauthorizedUser.selector, bob, alice));
         vault.depositCollateral(positionId, mockWeth, 1e18);
     }
 
-    function testRevertWhenBorrowingOnUninitializedPosition() public {
-        bytes32 uninitPos = keccak256("uninit");
+    function testRevertWhenDepositingOrBorrowingOnUninitializedPosition() public {
+        bytes32 uninitPos = vault.computePositionId(alice, ALICE_SALT);
+
+        vm.prank(alice);
+        vm.expectRevert(CollateralVault.PositionNotInitialized.selector);
+        vault.depositCollateral(uninitPos, mockWeth, 1e18);
+
         vm.prank(alice);
         vm.expectRevert(CollateralVault.PositionNotInitialized.selector);
         vault.recordBorrow(uninitPos, mockUsdc, 100e18);
@@ -144,14 +141,22 @@ contract CollateralVaultTest is Test {
     function testZeroAmountAndZeroAddressReverts() public {
         vm.prank(alice);
         vm.expectRevert(CollateralVault.ZeroAmount.selector);
+        vault.openPosition(ALICE_SALT, mockWeth, 0);
+
+        vm.prank(alice);
+        vm.expectRevert(CollateralVault.ZeroAddress.selector);
+        vault.openPosition(ALICE_SALT, address(0), 1e18);
+
+        vm.prank(alice);
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 1e18);
+
+        vm.prank(alice);
+        vm.expectRevert(CollateralVault.ZeroAmount.selector);
         vault.depositCollateral(positionId, mockWeth, 0);
 
         vm.prank(alice);
         vm.expectRevert(CollateralVault.ZeroAddress.selector);
         vault.depositCollateral(positionId, address(0), 1e18);
-
-        vm.prank(alice);
-        vault.depositCollateral(positionId, mockWeth, 1e18);
 
         vm.prank(alice);
         vm.expectRevert(CollateralVault.ZeroAmount.selector);
@@ -166,7 +171,6 @@ contract CollateralVaultTest is Test {
         address newOracle = address(0x777);
         address oldOracle = address(vault.valuationSource());
 
-        // RiskController is immutable to guarantee breach state continuity
         assertEq(address(vault.riskController()), address(riskController));
 
         vm.startPrank(owner);
@@ -185,44 +189,35 @@ contract CollateralVaultTest is Test {
     }
 
     function testRiskControllerImmutabilityPreservesBreachContinuity() public {
-        // 1. Establish position and deposit collateral
         vm.startPrank(alice);
-        vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000 collateral
-        vault.recordBorrow(positionId, mockUsdc, 4000e18); // $4,000 debt (66.66% LTV)
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
+        vault.recordBorrow(positionId, mockUsdc, 4000e18);
         vm.stopPrank();
 
-        // 2. Market shock causes breach (WETH drops from $3,000 to $2,000 -> $4,000 collateral, $4,000 debt = 100% LTV)
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 2000e8);
 
         (bool isBreached,,) = vault.evaluatePositionRisk(positionId);
         assertTrue(isBreached, "Position must be breached");
         assertTrue(riskController.isPositionBreached(positionId), "Breach recorded in risk controller");
-
-        // 3. Immutability guarantee: risk controller reference cannot be manipulated or swapped
         assertEq(address(vault.riskController()), address(riskController));
 
-        // 4. Further borrowing is strictly rejected while breach is active
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionInBreachedState.selector, positionId));
         vault.recordBorrow(positionId, mockUsdc, 100e18);
 
-        // 5. Oracle price recovers (WETH goes to $4,000 -> $8,000 collateral, $4,000 debt = 50% LTV)
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 4000e8);
 
-        // 6. Stale breach protection: borrow still rejected until explicit evaluation
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionInBreachedState.selector, positionId));
         vault.recordBorrow(positionId, mockUsdc, 100e18);
 
-        // 7. Explicit evaluation clears breach in the immutable controller
         (bool recoveredBreached, uint256 newLtv,) = vault.evaluatePositionRisk(positionId);
         assertFalse(recoveredBreached, "Breach cleared after explicit evaluation");
         assertEq(newLtv, 5000);
         assertFalse(riskController.isPositionBreached(positionId), "Breach cleared in controller");
 
-        // 8. Borrowing is now successfully permitted
         vm.prank(alice);
         vault.recordBorrow(positionId, mockUsdc, 500e18);
         (,,, address debtAsset, uint256 debtAmount) = vault.getPosition(positionId);
@@ -238,15 +233,11 @@ contract CollateralVaultTest is Test {
         new CollateralVault(owner, address(oracle), address(0));
     }
 
-    /* -------------------------------------------------------------------------- */
-    /*               M003.1 ORIGIN BORROWING SAFETY & RECOVERY TESTS             */
-    /* -------------------------------------------------------------------------- */
-
     function testRevertBorrowWhenZeroCollateral() public {
         vm.prank(alice);
-        vault.depositCollateral(positionId, mockWeth, 1e18);
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 1e18);
 
-        // Zero out collateralAmount in storage (_positions mapping at slot 2 since riskController is immutable)
+        // Zero out collateralAmount in storage (_positions mapping at slot 2)
         bytes32 colAmountSlot = bytes32(uint256(keccak256(abi.encode(positionId, uint256(2)))) + 2);
         vm.store(address(vault), colAmountSlot, bytes32(0));
 
@@ -260,23 +251,18 @@ contract CollateralVaultTest is Test {
 
     function testRevertBorrowWhenExceedingRiskThreshold() public {
         vm.startPrank(alice);
-        // Deposit 2 WETH ($6,000)
-        vault.depositCollateral(positionId, mockWeth, 2e18);
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
 
-        // At 80% threshold, max safe borrow is strictly < $4,800
-        // Attempting to borrow $4,800 USDC (80.00% LTV) must revert with PositionUnsafeOrBreached
         vm.expectRevert(
             abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 8000, 8000)
         );
         vault.recordBorrow(positionId, mockUsdc, 4800e18);
 
-        // Attempting to borrow $5,000 USDC (83.33% LTV) must revert
         vm.expectRevert(
             abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 8333, 8000)
         );
         vault.recordBorrow(positionId, mockUsdc, 5000e18);
 
-        // Safe borrow of $4,000 USDC (66.66% LTV) succeeds
         vault.recordBorrow(positionId, mockUsdc, 4000e18);
         vm.stopPrank();
 
@@ -286,16 +272,13 @@ contract CollateralVaultTest is Test {
 
     function testRevertBorrowWhenPositionAlreadyBreached() public {
         vm.startPrank(alice);
-        // Deposit 2 WETH ($6,000) and borrow $4,500 USDC (75% LTV, healthy)
-        vault.depositCollateral(positionId, mockWeth, 2e18);
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
         vault.recordBorrow(positionId, mockUsdc, 4500e18);
         vm.stopPrank();
 
-        // Collateral crashes to $2,000/WETH -> Collateral: $4,000, Debt: $4,500 -> LTV: 112.5% (Breached!)
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 2000e8);
 
-        // Any attempt to borrow more debt must revert
         vm.prank(alice);
         vm.expectRevert(
             abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 11500, 8000)
@@ -305,11 +288,10 @@ contract CollateralVaultTest is Test {
 
     function testRecoveryLifecycleOnOrigin() public {
         vm.startPrank(alice);
-        vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000
-        vault.recordBorrow(positionId, mockUsdc, 4500e18); // $4,500 (LTV = 75%)
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
+        vault.recordBorrow(positionId, mockUsdc, 4500e18);
         vm.stopPrank();
 
-        // Step 1: Market shock -> WETH drops to $2,500 ($5,000 col, $4,500 debt -> 90% LTV)
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 2500e8);
 
@@ -318,9 +300,6 @@ contract CollateralVaultTest is Test {
         assertEq(ltv, 9000);
         assertEq(nonce, 1);
 
-        // Step 2: Alice remedies position by depositing 2 more WETH ($5,000 more collateral)
-        // Total collateral = 4 WETH @ $2,500 = $10,000. Debt = $4,500.
-        // New LTV = 4,500 / 10,000 = 45% (4500 bps) < 80% (Healthy!)
         vm.prank(alice);
         vault.depositCollateral(positionId, mockWeth, 2e18);
 
@@ -329,24 +308,18 @@ contract CollateralVaultTest is Test {
         assertEq(recLtv, 4500);
         assertEq(recNonce, 2, "Recovery must increment monotonic nonce");
 
-        // Step 3: Now Alice can safely borrow again
         vm.prank(alice);
-        vault.recordBorrow(positionId, mockUsdc, 1000e18); // total debt $5,500 -> 55% LTV
+        vault.recordBorrow(positionId, mockUsdc, 1000e18);
         (,,,, uint256 newDebt) = vault.getPosition(positionId);
         assertEq(newDebt, 5500e18);
     }
 
-    /* -------------------------------------------------------------------------- */
-    /*               M003.2 STALE BREACH & FULL-PRECISION ARITHMETIC TESTS       */
-    /* -------------------------------------------------------------------------- */
-
     function testStaleBreachStateBorrowRejectionUntilExplicitEvaluation() public {
         vm.startPrank(alice);
-        vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000
-        vault.recordBorrow(positionId, mockUsdc, 4500e18); // $4,500 (LTV = 75%)
+        bytes32 positionId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
+        vault.recordBorrow(positionId, mockUsdc, 4500e18);
         vm.stopPrank();
 
-        // 1. Position breaches: WETH drops to $2,500 (Collateral $5,000, Debt $4,500 -> LTV = 90%)
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 2500e8);
 
@@ -354,54 +327,43 @@ contract CollateralVaultTest is Test {
         assertTrue(isBreached);
         assertTrue(riskController.isPositionBreached(positionId));
 
-        // 2. Oracle recovers: WETH price rebounds to $3,000 (Collateral becomes $6,000 -> LTV would be 75%)
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 3000e8);
 
-        // 3. Stale breach protection: Alice attempts to borrow BEFORE explicit evaluation
-        // MUST REVERT with PositionInBreachedState even though current pricing would be healthy!
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(CollateralVault.PositionInBreachedState.selector, positionId));
         vault.recordBorrow(positionId, mockUsdc, 100e18);
 
-        // Breach state remains active in RiskController
         assertTrue(riskController.isPositionBreached(positionId));
 
-        // 4. Explicit healthy risk evaluation is performed
         (bool recovered, uint256 recLtv, uint256 recNonce) = vault.evaluatePositionRisk(positionId);
         assertFalse(recovered);
         assertEq(recLtv, 7500);
         assertEq(recNonce, 2);
         assertFalse(riskController.isPositionBreached(positionId));
 
-        // 5. Outcome based on projected LTV:
-        // A) Borrow that pushes position beyond 80% threshold fails
         vm.prank(alice);
         vm.expectRevert(
             abi.encodeWithSelector(CollateralVault.PositionUnsafeOrBreached.selector, positionId, 8333, 8000)
         );
-        vault.recordBorrow(positionId, mockUsdc, 500e18); // $4,500 + $500 = $5,000 / $6,000 = 83.33%
+        vault.recordBorrow(positionId, mockUsdc, 500e18);
 
-        // B) Safe borrow within threshold succeeds
         vm.prank(alice);
-        vault.recordBorrow(positionId, mockUsdc, 200e18); // $4,500 + $200 = $4,700 / $6,000 = 78.33%
+        vault.recordBorrow(positionId, mockUsdc, 200e18);
         (,,,, uint256 finalDebt) = vault.getPosition(positionId);
         assertEq(finalDebt, 4700e18);
     }
 
     function testExtremeValuationMathDoesNotOverflow() public {
-        bytes32 extremePos = keccak256("extreme-pos");
+        bytes32 whaleSalt = keccak256("extreme-salt");
         address whale = address(0xEEEE);
 
-        // Whale deposits massive amount where amount * price exceeds 2^256 if not handled safely
-        // 1e30 tokens at $3,000 (3000e8) -> 3e41 (fits in 256 bits, but intermediate 512-bit safe)
         vm.prank(whale);
-        vault.depositCollateral(extremePos, mockWeth, 1e30);
+        bytes32 extremePos = vault.openPosition(whaleSalt, mockWeth, 1e30);
 
-        // Price set to very large number
         address mockMegaToken = address(0x9999);
         vm.prank(owner);
-        oracle.setAssetPrice(mockMegaToken, 1e20); // $1 trillion per token
+        oracle.setAssetPrice(mockMegaToken, 1e20);
 
         vm.prank(whale);
         vault.depositCollateral(extremePos, mockWeth, 1e25);
@@ -411,18 +373,19 @@ contract CollateralVaultTest is Test {
         assertEq(ltv, 0);
     }
 
-    function testRevertWhenZeroPositionIdUsed() public {
-        // Zero position ID rejected on depositCollateral
+    function testRevertWhenZeroPositionIdOrZeroSaltUsed() public {
+        vm.prank(alice);
+        vm.expectRevert(CrossGuardIdentity.InvalidSalt.selector);
+        vault.openPosition(bytes32(0), mockWeth, 1e18);
+
         vm.prank(alice);
         vm.expectRevert(CollateralVault.InvalidPositionId.selector);
         vault.depositCollateral(bytes32(0), mockWeth, 1e18);
 
-        // Zero position ID rejected on recordBorrow
         vm.prank(alice);
         vm.expectRevert(CollateralVault.InvalidPositionId.selector);
         vault.recordBorrow(bytes32(0), mockUsdc, 100e18);
 
-        // Zero position ID rejected on evaluatePositionRisk
         vm.expectRevert(CollateralVault.InvalidPositionId.selector);
         vault.evaluatePositionRisk(bytes32(0));
     }

@@ -3,15 +3,15 @@ pragma solidity >=0.8.20;
 
 import {IReactive} from "reactive-lib/interfaces/IReactive.sol";
 import {ISystemContract} from "../interfaces/ISystemContract.sol";
+import {ICrossGuardCallback} from "../interfaces/ICrossGuardCallback.sol";
+import {CrossGuardIdentity} from "../libraries/CrossGuardIdentity.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title CrossGuardReactive
 /// @notice Autonomous Reactive Contract deployed on Reactive Lasna (5318007).
-///         Uses current Reactive Omni system interface (0x8888888888888888888888888888888888888888)
-///         to intercept RiskBreach and RiskResolved events on Base Sepolia (84532) and request callbacks
-///         to Unichain Sepolia (1301).
-///         Enforces single authoritative risk policy from origin, strict event payload integrity,
-///         supported-chain topology allowlisting, durable pending dispatch, and bounded same-nonce recovery.
+///         Intercepts M007.1 versioned identity-bound RiskBreach and RiskResolved events on Base Sepolia (84532),
+///         independently recomputes canonical positionId before dispatch, carries full origin identity in callbacks,
+///         and preserves M006 durable pending dispatch and bounded recovery semantics.
 contract CrossGuardReactive is IReactive, Ownable {
     error ZeroAddress();
     error UnauthorizedCaller(address caller);
@@ -34,6 +34,8 @@ contract CrossGuardReactive is IReactive, Ownable {
     uint256 public constant UNICHAIN_SEPOLIA_CHAIN_ID = 1301;
     uint64 public constant MIN_CALLBACK_GAS_LIMIT = 100_000;
     uint8 public constant MAX_RETRIES = 3;
+    uint8 public constant IDENTITY_VERSION = CrossGuardIdentity.IDENTITY_VERSION;
+    bytes32 public constant IDENTITY_DOMAIN = CrossGuardIdentity.POSITION_IDENTITY_DOMAIN;
 
     enum CallbackType {
         NONE,
@@ -56,13 +58,14 @@ contract CrossGuardReactive is IReactive, Ownable {
     }
 
     bytes32 public constant RISK_BREACH_TOPIC_0 =
-        keccak256("RiskBreach(bytes32,address,uint256,uint256,uint256,uint256)");
+        keccak256("RiskBreach(bytes32,address,uint256,uint8,address,bytes32,uint256,uint256,uint256)");
     bytes32 public constant RISK_RESOLVED_TOPIC_0 =
-        keccak256("RiskResolved(bytes32,address,uint256,uint256,uint256,uint256)");
+        keccak256("RiskResolved(bytes32,address,uint256,uint8,address,bytes32,uint256,uint256,uint256)");
 
     ISystemContract public systemContract;
     uint256 public originChainId;
     address public originRiskController;
+    address public originCollateralVault;
     uint256 public destinationChainId;
     address public destinationCallback;
     uint64 public callbackGasLimit;
@@ -103,11 +106,12 @@ contract CrossGuardReactive is IReactive, Ownable {
         address _systemContract,
         uint256 _originChainId,
         address _originRiskController,
+        address _originCollateralVault,
         uint256 _destChainId,
         address _destCallback,
         uint64 _gasLimit
     ) Ownable(initialOwner) {
-        if (_originRiskController == address(0)) {
+        if (_originRiskController == address(0) || _originCollateralVault == address(0)) {
             revert ZeroAddress();
         }
         if (_originChainId != BASE_SEPOLIA_CHAIN_ID) {
@@ -122,7 +126,6 @@ contract CrossGuardReactive is IReactive, Ownable {
                 revert InvalidGasLimit(_gasLimit);
             }
         } else {
-            // Stage 1 of two-stage deployment: destCallback is address(0)
             if (_destChainId != 0 && _destChainId != UNICHAIN_SEPOLIA_CHAIN_ID) {
                 revert UnsupportedChainId(_destChainId);
             }
@@ -136,11 +139,11 @@ contract CrossGuardReactive is IReactive, Ownable {
 
         originChainId = _originChainId;
         originRiskController = _originRiskController;
+        originCollateralVault = _originCollateralVault;
         destinationChainId = _destCallback == address(0) ? 0 : _destChainId;
         destinationCallback = _destCallback;
         callbackGasLimit = _destCallback == address(0) ? 0 : _gasLimit;
 
-        // 1. Subscribe to RiskBreach events on origin
         systemContract.subscribe(
             _originChainId,
             _originRiskController,
@@ -150,7 +153,6 @@ contract CrossGuardReactive is IReactive, Ownable {
             REACTIVE_IGNORE
         );
 
-        // 2. Subscribe to RiskResolved events on origin
         systemContract.subscribe(
             _originChainId,
             _originRiskController,
@@ -158,6 +160,13 @@ contract CrossGuardReactive is IReactive, Ownable {
             REACTIVE_IGNORE,
             REACTIVE_IGNORE,
             REACTIVE_IGNORE
+        );
+    }
+
+    /// @notice Read-only canonical PositionID helper using configured origin domain.
+    function computeCanonicalPositionId(address originUser, bytes32 salt) external view returns (bytes32) {
+        return CrossGuardIdentity.computePositionId(
+            originChainId, originRiskController, originCollateralVault, originUser, salt
         );
     }
 
@@ -175,7 +184,6 @@ contract CrossGuardReactive is IReactive, Ownable {
     }
 
     /// @notice Core reactive execution entry point called strictly by the Reactive Network Omni System Contract.
-    /// @param log Event log data intercepted from origin chain.
     function react(LogRecord calldata log) external override onlySystem {
         reactCount++;
 
@@ -183,22 +191,21 @@ contract CrossGuardReactive is IReactive, Ownable {
         bytes32 positionId = bytes32(log.topic_1);
         uint256 nonce = log.topic_3;
 
-        // 1. Origin Chain ID validation
+        // 1. Authenticated Origin Chain ID validation
         if (log.chain_id != originChainId) {
             emit ReactiveEventRejected(topic0, positionId, nonce, "WRONG_CHAIN_ID");
             return;
         }
 
-        // 2. Origin Emitter validation
+        // 2. Authenticated Origin Emitter validation
         if (log._contract != originRiskController) {
             emit ReactiveEventRejected(topic0, positionId, nonce, "WRONG_EMITTER");
             return;
         }
 
-        // 3. Topic 0 validation (must be either RiskBreach or RiskResolved)
+        // 3. Versioned Topic 0 validation
         bool isBreach = (topic0 == RISK_BREACH_TOPIC_0);
         bool isResolved = (topic0 == RISK_RESOLVED_TOPIC_0);
-
         if (!isBreach && !isResolved) {
             emit ReactiveEventRejected(topic0, positionId, nonce, "WRONG_EVENT_TOPIC");
             return;
@@ -210,42 +217,80 @@ contract CrossGuardReactive is IReactive, Ownable {
             return;
         }
 
-        // 5. Indexed User Address validation (upper 12 bytes must be 0, address non-zero)
+        // 5. Indexed Origin User validation (clean 20-byte ABI padding, non-zero)
         // forge-lint: disable-next-line(unsafe-typecast)
-        if ((log.topic_2 >> 160) != 0 || address(uint160(log.topic_2)) == address(0)) {
+        address originUser = address(uint160(log.topic_2));
+        if ((log.topic_2 >> 160) != 0 || originUser == address(0)) {
             emit ReactiveEventRejected(topic0, positionId, nonce, "INVALID_INDEXED_USER");
             return;
         }
 
-        // 6. Indexed Nonce validation (RiskController nonces start at 1)
+        // 6. Indexed Nonce validation
         if (nonce == 0) {
             emit ReactiveEventRejected(topic0, positionId, nonce, "ZERO_NONCE");
             return;
         }
 
-        // 7. Event Data Length validation: exactly 3 ABI-encoded uint256 words = 96 bytes
-        // (currentLtvBps, riskThresholdBps, timestamp)
-        if (log.data.length != 96) {
+        // 7. Exact Event Data Length: 6 ABI words = 192 bytes
+        //    (uint8 identityVersion, address originVault, bytes32 positionSalt, uint256 ltvBps, uint256 thresholdBps, uint256 timestamp)
+        bytes calldata rawData = log.data;
+        if (rawData.length != 192) {
             emit ReactiveEventRejected(topic0, positionId, nonce, "INVALID_DATA_LENGTH");
             return;
         }
 
-        (uint256 currentLtvBps, uint256 riskThresholdBps, uint256 timestamp) =
-            abi.decode(log.data, (uint256, uint256, uint256));
+        // 8. Canonical upper-bit checks for uint8 version and address originVault
+        uint256 versionWord;
+        uint256 vaultWord;
+        assembly {
+            versionWord := calldataload(rawData.offset)
+            vaultWord := calldataload(add(rawData.offset, 32))
+        }
+        if ((versionWord >> 8) != 0 || (vaultWord >> 160) != 0) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "MALFORMED_EVENT_DATA");
+            return;
+        }
 
-        // 8. Threshold range validation (1 bps to 10,000 bps)
+        (
+            uint8 idVersion,
+            address evVault,
+            bytes32 salt,
+            uint256 currentLtvBps,
+            uint256 riskThresholdBps,
+            uint256 timestamp
+        ) = abi.decode(rawData, (uint8, address, bytes32, uint256, uint256, uint256));
+
+        // 9. Identity version & configured vault & salt checks
+        if (idVersion != IDENTITY_VERSION) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "UNSUPPORTED_IDENTITY_VERSION");
+            return;
+        }
+        if (evVault == address(0) || evVault != originCollateralVault) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "UNAUTHORIZED_ORIGIN_VAULT");
+            return;
+        }
+        if (salt == bytes32(0)) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "INVALID_SALT");
+            return;
+        }
+
+        // 10. Canonical PositionID derivation check from authenticated source metadata + event evidence
+        (bool idValid, bytes32 expectedPositionId) =
+            CrossGuardIdentity.tryComputePositionId(log.chain_id, log._contract, evVault, originUser, salt);
+        if (!idValid || expectedPositionId != positionId) {
+            emit ReactiveEventRejected(topic0, positionId, nonce, "POSITION_ID_MISMATCH");
+            return;
+        }
+
+        // 11. Threshold, timestamp, and risk evaluation semantics
         if (riskThresholdBps == 0 || riskThresholdBps > 10_000) {
             emit ReactiveEventRejected(topic0, positionId, nonce, "INVALID_THRESHOLD");
             return;
         }
-
-        // 9. Timestamp validation
         if (timestamp == 0) {
             emit ReactiveEventRejected(topic0, positionId, nonce, "INVALID_TIMESTAMP");
             return;
         }
-
-        // 10. Semantic validation of risk evaluation
         if (isBreach) {
             if (currentLtvBps < riskThresholdBps) {
                 emit ReactiveEventRejected(topic0, positionId, nonce, "BREACH_BELOW_THRESHOLD");
@@ -258,45 +303,42 @@ contract CrossGuardReactive is IReactive, Ownable {
             }
         }
 
-        // 11. Monotonic Nonce Ordering Guard: reject duplicate or out-of-order stale origin events
+        // 12. Monotonic Nonce Ordering Guard
         if (nonce <= latestOriginNonce[positionId]) {
             emit StaleOriginEventIgnored(positionId, nonce, latestOriginNonce[positionId]);
             emit ReactiveEventRejected(topic0, positionId, nonce, "STALE_OR_DUPLICATE_NONCE");
             return;
         }
 
-        // 12. Check if a previous pending dispatch is being superseded
+        // 13. Check supersede status
         CallbackState storage existing = latestCallback[positionId];
         if (existing.status == DispatchStatus.PENDING_DISPATCH) {
             emit PendingCallbackSuperseded(positionId, existing.nonce, nonce);
         }
 
-        // 13. Construct authoritative payload and store valid event in durable storage
+        // 14. Build identity-bearing destination callback payload (first arg reserved for proxy rvmSender injection)
         CallbackType cType = isBreach ? CallbackType.BREACH : CallbackType.RESOLVED;
+        CrossGuardIdentity.RiskCallbackMessage memory msgData = CrossGuardIdentity.RiskCallbackMessage({
+            identityVersion: idVersion,
+            originChainId: log.chain_id,
+            originRiskController: log._contract,
+            originVault: evVault,
+            originUser: originUser,
+            positionId: positionId,
+            salt: salt,
+            nonce: nonce,
+            riskLevel: currentLtvBps,
+            timestamp: timestamp
+        });
         bytes memory payload = isBreach
-            ? abi.encodeWithSignature(
-                "handleRiskBreach(address,bytes32,uint256,uint256,uint256)",
-                address(0),
-                positionId,
-                nonce,
-                currentLtvBps,
-                timestamp
-            )
-            : abi.encodeWithSignature(
-                "handleRiskResolved(address,bytes32,uint256,uint256,uint256)",
-                address(0),
-                positionId,
-                nonce,
-                currentLtvBps,
-                timestamp
-            );
+            ? abi.encodeCall(ICrossGuardCallback.handleRiskBreach, (address(0), msgData))
+            : abi.encodeCall(ICrossGuardCallback.handleRiskResolved, (address(0), msgData));
 
         latestOriginNonce[positionId] = nonce;
         latestCallback[positionId] = CallbackState({
             nonce: nonce, eventType: cType, payload: payload, retryCount: 0, status: DispatchStatus.PENDING_DISPATCH
         });
 
-        // 14. Check destination configuration: if valid, dispatch immediately; if not, defer
         bool isDestConfigured =
             (destinationCallback != address(0) && destinationChainId == UNICHAIN_SEPOLIA_CHAIN_ID
                 && callbackGasLimit >= MIN_CALLBACK_GAS_LIMIT);
@@ -306,7 +348,6 @@ contract CrossGuardReactive is IReactive, Ownable {
             return;
         }
 
-        // Mark as REQUESTED and submit callback request to Omni System Contract
         latestCallback[positionId].status = DispatchStatus.REQUESTED;
 
         if (isBreach) {
@@ -326,9 +367,6 @@ contract CrossGuardReactive is IReactive, Ownable {
     }
 
     /// @notice Allows owner to dispatch a valid pending origin event whose initial dispatch was deferred.
-    /// @dev Does not increment retryCount as this represents the first callback attempt.
-    /// @param positionId The position identifier to dispatch.
-    /// @param expectedNonce The origin nonce expected to be dispatched.
     function dispatchPendingCallback(bytes32 positionId, uint256 expectedNonce) external onlyOwner {
         if (positionId == bytes32(0)) revert InvalidPositionId();
 
@@ -347,7 +385,6 @@ contract CrossGuardReactive is IReactive, Ownable {
             revert DestinationNotConfigured();
         }
 
-        // State changes to REQUESTED atomically
         state.status = DispatchStatus.REQUESTED;
 
         emit CallbackDispatchSubmitted(positionId, state.nonce, state.eventType);
@@ -362,13 +399,7 @@ contract CrossGuardReactive is IReactive, Ownable {
         );
     }
 
-    /// @notice Allows owner to retry a confirmed failed callback using the exact stored origin nonce and payload.
-    /// @dev Can only be called after an initial callback has been submitted (status is REQUESTED).
-    ///      The contract cannot independently verify remote destination execution status; operators
-    ///      must inspect official Reactive callback records prior to calling this method.
-    /// @param positionId The position identifier to retry.
-    /// @param expectedNonce The origin nonce expected to be retried (guards against race conditions).
-    /// @param reasonCode Audit code indicating why the retry was initiated.
+    /// @notice Allows owner to retry a confirmed failed callback preserving exact original identity and payload.
     function retryFailedCallback(bytes32 positionId, uint256 expectedNonce, bytes32 reasonCode) external onlyOwner {
         if (positionId == bytes32(0)) revert InvalidPositionId();
         if (reasonCode == bytes32(0)) revert InvalidReasonCode();
@@ -404,7 +435,6 @@ contract CrossGuardReactive is IReactive, Ownable {
     }
 
     /// @notice Returns the latest stored callback state for a position.
-    /// @param positionId The position identifier.
     function getLatestCallback(bytes32 positionId)
         external
         view

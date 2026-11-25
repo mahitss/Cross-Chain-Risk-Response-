@@ -1,12 +1,12 @@
 # CrossGuard Cross-Chain Recovery Runbook
 
-**Document Version:** 1.2.0  
-**Milestones:** M006, M006.1 & M006.2 — Recovery Preflight Integrity, Drift Protection & Fee-Model Reconciliation  
-**Target Topology:**  
-- **Origin Chain:** Base Sepolia (`84532`)  
-- **Reactive Engine:** Reactive Lasna (`5318007`)  
-- **Destination Chain:** Unichain Sepolia (`1301`)  
-**Scope:** Standard Operating Procedure (SOP) for Incident Response, Fail-Closed Preflight Diagnosis, Deferred Dispatch Recovery (`DISPATCH_REQUIRED`), and Controlled Same-Nonce Retry (`RETRY_ELIGIBLE`)  
+**Document Version:** 1.3.0
+**Milestones:** M006, M006.1, M006.2 & M007.1 — Recovery Preflight Integrity, Drift Protection, Fee-Model Reconciliation & Canonical Identity Parity
+**Target Topology:**
+- **Origin Chain:** Base Sepolia (`84532`)
+- **Reactive Engine:** Reactive Lasna (`5318007`)
+- **Destination Chain:** Unichain Sepolia (`1301`)
+**Scope:** Standard Operating Procedure (SOP) for Incident Response, Fail-Closed Preflight Diagnosis, M007.1 Cross-Chain Identity Wiring Verification, Deferred Dispatch Recovery (`DISPATCH_REQUIRED`), and Controlled Same-Nonce Retry (`RETRY_ELIGIBLE`)
 
 ---
 
@@ -29,7 +29,8 @@ CrossGuard automates cross-chain borrowing risk pauses by monitoring origin even
    - Payment paths are strictly separated: **Destination Callback Proxy** debt or insufficient ETH reserves on Unichain Sepolia (`0x9299...7FC4`) is a hard blocker (`RETRY_BLOCKED`), whereas **Reactive System Contract** debt or low REACT reserves on Reactive Lasna (`0x8888...8888`) suspends automated `react()` execution and emits `REACTIVE_PATH_WARNING` without blocking owner EOA recovery transactions by default (use `--require-reactive-reserves` for conservative whole-pipeline blocking).
    - Configured `callbackGasLimit` is NOT exact forwarded destination execution gas (`_extraGas` + settlement overhead reduce forwarded gas strictly below configured limits). Any missing or malformed economic field fails closed as `RETRY_UNKNOWN`.
 8. **Authoritative Event ABI Only (M006.2):** Only modern Omni `CallbackRequest(uint256 indexed chainId, address indexed sender, address indexed recipient, CallbackVersion version, bytes configuration)` (`version == 0` / `V_1_0` with valid inner `CallbackConfiguration_V_1_0`) is accepted. Legacy/mock `CallbackRequestedV1` signatures fail closed as `RETRY_UNKNOWN`.
-9. **Credential Isolation:** Never expose private keys, seed phrases, or unredacted RPC URLs in logs, terminal output, or incident reports.
+9. **M007.1 Canonical Identity & Vault Domain Parity:** All operational health checks and `--recovery-preflight` diagnostics require `BASE_COLLATERAL_VAULT` (`--origin-collateral-vault`) and verify bytecode + cross-chain equality across `CollateralVault.riskController()`, `RiskController.authorizedVaults(vault)`, `CrossGuardReactive.originCollateralVault()`, `BorrowingController.trustedOriginChainId()` (`84532`), `BorrowingController.trustedOriginRiskController()`, and `BorrowingController.trustedOriginVault()`. Missing or mismatched origin vault / trusted-origin bindings fail closed (`RETRY_BLOCKED` / `RETRY_UNKNOWN`).
+10. **Credential Isolation:** Never expose private keys, seed phrases, or unredacted RPC URLs in logs, terminal output, or incident reports.
 
 ---
 
@@ -73,17 +74,18 @@ Execute the read-only recovery preflight tool with all three mandatory correlati
 ```bash
 python script/ops/crossguard_healthcheck.py \
   --recovery-preflight \
+  --origin-collateral-vault 0x<BASE_COLLATERAL_VAULT> \
   --position-id 0x<POSITION_ID_64_HEX_CHARS> \
   --expected-nonce <EXPECTED_NONCE> \
   --reactive-tx-hash 0x<REACTIVE_ORIGINATING_TX_HASH> \
   --safety-multiplier 2
 ```
-*Note: Missing or invalid `--position-id`, `--expected-nonce` ($\ge 1$), or `--reactive-tx-hash` causes the tool to fail closed with `RETRY_UNKNOWN` and exit code `1`. `--safety-multiplier` expects an integer (default: `2`).*
+*Note: Missing or invalid `--origin-collateral-vault` (or `BASE_COLLATERAL_VAULT` env), `--position-id`, `--expected-nonce` ($\ge 1$), or `--reactive-tx-hash` causes the tool to fail closed with `RETRY_UNKNOWN` (or `RETRY_BLOCKED` on zero vault address) and exit code `1`. `--safety-multiplier` expects an integer (default: `2`).*
 
 The preflight tool inspects and correlates:
-1. **Origin State:** `positionNonce(bytes32)` and `isPositionBreached(bytes32)` on Base Sepolia `RiskController`.
-2. **Reactive State:** `latestOriginNonce(bytes32)`, 5-field `getLatestCallback(bytes32)` `(nonce, eventType, payload, retryCount, dispatchStatus)`, and destination config (`destinationChainId`, `destinationCallback`, `callbackGasLimit >= 100_000`) on Reactive Lasna `CrossGuardReactive`.
-3. **Destination State:** `lastProcessedNonce(bytes32)`, `isBorrowingPaused(bytes32)`, `pausedByRiskBreach(bytes32)`, and `pausedByAdmin(bytes32)` on Unichain Sepolia `BorrowingController`.
+1. **Origin State & Vault Identity Pairing:** `positionNonce(bytes32)` and `isPositionBreached(bytes32)` on Base Sepolia `RiskController`, plus `CollateralVault.riskController()` and `RiskController.authorizedVaults(vault)`.
+2. **Reactive State:** `latestOriginNonce(bytes32)`, 5-field `getLatestCallback(bytes32)` `(nonce, eventType, payload, retryCount, dispatchStatus)`, `originCollateralVault()`, and destination config (`destinationChainId`, `destinationCallback`, `callbackGasLimit >= 100_000`) on Reactive Lasna `CrossGuardReactive`.
+3. **Destination State & Trusted Origin Anchors:** `lastProcessedNonce(bytes32)`, `isBorrowingPaused(bytes32)`, `pausedByRiskBreach(bytes32)`, `pausedByAdmin(bytes32)`, `trustedOriginChainId()`, `trustedOriginRiskController()`, and `trustedOriginVault()` on Unichain Sepolia `BorrowingController`.
 4. **Economics & Reconciled Fee Reserves:** Separately reports `reactive_event_processing_path` (`SystemContract`, `REACT`, conservative operational warning by default unless `--require-reactive-reserves` is set) and `destination_callback_delivery_path` (`CallbackProxy`, `ETH`, hard delivery blocker on debt or shortfall), queries `_gasPriceCoeffPer1000()`, `_extraGas()`, `_maxChargeGas()`, and `gas-price` / `base-fee`, evaluates `fee = p_base * (C / 1000) * (gas_limit + extra_gas)`, tracks `_maxChargeGas` settlement gas independently (`--settlement-gas-requirement`), and fails closed (`RETRY_UNKNOWN`) on missing/malformed inputs or uint256 overflow.
 5. **Receipt, Authoritative `CallbackRequest` ABI & 6-Field Callback Correlation:** Verifies `ReactiveBreachProcessed` / `ReactiveResolvedProcessed` / `CallbackDispatchDeferred` / `CallbackDispatchSubmitted` / `CallbackRetryRequested` and authoritative `CallbackRequest(uint256,address,address,uint8,bytes)` (`version == 0`, valid `CallbackConfiguration_V_1_0`, matching payload/chain/sender/recipient) using pure-Python Ethereum Keccak-256 topics (rejecting legacy `CallbackRequestedV1`), enforces 3-way recipient drift equality (`config_comparison`), and unambiguously correlates `getCallbacks(uint256)` 6-field tuples (`blockNumber`, `reactiveContract`, `callbackIndex`, `destinationChainId`, `destinationTxHash`, `error`).
 

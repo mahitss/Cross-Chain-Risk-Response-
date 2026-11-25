@@ -5,13 +5,21 @@ import {Script, console} from "forge-std/Script.sol";
 import {CrossGuardReactive} from "../src/reactive/CrossGuardReactive.sol";
 
 /// @title ConfigureReactive
-/// @notice Links the deployed Unichain Sepolia destination callback adapter into CrossGuardReactive on Lasna.
+/// @notice Links the deployed Unichain Sepolia destination callback adapter into CrossGuardReactive on Lasna
+///         while verifying origin identity domain configuration is non-zero and anchored to Base Sepolia (84532).
 contract ConfigureReactive is Script {
     uint256 constant REACTIVE_LASNA_CHAIN_ID = 5318007;
+    uint256 constant BASE_SEPOLIA_CHAIN_ID = 84532;
     uint256 constant UNICHAIN_SEPOLIA_CHAIN_ID = 1301;
     uint64 constant CALLBACK_GAS_LIMIT = 300_000;
 
     function run() external {
+        // Fail-closed execution network preflight guard
+        require(
+            block.chainid == REACTIVE_LASNA_CHAIN_ID,
+            "Unsupported execution network: must run on Reactive Lasna (5318007)"
+        );
+
         uint256 deployerPrivateKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
@@ -39,17 +47,13 @@ contract ConfigureReactive is Script {
         console.log("Destination Chain ID:", UNICHAIN_SEPOLIA_CHAIN_ID);
         console.log("Callback Gas Limit:", CALLBACK_GAS_LIMIT);
 
-        // Fail-closed execution network preflight guard
-        require(
-            block.chainid == REACTIVE_LASNA_CHAIN_ID,
-            "Unsupported execution network: must run on Reactive Lasna (5318007)"
-        );
+        CrossGuardReactive reactive = CrossGuardReactive(payable(reactiveContractAddress));
+        require(reactive.originChainId() == BASE_SEPOLIA_CHAIN_ID, "Reactive origin chain mismatch");
+        require(reactive.originRiskController() != address(0), "Reactive origin RiskController not configured");
+        require(reactive.originCollateralVault() != address(0), "Reactive origin CollateralVault not configured");
 
         vm.startBroadcast(deployerPrivateKey);
-
-        CrossGuardReactive reactive = CrossGuardReactive(payable(reactiveContractAddress));
         reactive.setDestinationConfig(UNICHAIN_SEPOLIA_CHAIN_ID, unichainCallbackAdapter, CALLBACK_GAS_LIMIT);
-
         vm.stopBroadcast();
 
         // Independent state confirmation

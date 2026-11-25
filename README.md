@@ -35,18 +35,18 @@ Reactive Network solves this by providing **inversion of control** at the smart-
                                        v
    +------------------------------------------------------------------------+
    |                            CollateralVault                             |
-   |   - Tracks collateral & debt positions (18 decimals, 1e18)             |
-   |   - recordBorrow(): Enforces zero-collateral & breach safety checks    |
-   |   - evaluatePositionRisk(): Triggers canonical risk evaluation         |
+   |   - Canonical PositionID = keccak256(DOMAIN, chain, rc, vault, user, salt)|
+   |   - openPosition(salt, asset, amount): Prevents position squatting     |
+   |   - recordBorrow() & evaluatePositionRisk(): Strict owner/vault binding|
    +-----------------------------------+------------------------------------+
                                        |
                                        v
    +------------------------------------------------------------------------+
    |                             RiskController                             |
-   |   - Sole authoritative origin risk policy                              |
+   |   - Sole authoritative origin risk policy & vault-gated registration   |
    |   - Configurable risk threshold (e.g., 8,000 bps = 80.00% LTV)         |
    |   - calculateLtvBps(): 512-bit intermediate math, overflow-protected   |
-   |   - Emits: RiskBreach(...) or RiskResolved(...) with monotonic nonce   |
+   |   - Emits: Versioned 192B RiskBreach/RiskResolved (vault & salt bound) |
    +-----------------------------------+------------------------------------+
                                        |
                                        | Event Logs Emitted on Base Sepolia
@@ -61,9 +61,9 @@ Reactive Network solves this by providing **inversion of control** at the smart-
                                        v
    +------------------------------------------------------------------------+
    |                          CrossGuardReactive                            |
-   |   - Validates origin chainId (84532), emitter, topic, payload & bounds |
-   |   - Enforces single authoritative policy (no secondary filtering)      |
-   |   - Dispatches Omni callback V_1_0 to Unichain Sepolia (1301)          |
+   |   - Validates chainId (84532), emitter, version (1), originCollateralVault|
+   |   - Recomputes canonical PositionID & upper-bit word canonicalization  |
+   |   - Dispatches RiskCallbackMessage via Omni callback V_1_0 (1301)      |
    +-----------------------------------+------------------------------------+
                                        |
                                        | Authenticated Callback via Relayer
@@ -79,16 +79,16 @@ Reactive Network solves this by providing **inversion of control** at the smart-
    +------------------------------------------------------------------------+
    |                           CrossGuardCallback                           |
    |   - Layer 1: Enforces msg.sender == UNICHAIN_CALLBACK_PROXY            |
-   |   - Layer 2: Authenticates injected reactiveSender == expected         |
-   |   - Calls BorrowingController.pauseBorrowing() or resolveBorrowing()   |
+   |   - Layer 2: Authenticates reactiveSender == authorizedReactiveSender  |
+   |   - Layer 3: Recomputes canonical PositionID & validates RiskCallbackMessage|
    +-----------------------------------+------------------------------------+
                                        |
                                        v
    +------------------------------------------------------------------------+
    |                          BorrowingController                           |
-   |   - Destination lending facility tracking borrowing against positions  |
-   |   - Strict monotonic nonce verification (rejects replay/stale nonces)  |
-   |   - Distinct emergency administrative controls with audit reasons      |
+   |   - Binds immutable trustedOriginChainId / RiskController / Vault      |
+   |   - registerPosition(salt) & EIP-712 / ERC-1271 delegated ownership    |
+   |   - Explicit Default-Owner Policy + monotonic nonces + admin controls  |
    +------------------------------------------------------------------------+
 ```
 
@@ -98,12 +98,13 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 
 | Contract | Network | Chain ID | Primary Responsibility |
 | :--- | :--- | :--- | :--- |
+| **`CrossGuardIdentity.sol`** | Shared Library | `All` | Canonical domain-separated `PositionID` derivation, tuple validation, and `RiskCallbackMessage` layout (`IDENTITY_VERSION = 1`). |
 | **`TestValuationSource.sol`** | Base Sepolia | `84532` | Configurable mock oracle providing asset USD prices scaled to 8 decimals ($10^8$). |
-| **`CollateralVault.sol`** | Base Sepolia | `84532` | Manages collateral deposits and borrow records ($10^{18}$ decimals). Evaluates position health and blocks borrowing on breached or uncollateralized positions. |
-| **`RiskController.sol`** | Base Sepolia | `84532` | Sole authoritative origin risk policy engine. Calculates canonical LTV using 512-bit arithmetic, manages position breach status, and emits events with monotonic per-position nonces. |
-| **`CrossGuardReactive.sol`** | Reactive Lasna | `5318007` | Subscribes to `RiskBreach` and `RiskResolved` origin events via Omni System Contract, validates event structure and semantics, and dispatches callbacks to Unichain Sepolia. |
-| **`CrossGuardCallback.sol`** | Unichain Sepolia | `1301` | Destination callback adapter enforcing dual-layer authentication: official Callback Proxy verification and injected Reactive contract address validation. |
-| **`BorrowingController.sol`** | Unichain Sepolia | `1301` | Destination lending pool that enforces borrowing pauses, rejects replayed or stale callbacks via monotonic nonces, and provides separated administrative emergency overrides. |
+| **`CollateralVault.sol`** | Base Sepolia | `84532` | Enforces `openPosition(salt, asset, amount)` canonical position creation, manages deposits/borrows ($10^{18}$ decimals), and blocks uninitialized/unauthorized/breached borrows. |
+| **`RiskController.sol`** | Base Sepolia | `84532` | Vault-gated authoritative origin risk policy engine. Binds immutable position identities, computes 512-bit LTV, and emits 192-byte versioned `RiskBreach`/`RiskResolved` events with monotonic nonces. |
+| **`CrossGuardReactive.sol`** | Reactive Lasna | `5318007` | Subscribes to `RiskBreach`/`RiskResolved`, validates 192-byte versioned payloads + `originCollateralVault` + canonical `PositionID`, and dispatches identity-bound callbacks with durable deferral/retry. |
+| **`CrossGuardCallback.sol`** | Unichain Sepolia | `1301` | Destination callback adapter enforcing Callback Proxy verification, injected `authorizedReactiveSender` check, and canonical `PositionID` recomputation. |
+| **`BorrowingController.sol`** | Unichain Sepolia | `1301` | Destination lending pool binding immutable `trustedOrigin*` anchors, EIP-712 / ERC-1271 owner delegation, explicit Default-Owner Policy, monotonic nonces, and orthogonal admin pause controls. |
 
 ---
 
@@ -123,11 +124,11 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 - **Single Authoritative Policy:** `RiskController` is the sole authority for risk thresholds. `CollateralVault` delegates all breach decisions and projected LTV checks to `RiskController`, guaranteeing that emitted LTVs and breach events cannot disagree.
 
 ### 2. Origin Borrow Safety & Stale Breach Protection
-- `CollateralVault.recordBorrow()` enforces four mandatory checks:
-  1. Position cannot have zero collateral (`PositionUncollateralized`).
-  2. Position cannot be in an active breached state (`PositionInBreachedState`).
-  3. Projected LTV with new debt cannot meet or exceed `riskThresholdBps` (`PositionUnsafeOrBreached`).
-  4. Caller must be the registered position owner or contract owner (`UnauthorizedUser`).
+- `CollateralVault.openPosition(salt, asset, amount)` initializes each position deterministically via canonical `PositionID`, and `recordBorrow()` / `depositCollateral()` require:
+  1. Position must already be initialized (`PositionNotInitialized`).
+  2. Caller must strictly be the initialized position owner `pos.user` (`UnauthorizedUser` — contract owner cannot bypass).
+  3. Position cannot have zero collateral (`PositionUncollateralized`) or be actively breached (`PositionInBreachedState`).
+  4. Projected LTV with new debt cannot meet or exceed `riskThresholdBps` (`PositionUnsafeOrBreached`).
 - **Explicit Recovery Requirement:** If a position breaches and the oracle subsequently recovers, borrowing on the origin remains blocked until an explicit `evaluatePositionRisk()` transaction evaluates the position as healthy and clears `isPositionBreached[positionId]`.
 
 ### 3. Full-Lifecycle Cross-Chain Recovery Propagation
@@ -142,24 +143,27 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 - **Rejection of Stale / Duplicate Callbacks:** `BorrowingController` enforces `require(nonce > lastProcessedNonce[positionId], InvalidNonce)`.
 - **Duplicate Nonces Revert:** Destination callbacks are **not** idempotent; duplicate or out-of-order nonces strictly revert to protect state sequencing.
 
-### 5. Reactive Origin Event Validation
+### 5. Reactive Origin Event & Identity Validation (M007.1)
 - `CrossGuardReactive.react()` operates exclusively on event logs delivered by the trusted Reactive Network Omni System Contract (`0x8888888888888888888888888888888888888888`).
-- Inside `react()`, the contract performs exhaustive parameter and structural checks:
+- Inside `react()`, the contract performs exhaustive parameter, identity, and structural checks:
   1. Caller authentication (`msg.sender == address(systemContract)` via `onlySystem`).
   2. Origin chain ID match (`log.chain_id == 84532`).
   3. Origin emitter match (`log._contract == originRiskController`).
   4. Topic 0 match (`RISK_BREACH_TOPIC_0` or `RISK_RESOLVED_TOPIC_0`).
-  5. Indexed parameter formatting (non-zero position ID, valid non-zero user address in lower 160 bits, non-zero nonce).
-  6. Payload data length verification (exactly 96 bytes / 3 ABI words: `currentLtvBps`, `riskThresholdBps`, `timestamp`).
-  7. Threshold bounds validation ($1 \le \text{riskThresholdBps} \le 10,000$).
-  8. Non-zero timestamp check.
-  9. Semantic LTV sanity (breach requires $\text{currentLtvBps} \ge \text{riskThresholdBps}$; resolution requires $\text{currentLtvBps} < \text{riskThresholdBps}$).
-- Log transport, consensus, and block inclusion are validated natively by the Reactive Network validator set; the smart contract verifies caller authority, origin parameters, and data semantics.
+  5. Indexed parameter formatting (non-zero `positionId`, canonical non-zero `originUser` in lower 160 bits, non-zero `nonce`).
+  6. Versioned payload data length verification (**192 bytes / 6 ABI words**: `identityVersion`, `originVault`, `salt`, `currentLtvBps`, `riskThresholdBps`, `timestamp`) with strict upper-bit canonicalization on `identityVersion` (`uint8`) and `originVault` (`address`).
+  7. Authorized origin vault and identity binding (`identityVersion == 1`, `originVault == originCollateralVault`, `salt != bytes32(0)`, and `CrossGuardIdentity.tryComputePositionId(originChainId, originRiskController, originCollateralVault, originUser, salt) == positionId`).
+  8. Threshold bounds ($1 \le \text{riskThresholdBps} \le 10,000$), non-zero timestamp, and semantic LTV consistency (`breach: ltv >= threshold`, `resolved: ltv < threshold`).
+- Valid events encode a full `CrossGuardIdentity.RiskCallbackMessage` targeting `CrossGuardCallback.handleRiskBreach` / `handleRiskResolved`.
 
-### 6. Dual-Layer Destination Authentication
-- **Layer 1 (Callback Proxy Verification):** Destination `CrossGuardCallback` inherits OpenZeppelin-compatible `AbstractCallback` and enforces `authorizedSenderOnly`, guaranteeing `msg.sender == UNICHAIN_CALLBACK_PROXY` (`0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4`).
-- **Layer 2 (Injected Contract Address Authentication):** The Reactive Network relayer replaces the first 160 bits of calldata with the actual deployed `CrossGuardReactive` contract address on Lasna. `CrossGuardCallback` validates that `reactiveSender == authorizedReactiveSender`.
-- *Note:* The authenticated identifier is the deployed smart contract address on Reactive Lasna, not a legacy deployer RVM ID.
+### 6. Dual-Layer Destination Authentication, EIP-712 / ERC-1271 Delegation & Default-Owner Policy (M007.1)
+- **Layer 1 (Callback Proxy Verification):** Destination `CrossGuardCallback` inherits `AbstractCallback` and enforces `authorizedSenderOnly`, guaranteeing `msg.sender == UNICHAIN_CALLBACK_PROXY` (`0x9299472A6399Fd1027ebF067571Eb3e3D7837FC4`).
+- **Layer 2 (Injected Contract Address Authentication):** The Reactive relayer overwrites the first 160 bits of callback calldata with the deployed `CrossGuardReactive` contract address on Lasna (`reactiveSender == authorizedReactiveSender`, strictly separate from `message.originUser`).
+- **Layer 3 (Canonical Identity & Trusted Origin Anchors):** `CrossGuardCallback` recomputes `CrossGuardIdentity.computePositionId(...) == message.positionId`, and `BorrowingController` validates immutable `trustedOriginChainId == 84532`, `trustedOriginRiskController`, and `trustedOriginVault`.
+- **Anti-Squatting & Cross-Wallet Authorization:**
+  - `registerPosition(bytes32 salt)` derives `positionId` from `msg.sender` (`originUser == msg.sender == destinationOwner`).
+  - `registerPositionWithAuthorization(OriginIdentity, destinationOwner, deadline, signature)` verifies an EIP-712 signature (`SignatureChecker`, supporting EOA ECDSA + ERC-1271 contract wallets) from `originUser` consuming `sigNonces[originUser]` cleanly.
+  - **Default-Owner Policy:** If `pauseBorrowing(RiskCallbackMessage)` arrives before explicit registration, origin identity binds and `positionOwners[positionId]` defaults strictly to `message.originUser` without overwriting existing owners. If `resolveBorrowing(RiskCallbackMessage)` arrives first on an unregistered position, origin identity initializes while keeping `positionOwners[positionId] == address(0)` so resolution events never grant ownership.
 
 ### 7. Administrative Controls, Orthogonal Pause Dimensions & Delivery Convergence
 - **Orthogonal Pause Tracking:** `BorrowingController` decouples administrative pauses from autonomous risk pauses using two distinct tracking mappings:
@@ -171,15 +175,12 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 - **Out-of-Order Delivery Convergence:** `resolveBorrowing` is designed to be idempotent with respect to the pause flag while strictly monotonic with respect to nonces. If network delay or dropped packets cause a resolution callback (e.g., nonce 2) to arrive before an earlier breach callback (e.g., nonce 1), `resolveBorrowing` safely advances `lastProcessedNonce` to 2 and establishes the healthy state without reverting. When the delayed breach message (nonce 1) arrives later, it is rejected as stale (`InvalidNonce(1, 2)`), preventing permanent liveness locks.
 - **Emergency Circuit Breaker:** `emergencyResumeBorrowing(positionId, string calldata reason)` allows owner override to clear both pause dimensions only if cross-chain relay infrastructure is permanently disrupted. It mandates a non-empty audit reason string and emits `EmergencyBorrowingResumed` with the caller address, reason, and timestamp for complete on-chain transparency.
 
-### 8. Position ID Invariant on State-Changing Functions
-- Zero position IDs (`bytes32(0)`) are invalid protocol-wide for state transitions.
-- Every state-changing function across origin and destination that initializes, registers, evaluates, borrows against, pauses, or resumes positions enforces:
-  ```solidity
-  if (positionId == bytes32(0)) revert InvalidPositionId();
-  ```
-  This applies to `depositCollateral`, `recordBorrow`, `evaluatePositionRisk`, `assessRisk`, `registerPosition`, `registerPositionFor`, `pauseBorrowing`, `resolveBorrowing`, `emergencyPauseBorrowing`, `resumeBorrowing`, `emergencyResumeBorrowing`, `borrow`, `handleRiskBreach`, and `handleRiskResolved`.
-- `CrossGuardReactive.react()` silently rejects event logs containing zero position IDs (`ReactiveEventRejected(..., "ZERO_POSITION_ID")`).
-- Read-only mapping getters (such as `getPosition`, `positionOwners`, `isBorrowingPaused`, `positionNonce`) return default empty values for uninitialized keys in accordance with standard EVM mapping behavior without reverting.
+### 8. Canonical Position ID Derivation & Zero-ID Guards (M007.1)
+- Canonical `PositionID = keccak256(abi.encode(POSITION_IDENTITY_DOMAIN, originChainId, originRiskController, originVault, originUser, salt))` (`POSITION_IDENTITY_DOMAIN = keccak256("CROSSGUARD_POSITION_IDENTITY_V1")`, `IDENTITY_VERSION = 1`).
+- Origin creation requires `CollateralVault.openPosition(salt, asset, amount)` (`salt != bytes32(0)`) and atomically registers immutable origin identity in `RiskController`; `depositCollateral` and `recordBorrow` revert with `PositionNotInitialized` for uninitialized IDs.
+- Every state-changing function across origin and destination rejects `bytes32(0)` with `InvalidPositionId` (or `InvalidSalt` on zero salt). On destination, legacy unauthenticated `registerPosition(bytes32)` / `registerPositionFor(bytes32,address)` selectors are removed and replaced with `registerPosition(bytes32 salt)` and `registerPositionWithAuthorization(...)`.
+- `CrossGuardReactive.react()` rejects event logs containing zero position IDs (`ReactiveEventRejected(..., "ZERO_POSITION_ID")`) or invalid identity tuples (`"INVALID_SALT"`, `"POSITION_ID_MISMATCH"`, `"UNAUTHORIZED_ORIGIN_VAULT"`, `"UNSUPPORTED_IDENTITY_VERSION"`).
+- Read-only mapping getters (`positionOwners`, `originUsers`, `originIdentityHashes`, `positionIdentityVersion`, `isBorrowingPaused`, `positionNonce`) return standard default EVM empty values without reverting.
 
 ### 9. Fail-Closed Deployment Network Preflight Guards
 - Every deployment and configuration script enforces a fail-closed `block.chainid` preflight check before calling `vm.startBroadcast()`:
@@ -218,10 +219,12 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 │   ├── reports/                        # Milestone verification and audit reports
 │   │   ├── M006-VERIFICATION-REPORT.md   # M006 formal verification & reconciliation report
 │   │   ├── M006.1-VERIFICATION-REPORT.md # M006.1 remediation & invariant verification report
-│   │   └── M006.2-VERIFICATION-REPORT.md # M006.2 drift, fee-model & ABI reconciliation report
+│   │   ├── M006.2-VERIFICATION-REPORT.md # M006.2 drift, fee-model & ABI reconciliation report
+│   │   └── M007.1-VERIFICATION-REPORT.md # M007.1 canonical cross-chain identity verification report
 │   └── security/
 │       ├── M004-THREAT-MODEL.md        # Comprehensive multi-chain threat model & adversarial matrix
-│       └── M006-RECOVERY-THREAT-MODEL.md # M006/M006.1/M006.2 recovery threat model (34 vectors)
+│       ├── M006-RECOVERY-THREAT-MODEL.md # M006/M006.1/M006.2 recovery threat model (34 vectors)
+│       └── M007.1-CROSS-CHAIN-IDENTITY-THREAT-MODEL.md # M007.1 identity & authorization threat model
 ├── script/
 │   ├── ops/
 │   │   └── crossguard_healthcheck.py   # Read-only health check & recovery preflight diagnostic CLI
@@ -237,32 +240,35 @@ Reactive Network solves this by providing **inversion of control** at the smart-
 │   │   ├── IRiskController.sol         # Origin risk engine interface
 │   │   ├── ISystemContract.sol         # Reactive Omni system interface
 │   │   └── ITestValuationSource.sol    # Valuation oracle interface
+│   ├── libraries/
+│   │   └── CrossGuardIdentity.sol      # Canonical domain-separated PositionID derivation & validation
 │   ├── origin/
-│   │   ├── CollateralVault.sol         # Vault managing collateral, debt, and borrow safety
-│   │   ├── RiskController.sol          # Authoritative fixed-point risk engine & event emitter
+│   │   ├── CollateralVault.sol         # Vault managing collateral, debt, openPosition & borrow safety
+│   │   ├── RiskController.sol          # Authoritative fixed-point risk engine & versioned emitter
 │   │   └── TestValuationSource.sol     # Configurable mock price oracle
 │   ├── destination/
-│   │   ├── BorrowingController.sol     # Lending controller with nonce replay checks & emergency modes
-│   │   └── CrossGuardCallback.sol      # Callback proxy & injected address authenticator
+│   │   ├── BorrowingController.sol     # Lending controller with EIP-712/ERC-1271 auth & default-owner policy
+│   │   └── CrossGuardCallback.sol      # Callback proxy, sender & canonical identity authenticator
 │   └── reactive/
-│       └── CrossGuardReactive.sol      # Autonomous reactive event listener, storage & controlled retry
+│       └── CrossGuardReactive.sol      # Autonomous reactive event listener, identity verifier & retry engine
 ├── test/
 │   ├── integration/
-│   │   └── CrossGuardE2E.t.sol         # Full cross-chain reactive lifecycle & recovery simulation
+│   │   └── CrossGuardE2E.t.sol         # Full cross-chain reactive lifecycle, delegation & recovery simulation
 │   ├── mocks/
 │   │   └── MockOmniSystemContract.sol  # In-memory mock of Reactive Omni System Contract
 │   ├── ops/
-│   │   └── test_crossguard_healthcheck.py # Offline unit tests for operational health check & preflight (110 tests)
+│   │   └── test_crossguard_healthcheck.py # Offline unit tests for operational health check & preflight
 │   └── unit/
-│       ├── BorrowingController.t.sol   # Unit tests for destination lending & nonce mechanics
+│       ├── BorrowingController.t.sol   # Unit tests for destination lending, delegation & nonce mechanics
 │       ├── CollateralVault.t.sol       # Unit tests for collateral vault & borrow safety
 │       ├── ConfigurationConsistency.t.sol # Cross-chain configuration & topology consistency tests
-│       ├── CrossGuardCallback.t.sol    # Unit tests for callback proxy & sender authentication
+│       ├── CrossGuardCallback.t.sol    # Unit tests for callback proxy, sender & identity authentication
 │       ├── CrossGuardReactive.t.sol    # Unit tests for reactive event filtering, pending storage & retry
 │       ├── M004AdversarialSecurity.t.sol # Adversarial security, out-of-order delivery & invariant fuzzing
 │       ├── M006Recovery.t.sol          # 18 unit recovery scenarios + 6 stateful handler invariants (256 runs)
+│       ├── M007IdentitySecurity.t.sol  # M007.1 identity anti-squatting, EIP-712/ERC-1271 & 10 invariants
 │       ├── RiskController.t.sol        # Unit tests for fixed-point LTV math & transition idempotency
-│       ├── ScriptPreflight.t.sol       # Unit tests for all 4 deployment network guards
+│       ├── ScriptPreflight.t.sol       # Unit tests for deployment network & origin-vault guards
 │       └── TestValuationSource.t.sol   # Unit tests for valuation oracle
 ├── .env.example                        # Template for multi-chain RPCs and contract addresses
 ├── foundry.toml                        # Foundry toolchain configuration (cancun, via_ir)
@@ -296,10 +302,10 @@ forge fmt --check
 # 3. Compile contracts and check bytecode sizes
 forge build --sizes
 
-# 4. Execute all 169 unit, recovery, invariant, and integration tests with detailed traces
+# 4. Execute all 184 unit, recovery, identity, invariant, and integration tests with detailed traces
 forge test -vvv
 
-# 5. Execute 110 operational health-check and recovery preflight unit tests (mocked RPC)
+# 5. Execute 115 operational health-check and recovery preflight unit tests (mocked RPC)
 python -m unittest discover -s test/ops -p "test_*.py"
 
 # 6. Generate local coverage report
@@ -309,7 +315,7 @@ forge coverage --ir-minimum
 ### Verified Test Results
 
 ```text
-Ran 12 Foundry test suites:
+Ran 14 Foundry test suites:
 - test/unit/BorrowingController.t.sol:BorrowingControllerTest: 20 passed, 0 failed, 0 skipped
 - test/unit/CrossGuardReactive.t.sol:CrossGuardReactiveTest: 33 passed, 0 failed, 0 skipped
 - test/unit/CollateralVault.t.sol:CollateralVaultTest: 19 passed, 0 failed, 0 skipped
@@ -317,30 +323,32 @@ Ran 12 Foundry test suites:
 - test/unit/CrossGuardCallback.t.sol:CrossGuardCallbackTest: 14 passed, 0 failed, 0 skipped
 - test/unit/ConfigurationConsistency.t.sol:ConfigurationConsistencyTest: 10 passed, 0 failed, 0 skipped
 - test/unit/TestValuationSource.t.sol:TestValuationSourceTest: 4 passed, 0 failed, 0 skipped
-- test/unit/ScriptPreflight.t.sol:ScriptPreflightTest: 4 passed, 0 failed, 0 skipped
+- test/unit/ScriptPreflight.t.sol:ScriptPreflightTest: 5 passed, 0 failed, 0 skipped
 - test/unit/M004AdversarialSecurity.t.sol:M004AdversarialSecurityTest: 21 passed, 0 failed, 0 skipped
 - test/unit/M006Recovery.t.sol:M006RecoveryTest: 18 passed, 0 failed, 0 skipped
 - test/unit/M006Recovery.t.sol:M006RecoveryInvariantTest: 1 passed, 0 failed, 0 skipped (6 stateful invariants; 256 runs, 128,000 calls, 0 reverts)
-- test/integration/CrossGuardE2E.t.sol:CrossGuardE2ETest: 4 passed, 0 failed, 0 skipped
+- test/unit/M007IdentitySecurity.t.sol:M007IdentitySecurityTest: 12 passed, 0 failed, 0 skipped
+- test/unit/M007IdentitySecurity.t.sol:M007IdentityInvariantTest: 1 passed, 0 failed, 0 skipped (10 stateful invariants; 256 runs, 128,000 calls, 0 reverts)
+- test/integration/CrossGuardE2E.t.sol:CrossGuardE2ETest: 5 passed, 0 failed, 0 skipped
 
-Total Foundry Tests: 169 passed, 0 failed, 0 skipped (100% pass rate)
+Total Foundry Tests: 184 passed, 0 failed, 0 skipped (100% pass rate)
 
 Ran Operational Health Check & Recovery Preflight Test Suite:
-- test/ops/test_crossguard_healthcheck.py: 110 passed, 0 failed, 0 errors (100% pass rate)
+- test/ops/test_crossguard_healthcheck.py: 115 passed, 0 failed, 0 errors (100% pass rate)
 ```
 
 ### Verified Contract Bytecode Sizes
 
-| Contract | Runtime Size (Bytes) | Max Limit (24,576 Bytes) | Safety Margin |
-| :--- | :--- | :--- | :--- |
-| `BorrowingController` | 2,829 B | 24,576 B | 21,747 B (88.5% margin) |
-| `CollateralVault` | 3,499 B | 24,576 B | 21,077 B (85.8% margin) |
-| `CrossGuardCallback` | 2,314 B | 24,576 B | 22,262 B (90.6% margin) |
-| `CrossGuardReactive` | 6,689 B | 24,576 B | 17,887 B (72.8% margin) |
-| `RiskController` | 1,847 B | 24,576 B | 22,729 B (92.5% margin) |
-| `TestValuationSource` | 695 B | 24,576 B | 23,881 B (97.2% margin) |
+| Contract | Runtime Size (Bytes) | Initcode Size (Bytes) | Max Limit (24,576 B Runtime) | Safety Margin (Runtime) |
+| :--- | :--- | :--- | :--- | :--- |
+| `BorrowingController` | 7,766 B | 8,734 B | 24,576 B | 16,810 B (68.4% margin) |
+| `CollateralVault` | 4,635 B | 5,003 B | 24,576 B | 19,941 B (81.1% margin) |
+| `CrossGuardCallback` | 2,766 B | 3,221 B | 24,576 B | 21,810 B (88.7% margin) |
+| `CrossGuardReactive` | 8,378 B | 9,455 B | 24,576 B | 16,198 B (65.9% margin) |
+| `RiskController` | 3,221 B | 3,490 B | 24,576 B | 21,355 B (86.9% margin) |
+| `TestValuationSource` | 695 B | 905 B | 24,576 B | 23,881 B (97.2% margin) |
 
-### Local Code Coverage Snapshot (`forge coverage --ir-minimum`, M006 Baseline)
+### Local Code Coverage Snapshot (`forge coverage --ir-minimum`, Historical M006 Baseline)
 
 > [!NOTE]
 > Coverage numbers are measured locally using `forge coverage --ir-minimum`. The GitHub Actions CI workflow runs automated compilation, formatting, and unit tests, but does not run `forge coverage`.
@@ -381,16 +389,18 @@ Because `CrossGuardCallback` on Unichain Sepolia requires the deployed `CrossGua
 ```
 [Step 1: Base Sepolia (84532)]
  Deploy TestValuationSource, RiskController, CollateralVault
- Record BASE_RISK_CONTROLLER address
+ Record BASE_RISK_CONTROLLER and BASE_COLLATERAL_VAULT addresses
                   |
                   v
 [Step 2: Reactive Lasna (5318007)]
- Deploy CrossGuardReactive with BASE_RISK_CONTROLLER and UNICHAIN_CALLBACK_ADAPTER = address(0)
+ Deploy CrossGuardReactive with BASE_RISK_CONTROLLER, BASE_COLLATERAL_VAULT,
+ and UNICHAIN_CALLBACK_ADAPTER = address(0)
  Record REACTIVE_CROSSGUARD address
                   |
                   v
 [Step 3: Unichain Sepolia (1301)]
- Deploy BorrowingController and CrossGuardCallback passing REACTIVE_CROSSGUARD
+ Deploy BorrowingController (anchored to Base chainId, BASE_RISK_CONTROLLER, BASE_COLLATERAL_VAULT)
+ and CrossGuardCallback passing REACTIVE_CROSSGUARD
  Record UNICHAIN_CALLBACK_ADAPTER address
                   |
                   v
@@ -413,6 +423,7 @@ forge script script/DeployOrigin.s.sol \
 *Enforces `block.chainid == 5318007` runtime preflight check:*
 ```bash
 BASE_RISK_CONTROLLER=<deployed_controller_address> \
+BASE_COLLATERAL_VAULT=<deployed_vault_address> \
 forge script script/DeployReactive.s.sol \
   --rpc-url $REACTIVE_LASNA_RPC \
   --broadcast
@@ -422,6 +433,8 @@ forge script script/DeployReactive.s.sol \
 *Enforces `block.chainid == 1301` runtime preflight check:*
 ```bash
 REACTIVE_CROSSGUARD=<deployed_reactive_contract_address> \
+BASE_RISK_CONTROLLER=<deployed_controller_address> \
+BASE_COLLATERAL_VAULT=<deployed_vault_address> \
 forge script script/DeployDestination.s.sol \
   --rpc-url $UNICHAIN_SEPOLIA_RPC \
   --broadcast
@@ -475,6 +488,7 @@ python script/ops/crossguard_healthcheck.py \
   --reactive-rpc https://lasna-rpc.reactive.network \
   --unichain-rpc https://sepolia.unichain.org \
   --origin-risk-controller 0x... \
+  --origin-collateral-vault 0x... \
   --reactive-address 0x... \
   --callback-address 0x... \
   --borrowing-controller-address 0x... \
@@ -490,6 +504,7 @@ When a cross-chain delivery failure or deferred pending dispatch occurs, operato
 ```bash
 python script/ops/crossguard_healthcheck.py \
   --recovery-preflight \
+  --origin-collateral-vault 0x<BASE_COLLATERAL_VAULT> \
   --position-id 0x<POSITION_ID> \
   --expected-nonce <EXPECTED_NONCE> \
   --reactive-tx-hash 0x<REACTIVE_ORIGINATING_TX_HASH>

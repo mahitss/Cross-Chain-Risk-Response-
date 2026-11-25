@@ -7,21 +7,22 @@ import {RiskController} from "../src/origin/RiskController.sol";
 import {CollateralVault} from "../src/origin/CollateralVault.sol";
 
 /// @title DeployOrigin
-/// @notice Deploys origin risk & collateral infrastructure to Base Sepolia (84532).
+/// @notice Deploys origin risk & collateral infrastructure to Base Sepolia (84532)
+///         with M007.1 canonical position identity domain wiring.
 contract DeployOrigin is Script {
     uint256 constant BASE_SEPOLIA_CHAIN_ID = 84532;
 
     function run() external {
+        // Fail-closed execution network preflight guard
+        require(
+            block.chainid == BASE_SEPOLIA_CHAIN_ID, "Unsupported execution network: must run on Base Sepolia (84532)"
+        );
+
         uint256 deployerPrivateKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
         console.log("=== Deploying Origin Contracts to Base Sepolia (84532) ===");
         console.log("Deployer Address:", deployer);
-
-        // Fail-closed execution network preflight guard
-        require(
-            block.chainid == BASE_SEPOLIA_CHAIN_ID, "Unsupported execution network: must run on Base Sepolia (84532)"
-        );
 
         vm.startBroadcast(deployerPrivateKey);
 
@@ -42,5 +43,9 @@ contract DeployOrigin is Script {
         console.log("CollateralVault authorized in RiskController");
 
         vm.stopBroadcast();
+
+        require(riskController.authorizedVaults(address(vault)), "Vault authorization failed");
+        require(address(vault.riskController()) == address(riskController), "RiskController mismatch");
+        require(vault.IDENTITY_VERSION() == riskController.IDENTITY_VERSION(), "Identity version mismatch");
     }
 }

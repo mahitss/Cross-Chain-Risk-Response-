@@ -2,6 +2,9 @@
 
 **Document Version:** 1.2.0  
 **Milestones:** M006 (Controlled Callback Recovery), M006.1 (Preflight Integrity & Durable Dispatch), & M006.2 (Configuration Drift & Fee-Model Reconciliation)  
+
+> [!NOTE]
+> **Superseded Identity & Payload Schema Note (M007.1):** While all 34 recovery threat vectors and invariants below remain enforced, Mission **M007.1** upgraded origin events from 96-byte `RiskBreach`/`RiskResolved` payloads to 192-byte versioned payloads binding `identityVersion`, `originVault`, and `salt`, and bound destination registration & callbacks to canonical `PositionID` derivation and EIP-712 / ERC-1271 authorization. See [`M007.1-CROSS-CHAIN-IDENTITY-THREAT-MODEL.md`](./M007.1-CROSS-CHAIN-IDENTITY-THREAT-MODEL.md) for the active identity security architecture.
 **Repository:** `mahitss/Cross-Chain-Risk-Response-`  
 **Working Branch:** `fix/m002-2-omni-callback-correctness`  
 **Topology:**  

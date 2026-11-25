@@ -6,8 +6,8 @@ import {CrossGuardReactive} from "../src/reactive/CrossGuardReactive.sol";
 
 /// @title DeployReactive
 /// @notice Deploys autonomous reactive risk engine to Reactive Lasna (5318007).
-///         Subscribes to Base Sepolia RiskController (84532); destination callback can be configured
-///         at deployment or linked post-destination deployment via setDestinationConfig for Unichain Sepolia (1301).
+///         Subscribes to Base Sepolia RiskController (84532) and enforces authorized BASE_COLLATERAL_VAULT
+///         identity domain verification before dispatching Unichain Sepolia (1301) callbacks.
 contract DeployReactive is Script {
     uint256 constant REACTIVE_LASNA_CHAIN_ID = 5318007;
     uint256 constant BASE_SEPOLIA_CHAIN_ID = 84532;
@@ -15,15 +15,32 @@ contract DeployReactive is Script {
     uint64 constant CALLBACK_GAS_LIMIT = 300_000;
 
     function run() external {
+        // Fail-closed execution network preflight guard
+        require(
+            block.chainid == REACTIVE_LASNA_CHAIN_ID,
+            "Unsupported execution network: must run on Reactive Lasna (5318007)"
+        );
+
         uint256 deployerPrivateKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
         address baseRiskController = vm.envAddress("BASE_RISK_CONTROLLER");
+        address baseCollateralVault = vm.envAddress("BASE_COLLATERAL_VAULT");
+
         if (baseRiskController == address(0)) {
             revert("BASE_RISK_CONTROLLER cannot be zero address");
         }
+        if (baseCollateralVault == address(0)) {
+            revert("BASE_COLLATERAL_VAULT cannot be zero address");
+        }
         if (baseRiskController == deployer) {
             revert("BASE_RISK_CONTROLLER cannot be deployer EOA: must be deployed RiskController contract address");
+        }
+        if (baseCollateralVault == deployer) {
+            revert("BASE_COLLATERAL_VAULT cannot be deployer EOA: must be deployed CollateralVault contract address");
+        }
+        if (baseCollateralVault == baseRiskController) {
+            revert("BASE_COLLATERAL_VAULT cannot equal BASE_RISK_CONTROLLER");
         }
 
         // Optional: destination callback adapter if already deployed; otherwise address(0) to link post-deploy
@@ -38,13 +55,8 @@ contract DeployReactive is Script {
         console.log("=== Deploying CrossGuardReactive to Reactive Lasna (5318007) ===");
         console.log("Deployer Address:", deployer);
         console.log("Subscribing to RiskController on Base Sepolia (84532):", baseRiskController);
+        console.log("Authorized Origin CollateralVault on Base Sepolia (84532):", baseCollateralVault);
         console.log("Initial Callback on Unichain Sepolia (1301):", unichainCallbackAdapter);
-
-        // Fail-closed execution network preflight guard
-        require(
-            block.chainid == REACTIVE_LASNA_CHAIN_ID,
-            "Unsupported execution network: must run on Reactive Lasna (5318007)"
-        );
 
         vm.startBroadcast(deployerPrivateKey);
 
@@ -53,6 +65,7 @@ contract DeployReactive is Script {
             address(0), // Uses default Omni system contract (0x8888888888888888888888888888888888888888)
             BASE_SEPOLIA_CHAIN_ID,
             baseRiskController,
+            baseCollateralVault,
             unichainCallbackAdapter == address(0) ? 0 : UNICHAIN_SEPOLIA_CHAIN_ID,
             unichainCallbackAdapter,
             unichainCallbackAdapter == address(0) ? 0 : CALLBACK_GAS_LIMIT
@@ -62,8 +75,8 @@ contract DeployReactive is Script {
 
         vm.stopBroadcast();
 
-        // Verification of actual deployed state
         require(reactiveContract.originRiskController() == baseRiskController, "Origin controller mismatch");
+        require(reactiveContract.originCollateralVault() == baseCollateralVault, "Origin vault mismatch");
         require(reactiveContract.originChainId() == BASE_SEPOLIA_CHAIN_ID, "Origin chain mismatch");
 
         if (unichainCallbackAdapter == address(0)) {

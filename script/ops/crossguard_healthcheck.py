@@ -552,6 +552,7 @@ class CrossGuardHealthChecker:
                     "expected_chain_id": BASE_SEPOLIA_CHAIN_ID,
                     "rpc_url": redact_rpc_url(self.config.get("base_rpc")),
                     "risk_controller": self.config.get("origin_risk_controller"),
+                    "collateral_vault": self.config.get("origin_collateral_vault"),
                 },
                 "reactive_lasna": {
                     "expected_chain_id": REACTIVE_LASNA_CHAIN_ID,
@@ -644,6 +645,7 @@ class CrossGuardHealthChecker:
     def _check_deployments(self):
         contracts = [
             ("Origin RiskController", self.config.get("origin_risk_controller"), self.config.get("base_rpc"), "deployment_origin_risk_controller"),
+            ("Origin CollateralVault", self.config.get("origin_collateral_vault"), self.config.get("base_rpc"), "deployment_origin_collateral_vault"),
             ("Reactive CrossGuardReactive", self.config.get("reactive_address"), self.config.get("reactive_rpc"), "deployment_reactive_crossguard"),
             ("Destination CrossGuardCallback", self.config.get("callback_address"), self.config.get("unichain_rpc"), "deployment_destination_callback"),
             ("Destination BorrowingController", self.config.get("borrowing_controller_address"), self.config.get("unichain_rpc"), "deployment_borrowing_controller"),
@@ -715,12 +717,68 @@ class CrossGuardHealthChecker:
                 )
 
     def _check_configurations(self):
-        # 1. CrossGuardReactive configuration
+        # 1. CrossGuardReactive & Origin Identity Configuration
+        base_rpc = self.config.get("base_rpc")
         reactive_addr = self.config.get("reactive_address")
         reactive_rpc = self.config.get("reactive_rpc")
         origin_controller = self.config.get("origin_risk_controller")
+        origin_vault = self.config.get("origin_collateral_vault")
         callback_addr = self.config.get("callback_address")
         system_addr = self.config.get("system_contract", DEFAULT_SYSTEM_CONTRACT)
+
+        if origin_controller or reactive_addr or self.config.get("borrowing_controller_address"):
+            if not origin_vault:
+                self.results.append(
+                    CheckResult(
+                        category=CheckCategory.CONFIGURATION,
+                        name="config_origin_collateral_vault_present",
+                        status=Status.CRITICAL,
+                        message="Missing origin_collateral_vault (BASE_COLLATERAL_VAULT) required for M007.1 canonical identity verification.",
+                        remediation="Configure BASE_COLLATERAL_VAULT or --origin-collateral-vault.",
+                    )
+                )
+            elif base_rpc and origin_controller:
+                self._verify_call_addr(
+                    origin_vault, "riskController()", base_rpc, origin_controller,
+                    "config_vault_risk_controller", "CollateralVault riskController matches configured RiskController"
+                )
+                try:
+                    norm_vault = validate_evm_address(origin_vault, "origin_collateral_vault")
+                    auth_raw = self.runner.call(origin_controller, "authorizedVaults(address)", [norm_vault], base_rpc)
+                    auth_ok = decode_bool_strict(auth_raw, "authorizedVaults")
+                    if auth_ok:
+                        self.results.append(
+                            CheckResult(
+                                category=CheckCategory.CONFIGURATION,
+                                name="config_risk_controller_authorized_vault",
+                                status=Status.PASS,
+                                message=f"RiskController authorizedVaults({norm_vault}) == true",
+                                evidence={"contract": origin_controller, "vault": norm_vault, "authorized": True},
+                            )
+                        )
+                    else:
+                        self.results.append(
+                            CheckResult(
+                                category=CheckCategory.CONFIGURATION,
+                                name="config_risk_controller_authorized_vault",
+                                status=Status.CRITICAL,
+                                message=f"RiskController authorizedVaults({norm_vault}) == false.",
+                                evidence={"contract": origin_controller, "vault": norm_vault, "authorized": False},
+                                remediation=f"Authorize CollateralVault {norm_vault} in RiskController {origin_controller} via setAuthorizedVault().",
+                            )
+                        )
+                except Exception as e:
+                    sanitized_err = sanitize_text(str(e), [base_rpc])
+                    self.results.append(
+                        CheckResult(
+                            category=CheckCategory.CONFIGURATION,
+                            name="config_risk_controller_authorized_vault",
+                            status=Status.ERROR,
+                            message=f"Failed to query authorizedVaults(address) on {origin_controller}: {sanitized_err}",
+                            evidence={"contract": origin_controller, "error": sanitized_err},
+                            remediation="Check CollateralVault address, RiskController ABI, and Base Sepolia RPC reachability.",
+                        )
+                    )
 
         if reactive_addr and reactive_rpc:
             # Check originChainId()
@@ -733,6 +791,13 @@ class CrossGuardHealthChecker:
                 self._verify_call_addr(
                     reactive_addr, "originRiskController()", reactive_rpc, origin_controller,
                     "config_reactive_origin_risk_controller", "Reactive originRiskController matches configured RiskController"
+                )
+
+            # M007.1: Check originCollateralVault()
+            if origin_vault:
+                self._verify_call_addr(
+                    reactive_addr, "originCollateralVault()", reactive_rpc, origin_vault,
+                    "config_reactive_origin_collateral_vault", "Reactive originCollateralVault matches configured CollateralVault"
                 )
             # Check destinationChainId()
             self._verify_call_uint(
@@ -776,11 +841,26 @@ class CrossGuardHealthChecker:
                 )
 
         # 3. BorrowingController configuration
-        if borrow_addr and unichain_rpc and callback_addr:
-            self._verify_call_addr(
-                borrow_addr, "callbackAdapter()", unichain_rpc, callback_addr,
-                "config_controller_callback_adapter", "BorrowingController callbackAdapter matches deployed CrossGuardCallback"
+        if borrow_addr and unichain_rpc:
+            if callback_addr:
+                self._verify_call_addr(
+                    borrow_addr, "callbackAdapter()", unichain_rpc, callback_addr,
+                    "config_controller_callback_adapter", "BorrowingController callbackAdapter matches deployed CrossGuardCallback"
+                )
+            self._verify_call_uint(
+                borrow_addr, "trustedOriginChainId()", unichain_rpc, BASE_SEPOLIA_CHAIN_ID,
+                "config_controller_trusted_origin_chain_id", "BorrowingController trustedOriginChainId matches Base Sepolia"
             )
+            if origin_controller:
+                self._verify_call_addr(
+                    borrow_addr, "trustedOriginRiskController()", unichain_rpc, origin_controller,
+                    "config_controller_trusted_origin_risk_controller", "BorrowingController trustedOriginRiskController matches configured RiskController"
+                )
+            if origin_vault:
+                self._verify_call_addr(
+                    borrow_addr, "trustedOriginVault()", unichain_rpc, origin_vault,
+                    "config_controller_trusted_origin_vault", "BorrowingController trustedOriginVault matches configured CollateralVault"
+                )
 
     def _verify_call_uint(self, contract: str, sig: str, rpc: str, expected: int, check_id: str, label: str):
         try:
@@ -1939,6 +2019,7 @@ def run_recovery_preflight(
     reactive_rpc = config.get("reactive_rpc")
     unichain_rpc = config.get("unichain_rpc")
     origin_controller = config.get("origin_risk_controller")
+    origin_vault = config.get("origin_collateral_vault")
     reactive_addr = config.get("reactive_address")
     callback_addr = config.get("callback_address")
     borrowing_controller = config.get("borrowing_controller_address")
@@ -1948,15 +2029,16 @@ def run_recovery_preflight(
     require_reactive_reserves = bool(config.get("require_reactive_reserves", False))
     settlement_gas_req_raw = config.get("settlement_gas_requirement")
 
-    if not (base_rpc and reactive_rpc and unichain_rpc and origin_controller and reactive_addr and callback_addr and borrowing_controller):
+    if not (base_rpc and reactive_rpc and unichain_rpc and origin_controller and origin_vault and reactive_addr and callback_addr and borrowing_controller):
         return _preflight_error(
             RecoveryStatus.RETRY_UNKNOWN, norm_pos, expected_nonce, norm_tx_hash,
-            "Missing required multi-chain RPC URLs or contract address configuration.",
+            "Missing required multi-chain RPC URLs or contract address configuration (including origin_collateral_vault).",
             "Specify all required RPC URLs and contract addresses via flags or environment variables.",
         )
 
     try:
         norm_origin_ctrl = validate_evm_address(origin_controller, "origin_risk_controller")
+        norm_origin_vault = validate_evm_address(origin_vault, "origin_collateral_vault")
         norm_reactive_cfg = validate_evm_address(reactive_addr, "reactive_address")
         norm_cb_addr = validate_evm_address(callback_addr, "callback_address")
         norm_borrow_ctrl = validate_evm_address(borrowing_controller, "borrowing_controller_address")
@@ -1974,6 +2056,12 @@ def run_recovery_preflight(
             RecoveryStatus.RETRY_BLOCKED, norm_pos, expected_nonce, norm_tx_hash,
             "Expected CrossGuardCallback address cannot be the zero address.",
             "Specify the deployed non-zero CrossGuardCallback address.",
+        )
+    if norm_origin_vault == ZERO_ADDRESS or norm_origin_ctrl == ZERO_ADDRESS:
+        return _preflight_error(
+            RecoveryStatus.RETRY_BLOCKED, norm_pos, expected_nonce, norm_tx_hash,
+            "Expected origin RiskController and CollateralVault addresses cannot be zero address.",
+            "Specify non-zero deployed BASE_RISK_CONTROLLER and BASE_COLLATERAL_VAULT addresses.",
         )
 
     try:
@@ -2078,6 +2166,7 @@ def run_recovery_preflight(
         if not config_blocker_reason:
             for label, addr, rpc_u in (
                 ("Origin RiskController", origin_controller, base_rpc),
+                ("Origin CollateralVault", origin_vault, base_rpc),
                 ("CrossGuardReactive", reactive_addr, reactive_rpc),
                 ("CrossGuardCallback", callback_addr, unichain_rpc),
                 ("BorrowingController", borrowing_controller, unichain_rpc),
@@ -2090,20 +2179,35 @@ def run_recovery_preflight(
                     break
 
         if not config_blocker_reason:
+            v_ctrl = decode_address_strict(runner.call(origin_vault, "riskController()", [], base_rpc), "vault riskController")
+            rc_auth = decode_bool_strict(runner.call(origin_controller, "authorizedVaults(address)", [norm_origin_vault], base_rpc), "riskController authorizedVaults")
             r_origin_cid = decode_uint_strict(runner.call(reactive_addr, "originChainId()", [], reactive_rpc), "reactive originChainId")
             r_origin_ctrl = decode_address_strict(runner.call(reactive_addr, "originRiskController()", [], reactive_rpc), "reactive originRiskController")
+            r_origin_vault = decode_address_strict(runner.call(reactive_addr, "originCollateralVault()", [], reactive_rpc), "reactive originCollateralVault")
             r_sys = decode_address_strict(runner.call(reactive_addr, "systemContract()", [], reactive_rpc), "reactive systemContract")
             cb_proxy = decode_address_strict(runner.call(callback_addr, "callbackProxy()", [], unichain_rpc), "callback callbackProxy")
             cb_sender = decode_address_strict(runner.call(callback_addr, "authorizedReactiveSender()", [], unichain_rpc), "callback authorizedReactiveSender")
             cb_borrow = decode_address_strict(runner.call(callback_addr, "borrowingController()", [], unichain_rpc), "callback borrowingController")
             bc_adapter = decode_address_strict(runner.call(borrowing_controller, "callbackAdapter()", [], unichain_rpc), "borrowingController callbackAdapter")
+            bc_origin_cid = decode_uint_strict(runner.call(borrowing_controller, "trustedOriginChainId()", [], unichain_rpc), "borrowingController trustedOriginChainId")
+            bc_origin_ctrl = decode_address_strict(runner.call(borrowing_controller, "trustedOriginRiskController()", [], unichain_rpc), "borrowingController trustedOriginRiskController")
+            bc_origin_vault = decode_address_strict(runner.call(borrowing_controller, "trustedOriginVault()", [], unichain_rpc), "borrowingController trustedOriginVault")
 
-            if r_origin_cid != BASE_SEPOLIA_CHAIN_ID:
+            if v_ctrl != norm_origin_ctrl:
+                config_blocker_reason = f"CollateralVault riskController mismatch: expected {norm_origin_ctrl}, got {v_ctrl}."
+                config_blocker_remediation = "Verify origin RiskController and CollateralVault deployment pairing."
+            elif not rc_auth:
+                config_blocker_reason = f"Origin CollateralVault {norm_origin_vault} is not authorized in RiskController {norm_origin_ctrl}."
+                config_blocker_remediation = "Call setAuthorizedVault(vault, true) on RiskController."
+            elif r_origin_cid != BASE_SEPOLIA_CHAIN_ID:
                 config_blocker_reason = f"CrossGuardReactive originChainId ({r_origin_cid}) != {BASE_SEPOLIA_CHAIN_ID}."
                 config_blocker_remediation = "Verify CrossGuardReactive deployment parameters."
             elif r_origin_ctrl != norm_origin_ctrl:
                 config_blocker_reason = f"CrossGuardReactive originRiskController mismatch: expected {norm_origin_ctrl}, got {r_origin_ctrl}."
                 config_blocker_remediation = "Verify RiskController / CrossGuardReactive topology parity."
+            elif r_origin_vault != norm_origin_vault:
+                config_blocker_reason = f"CrossGuardReactive originCollateralVault mismatch: expected {norm_origin_vault}, got {r_origin_vault}."
+                config_blocker_remediation = "Verify CollateralVault / CrossGuardReactive M007.1 identity topology parity."
             elif r_sys != norm_sys_cfg:
                 config_blocker_reason = f"CrossGuardReactive systemContract mismatch: expected {norm_sys_cfg}, got {r_sys}."
                 config_blocker_remediation = "Verify Omni System Contract address wiring."
@@ -2119,6 +2223,15 @@ def run_recovery_preflight(
             elif bc_adapter != norm_cb_addr:
                 config_blocker_reason = f"BorrowingController callbackAdapter mismatch: expected {norm_cb_addr}, got {bc_adapter}."
                 config_blocker_remediation = "Owner must call setCallbackAdapter on BorrowingController."
+            elif bc_origin_cid != BASE_SEPOLIA_CHAIN_ID:
+                config_blocker_reason = f"BorrowingController trustedOriginChainId ({bc_origin_cid}) != {BASE_SEPOLIA_CHAIN_ID}."
+                config_blocker_remediation = "Redeploy destination contracts with trustedOriginChainId == 84532."
+            elif bc_origin_ctrl != norm_origin_ctrl:
+                config_blocker_reason = f"BorrowingController trustedOriginRiskController mismatch: expected {norm_origin_ctrl}, got {bc_origin_ctrl}."
+                config_blocker_remediation = "Verify destination BorrowingController origin RiskController parity."
+            elif bc_origin_vault != norm_origin_vault:
+                config_blocker_reason = f"BorrowingController trustedOriginVault mismatch: expected {norm_origin_vault}, got {bc_origin_vault}."
+                config_blocker_remediation = "Verify destination BorrowingController origin CollateralVault parity."
     except Exception as e:
         sanitized_err = sanitize_text(str(e), [base_rpc, reactive_rpc, unichain_rpc])
         return _preflight_error(
@@ -3093,6 +3206,11 @@ def parse_arguments() -> argparse.Namespace:
         help="Deployed RiskController address on Base Sepolia",
     )
     parser.add_argument(
+        "--origin-collateral-vault",
+        default=os.getenv("BASE_COLLATERAL_VAULT") or os.getenv("ORIGIN_COLLATERAL_VAULT"),
+        help="Deployed CollateralVault address on Base Sepolia",
+    )
+    parser.add_argument(
         "--reactive-address",
         default=os.getenv("REACTIVE_CROSSGUARD") or os.getenv("CROSSGUARD_REACTIVE_ADDRESS"),
         help="Deployed CrossGuardReactive address on Reactive Lasna",
@@ -3156,6 +3274,7 @@ def main():
         "reactive_rpc": args.reactive_rpc,
         "unichain_rpc": args.unichain_rpc,
         "origin_risk_controller": args.origin_risk_controller,
+        "origin_collateral_vault": args.origin_collateral_vault,
         "reactive_address": args.reactive_address,
         "callback_address": args.callback_address,
         "borrowing_controller_address": args.borrowing_controller_address,

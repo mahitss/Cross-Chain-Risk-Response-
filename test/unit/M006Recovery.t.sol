@@ -12,14 +12,15 @@ import {MockOmniSystemContract} from "../mocks/MockOmniSystemContract.sol";
 import {MockCallbackProxy} from "reactive-test-lib/mock/MockCallbackProxy.sol";
 import {ISystemContract} from "../../src/interfaces/ISystemContract.sol";
 import {ICrossGuardCallback} from "../../src/interfaces/ICrossGuardCallback.sol";
+import {CrossGuardIdentity} from "../../src/libraries/CrossGuardIdentity.sol";
 import {IReactive} from "reactive-lib/interfaces/IReactive.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title M006RecoveryTest
-/// @notice Comprehensive verification suite for M006: Controlled Callback Recovery,
-///         Event Idempotency, Monotonic Nonce Ordering, and Cross-Chain Reconciliation.
+/// @notice Comprehensive verification suite for M006 Controlled Callback Recovery,
+///         Event Idempotency, Monotonic Nonce Ordering, and Cross-Chain Reconciliation
+///         preserving all invariants on M007.1 canonical position identity.
 contract M006RecoveryTest is Test {
-    // Infrastructure
     TestValuationSource oracle;
     RiskController riskController;
     CollateralVault vault;
@@ -29,20 +30,19 @@ contract M006RecoveryTest is Test {
     MockOmniSystemContract mockSystem;
     MockCallbackProxy callbackProxy;
 
-    // Topology
     uint256 constant BASE_SEPOLIA_CHAIN_ID = 84532;
     uint256 constant REACTIVE_LASNA_CHAIN_ID = 5318007;
     uint256 constant UNICHAIN_SEPOLIA_CHAIN_ID = 1301;
     uint64 constant CALLBACK_GAS_LIMIT = 300_000;
-    uint256 constant RISK_THRESHOLD_BPS = 8000; // 80%
+    uint256 constant RISK_THRESHOLD_BPS = 8000;
 
-    // Actors
     address owner = address(0xAA);
     address alice = address(0xBB);
     address stranger = address(0xDD);
     address mockWeth = address(0x1111);
     address mockUsdc = address(0x2222);
 
+    bytes32 constant ALICE_SALT = keccak256("position-m006-salt");
     bytes32 positionId;
 
     event StaleOriginEventIgnored(bytes32 indexed positionId, uint256 receivedNonce, uint256 latestNonce);
@@ -51,10 +51,9 @@ contract M006RecoveryTest is Test {
     );
 
     function setUp() public {
-        positionId = keccak256(abi.encodePacked(alice, "position-m006", BASE_SEPOLIA_CHAIN_ID));
+        vm.chainId(BASE_SEPOLIA_CHAIN_ID);
 
         vm.startPrank(owner);
-        // 1. Origin
         oracle = new TestValuationSource(owner);
         oracle.setAssetPrice(mockWeth, 3000e8);
         oracle.setAssetPrice(mockUsdc, 1e8);
@@ -63,52 +62,53 @@ contract M006RecoveryTest is Test {
         vault = new CollateralVault(owner, address(oracle), address(riskController));
         riskController.setAuthorizedVault(address(vault), true);
 
-        // 2. Reactive
         mockSystem = new MockOmniSystemContract();
 
-        // Predict address
         address predictedReactive = vm.computeCreateAddress(owner, vm.getNonce(owner));
         reactiveContract = new CrossGuardReactive(
             owner,
             address(mockSystem),
             BASE_SEPOLIA_CHAIN_ID,
             address(riskController),
+            address(vault),
             UNICHAIN_SEPOLIA_CHAIN_ID,
             address(0),
             0
         );
         assertEq(address(reactiveContract), predictedReactive);
 
-        // 3. Destination
         callbackProxy = new MockCallbackProxy();
-        borrowingController = new BorrowingController(owner);
+        borrowingController =
+            new BorrowingController(owner, BASE_SEPOLIA_CHAIN_ID, address(riskController), address(vault));
         crossGuardCallback = new CrossGuardCallback(
             owner, address(callbackProxy), address(borrowingController), address(reactiveContract)
         );
         borrowingController.setCallbackAdapter(address(crossGuardCallback));
 
-        // Link destination config
         reactiveContract.setDestinationConfig(
             UNICHAIN_SEPOLIA_CHAIN_ID, address(crossGuardCallback), CALLBACK_GAS_LIMIT
         );
         vm.stopPrank();
 
-        // Register position and set healthy state
         vm.prank(alice);
-        borrowingController.registerPosition(positionId);
+        positionId = borrowingController.registerPosition(ALICE_SALT);
 
         vm.startPrank(alice);
-        vault.depositCollateral(positionId, mockWeth, 2e18); // $6,000
-        vault.recordBorrow(positionId, mockUsdc, 2000e18); // $2,000 (33.33% LTV)
+        bytes32 openedId = vault.openPosition(ALICE_SALT, mockWeth, 2e18);
+        assertEq(openedId, positionId);
+        vault.recordBorrow(positionId, mockUsdc, 2000e18);
         vm.stopPrank();
     }
 
-    // Helper: Trigger price drop and evaluate on origin
+    function _eventData(address originVault, bytes32 salt, uint256 ltv, uint256 ts)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encode(CrossGuardIdentity.IDENTITY_VERSION, originVault, salt, ltv, RISK_THRESHOLD_BPS, ts);
+    }
+
     function _triggerOriginBreach() internal returns (Vm.Log memory breachLog) {
-        vm.prank(owner);
-        oracle.setAssetPrice(mockWeth, 2000e8); // $4,000 collateral, $2,000 debt -> 50%? Wait, let's make debt 3600:
-        // Let's borrow more to reach breach or set price lower:
-        // Collateral 2 WETH at $1000 = $2000, Debt = $2000 -> 100% LTV >= 80%
         vm.prank(owner);
         oracle.setAssetPrice(mockWeth, 1000e8);
 
@@ -142,9 +142,6 @@ contract M006RecoveryTest is Test {
         });
     }
 
-    // ==========================================
-    // 1. Normal Breach Delivery
-    // ==========================================
     function test01_NormalBreachDelivery() public {
         Vm.Log memory breachLog = _triggerOriginBreach();
         IReactive.LogRecord memory rec = _toLogRecord(breachLog);
@@ -163,19 +160,15 @@ contract M006RecoveryTest is Test {
         assertEq(borrowingController.lastProcessedNonce(positionId), 1);
     }
 
-    // ==========================================
-    // 2. Duplicate Origin Evaluation Idempotency
-    // ==========================================
     function test02_DuplicateOriginEvaluationIdempotency() public {
         _triggerOriginBreach();
         assertEq(riskController.positionNonce(positionId), 1);
         assertTrue(riskController.isPositionBreached(positionId));
 
-        // Evaluate again while position remains breached
         vm.recordLogs();
         (bool stillBreached,, uint256 repeatNonce) = vault.evaluatePositionRisk(positionId);
         assertTrue(stillBreached);
-        assertEq(repeatNonce, 1, "Nonce must not increment on repeated breach");
+        assertEq(repeatNonce, 1);
 
         Vm.Log[] memory entries = vm.getRecordedLogs();
         bytes32 breachTopic = reactiveContract.RISK_BREACH_TOPIC_0();
@@ -186,9 +179,8 @@ contract M006RecoveryTest is Test {
                 break;
             }
         }
-        assertFalse(foundSecondEvent, "No RiskBreach event emitted on repeated breach");
+        assertFalse(foundSecondEvent);
 
-        // If duplicate event is replayed to Reactive Lasna, it ignores it
         IReactive.LogRecord memory duplicateLog = IReactive.LogRecord({
             chain_id: BASE_SEPOLIA_CHAIN_ID,
             _contract: address(riskController),
@@ -196,7 +188,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 1,
-            data: abi.encode(10000, 8000, block.timestamp),
+            data: _eventData(address(vault), ALICE_SALT, 10000, block.timestamp),
             block_number: 100,
             op_code: 0,
             block_hash: 0,
@@ -204,22 +196,17 @@ contract M006RecoveryTest is Test {
             log_index: 0
         });
 
-        // First delivery:
         vm.prank(address(mockSystem));
         reactiveContract.react(duplicateLog);
         assertEq(mockSystem.requestedCallbackCount(), 1);
 
-        // Second delivery (replay):
         vm.prank(address(mockSystem));
         vm.expectEmit(true, false, false, true);
         emit StaleOriginEventIgnored(positionId, 1, 1);
         reactiveContract.react(duplicateLog);
-        assertEq(mockSystem.requestedCallbackCount(), 1, "Duplicate log must not request callback");
+        assertEq(mockSystem.requestedCallbackCount(), 1);
     }
 
-    // ==========================================
-    // 3. Callback Delivery Failure Leaves State Unmutated
-    // ==========================================
     function test03_CallbackDeliveryFailureLeavesStateUnmutated() public {
         Vm.Log memory breachLog = _triggerOriginBreach();
         IReactive.LogRecord memory rec = _toLogRecord(breachLog);
@@ -229,15 +216,12 @@ contract M006RecoveryTest is Test {
 
         ISystemContract.CallbackConfiguration_V_1_0 memory cb = mockSystem.getLastRequestedCallback();
 
-        // Destination delivery fails (e.g. out of gas or revert simulated via insufficient gas limit)
         (bool success,) = callbackProxy.executeCallback(cb.recipient, cb.payload, 1000, address(reactiveContract));
-        assertFalse(success, "Callback execution should fail due to out-of-gas");
+        assertFalse(success);
 
-        // Destination state remains completely unmutated
         assertFalse(borrowingController.isBorrowingPaused(positionId));
         assertEq(borrowingController.lastProcessedNonce(positionId), 0);
 
-        // Reactive contract holds stored callback state ready for recovery
         (uint256 nonce, CrossGuardReactive.CallbackType cType,, uint8 retries,) =
             reactiveContract.getLatestCallback(positionId);
         assertEq(nonce, 1);
@@ -245,9 +229,6 @@ contract M006RecoveryTest is Test {
         assertEq(retries, 0);
     }
 
-    // ==========================================
-    // 4. Successful Same-Nonce Recovery
-    // ==========================================
     function test04_SuccessfulSameNonceRecovery() public {
         Vm.Log memory breachLog = _triggerOriginBreach();
         vm.prank(address(mockSystem));
@@ -255,13 +236,11 @@ contract M006RecoveryTest is Test {
 
         ISystemContract.CallbackConfiguration_V_1_0 memory initialCb = mockSystem.getLastRequestedCallback();
 
-        // Initial callback fails
         (bool initialSuccess,) =
             callbackProxy.executeCallback(initialCb.recipient, initialCb.payload, 1000, address(reactiveContract));
         assertFalse(initialSuccess);
         assertEq(borrowingController.lastProcessedNonce(positionId), 0);
 
-        // Owner investigates, verifies preflight conditions, and initiates retry
         bytes32 reason = bytes32("RECOVERY_GAS_EXHAUSTION");
         vm.prank(owner);
         vm.expectEmit(true, true, false, true);
@@ -271,24 +250,18 @@ contract M006RecoveryTest is Test {
         assertEq(mockSystem.requestedCallbackCount(), 2);
         ISystemContract.CallbackConfiguration_V_1_0 memory retriedCb = mockSystem.getLastRequestedCallback();
 
-        // Ensure retried payload and gas configuration match
         assertEq(retriedCb.payload, initialCb.payload);
         assertEq(retriedCb.recipient, address(crossGuardCallback));
 
-        // Destination executes retried callback with adequate gas
         (bool retryExecSuccess,) = callbackProxy.executeCallback(
             retriedCb.recipient, retriedCb.payload, retriedCb.gasLimit, address(reactiveContract)
         );
-        assertTrue(retryExecSuccess, "Retried callback must succeed");
+        assertTrue(retryExecSuccess);
 
-        // Destination state successfully paused and nonce advanced
         assertTrue(borrowingController.isBorrowingPaused(positionId));
         assertEq(borrowingController.lastProcessedNonce(positionId), 1);
     }
 
-    // ==========================================
-    // 5. Retry After Successful Delivery Reverts on Destination
-    // ==========================================
     function test05_RetryAfterSuccessfulDeliveryRevertsOnDestination() public {
         Vm.Log memory breachLog = _triggerOriginBreach();
         vm.prank(address(mockSystem));
@@ -296,33 +269,25 @@ contract M006RecoveryTest is Test {
 
         ISystemContract.CallbackConfiguration_V_1_0 memory initialCb = mockSystem.getLastRequestedCallback();
 
-        // Initial callback SUCCEEDS
         (bool initialSuccess,) = callbackProxy.executeCallback(
             initialCb.recipient, initialCb.payload, initialCb.gasLimit, address(reactiveContract)
         );
         assertTrue(initialSuccess);
         assertEq(borrowingController.lastProcessedNonce(positionId), 1);
 
-        // Owner mistakenly retries same nonce
         vm.prank(owner);
         reactiveContract.retryFailedCallback(positionId, 1, bytes32("RECOVERY_MISTAKE"));
 
         ISystemContract.CallbackConfiguration_V_1_0 memory retriedCb = mockSystem.getLastRequestedCallback();
 
-        // Destination receives retry of already-processed nonce 1
-        // Proxy execution fails because BorrowingController reverts with InvalidNonce(1, 1)
         (bool replaySuccess,) = callbackProxy.executeCallback(
             retriedCb.recipient, retriedCb.payload, retriedCb.gasLimit, address(reactiveContract)
         );
-        assertFalse(replaySuccess, "Replaying already-processed nonce must revert on destination");
+        assertFalse(replaySuccess);
         assertEq(borrowingController.lastProcessedNonce(positionId), 1);
     }
 
-    // ==========================================
-    // 6. Out-of-Order Event Handling
-    // ==========================================
     function test06_OutOfOrderEventHandling() public {
-        // Step 1: Simulate resolution nonce 2 arriving BEFORE breach nonce 1
         IReactive.LogRecord memory resolutionLog = IReactive.LogRecord({
             chain_id: BASE_SEPOLIA_CHAIN_ID,
             _contract: address(riskController),
@@ -330,7 +295,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 2,
-            data: abi.encode(4000, 8000, block.timestamp + 10),
+            data: _eventData(address(vault), ALICE_SALT, 4000, block.timestamp + 10),
             block_number: 105,
             op_code: 0,
             block_hash: 0,
@@ -344,7 +309,6 @@ contract M006RecoveryTest is Test {
         assertEq(reactiveContract.latestOriginNonce(positionId), 2);
         assertEq(mockSystem.requestedCallbackCount(), 1);
 
-        // Step 2: Delayed breach log with nonce 1 arrives
         IReactive.LogRecord memory delayedBreachLog = IReactive.LogRecord({
             chain_id: BASE_SEPOLIA_CHAIN_ID,
             _contract: address(riskController),
@@ -352,7 +316,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 1,
-            data: abi.encode(9000, 8000, block.timestamp),
+            data: _eventData(address(vault), ALICE_SALT, 9000, block.timestamp),
             block_number: 100,
             op_code: 0,
             block_hash: 0,
@@ -365,14 +329,10 @@ contract M006RecoveryTest is Test {
         emit StaleOriginEventIgnored(positionId, 1, 2);
         reactiveContract.react(delayedBreachLog);
 
-        assertEq(mockSystem.requestedCallbackCount(), 1, "Delayed older nonce must not dispatch callback");
+        assertEq(mockSystem.requestedCallbackCount(), 1);
     }
 
-    // ==========================================
-    // 7. Old Retry After Newer State Rejected
-    // ==========================================
     function test07_OldRetryAfterNewerStateRejected() public {
-        // Breach nonce 1 arrives
         IReactive.LogRecord memory log1 = IReactive.LogRecord({
             chain_id: BASE_SEPOLIA_CHAIN_ID,
             _contract: address(riskController),
@@ -380,7 +340,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 1,
-            data: abi.encode(8500, 8000, block.timestamp),
+            data: _eventData(address(vault), ALICE_SALT, 8500, block.timestamp),
             block_number: 100,
             op_code: 0,
             block_hash: 0,
@@ -390,7 +350,6 @@ contract M006RecoveryTest is Test {
         vm.prank(address(mockSystem));
         reactiveContract.react(log1);
 
-        // Resolution nonce 2 arrives
         IReactive.LogRecord memory log2 = IReactive.LogRecord({
             chain_id: BASE_SEPOLIA_CHAIN_ID,
             _contract: address(riskController),
@@ -398,7 +357,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 2,
-            data: abi.encode(4000, 8000, block.timestamp + 5),
+            data: _eventData(address(vault), ALICE_SALT, 4000, block.timestamp + 5),
             block_number: 102,
             op_code: 0,
             block_hash: 0,
@@ -408,15 +367,11 @@ contract M006RecoveryTest is Test {
         vm.prank(address(mockSystem));
         reactiveContract.react(log2);
 
-        // Attempting to retry obsolete nonce 1 reverts with NonceMismatch(1, 2)
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.NonceMismatch.selector, 1, 2));
         reactiveContract.retryFailedCallback(positionId, 1, bytes32("RETRY_SUPERSEDED"));
     }
 
-    // ==========================================
-    // 8. Retry Limit Enforcement
-    // ==========================================
     function test08_RetryLimitEnforcement() public {
         Vm.Log memory breachLog = _triggerOriginBreach();
         vm.prank(address(mockSystem));
@@ -424,7 +379,6 @@ contract M006RecoveryTest is Test {
 
         bytes32 reason = bytes32("RECOVERY_ATTEMPT");
 
-        // 3 retries permitted
         for (uint8 i = 1; i <= 3; i++) {
             vm.prank(owner);
             reactiveContract.retryFailedCallback(positionId, 1, reason);
@@ -432,14 +386,12 @@ contract M006RecoveryTest is Test {
             assertEq(count, i);
         }
 
-        // 4th retry reverts with RetryLimitExceeded
         vm.prank(owner);
         vm.expectRevert(
             abi.encodeWithSelector(CrossGuardReactive.RetryLimitExceeded.selector, positionId, uint8(3), uint8(3))
         );
         reactiveContract.retryFailedCallback(positionId, 1, reason);
 
-        // New event arrives with nonce 2 -> resets retry budget
         IReactive.LogRecord memory log2 = IReactive.LogRecord({
             chain_id: BASE_SEPOLIA_CHAIN_ID,
             _contract: address(riskController),
@@ -447,7 +399,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 2,
-            data: abi.encode(4000, 8000, block.timestamp + 10),
+            data: _eventData(address(vault), ALICE_SALT, 4000, block.timestamp + 10),
             block_number: 105,
             op_code: 0,
             block_hash: 0,
@@ -458,18 +410,14 @@ contract M006RecoveryTest is Test {
         reactiveContract.react(log2);
 
         (,,, uint8 resetCount,) = reactiveContract.getLatestCallback(positionId);
-        assertEq(resetCount, 0, "New origin event must reset retry count");
+        assertEq(resetCount, 0);
 
-        // Retry on nonce 2 succeeds
         vm.prank(owner);
         reactiveContract.retryFailedCallback(positionId, 2, reason);
         (,,, uint8 countAfterReset,) = reactiveContract.getLatestCallback(positionId);
         assertEq(countAfterReset, 1);
     }
 
-    // ==========================================
-    // 9. Unauthorized Retry
-    // ==========================================
     function test09_UnauthorizedRetryReverts() public {
         Vm.Log memory breachLog = _triggerOriginBreach();
         vm.prank(address(mockSystem));
@@ -480,49 +428,37 @@ contract M006RecoveryTest is Test {
         reactiveContract.retryFailedCallback(positionId, 1, bytes32("UNAUTHORIZED"));
     }
 
-    // ==========================================
-    // 10. Invalid Retry Inputs
-    // ==========================================
     function test10_InvalidRetryInputs() public {
         bytes32 reason = bytes32("RECOVERY_CHECK");
 
-        // Zero positionId
         vm.prank(owner);
         vm.expectRevert(CrossGuardReactive.InvalidPositionId.selector);
         reactiveContract.retryFailedCallback(bytes32(0), 1, reason);
 
-        // Zero reasonCode
         vm.prank(owner);
         vm.expectRevert(CrossGuardReactive.InvalidReasonCode.selector);
         reactiveContract.retryFailedCallback(positionId, 1, bytes32(0));
 
-        // No callback stored
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.NoCallbackPayloadStored.selector, positionId));
         reactiveContract.retryFailedCallback(positionId, 1, reason);
 
-        // Store breach
         Vm.Log memory breachLog = _triggerOriginBreach();
         vm.prank(address(mockSystem));
         reactiveContract.react(_toLogRecord(breachLog));
 
-        // Nonce mismatch
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(CrossGuardReactive.NonceMismatch.selector, 999, 1));
         reactiveContract.retryFailedCallback(positionId, 999, reason);
     }
 
-    // ==========================================
-    // 11. Multi-Position Isolation
-    // ==========================================
     function test11_MultiPositionIsolation() public {
-        bytes32 posB = keccak256("position-B");
+        bytes32 bobSalt = keccak256("bob-salt-B");
         address bobUser = address(0xEEEE);
 
         vm.prank(bobUser);
-        borrowingController.registerPosition(posB);
+        bytes32 posB = borrowingController.registerPosition(bobSalt);
 
-        // Position A breach
         IReactive.LogRecord memory logA = IReactive.LogRecord({
             chain_id: BASE_SEPOLIA_CHAIN_ID,
             _contract: address(riskController),
@@ -530,7 +466,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 1,
-            data: abi.encode(8500, 8000, block.timestamp),
+            data: _eventData(address(vault), ALICE_SALT, 8500, block.timestamp),
             block_number: 100,
             op_code: 0,
             block_hash: 0,
@@ -540,7 +476,6 @@ contract M006RecoveryTest is Test {
         vm.prank(address(mockSystem));
         reactiveContract.react(logA);
 
-        // Position B breach
         IReactive.LogRecord memory logB = IReactive.LogRecord({
             chain_id: BASE_SEPOLIA_CHAIN_ID,
             _contract: address(riskController),
@@ -548,7 +483,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(posB),
             topic_2: uint256(uint160(bobUser)),
             topic_3: 1,
-            data: abi.encode(9000, 8000, block.timestamp),
+            data: _eventData(address(vault), bobSalt, 9000, block.timestamp),
             block_number: 101,
             op_code: 0,
             block_hash: 0,
@@ -558,7 +493,6 @@ contract M006RecoveryTest is Test {
         vm.prank(address(mockSystem));
         reactiveContract.react(logB);
 
-        // Retry Position A twice
         vm.startPrank(owner);
         reactiveContract.retryFailedCallback(positionId, 1, bytes32("RETRY_A"));
         reactiveContract.retryFailedCallback(positionId, 1, bytes32("RETRY_A"));
@@ -567,21 +501,16 @@ contract M006RecoveryTest is Test {
         (,,, uint8 retriesA,) = reactiveContract.getLatestCallback(positionId);
         (,,, uint8 retriesB,) = reactiveContract.getLatestCallback(posB);
 
-        assertEq(retriesA, 2, "Position A retries should be 2");
-        assertEq(retriesB, 0, "Position B retries must remain 0");
+        assertEq(retriesA, 2);
+        assertEq(retriesB, 0);
     }
 
-    // ==========================================
-    // 12. Administrative Pause Protection
-    // ==========================================
     function test12_AdministrativePauseProtection() public {
-        // Destination owner pauses position administratively
         vm.prank(owner);
         borrowingController.emergencyPauseBorrowing(positionId);
         assertTrue(borrowingController.isBorrowingPaused(positionId));
         assertTrue(borrowingController.pausedByAdmin(positionId));
 
-        // Breach arrives
         Vm.Log memory breachLog = _triggerOriginBreach();
         vm.prank(address(mockSystem));
         reactiveContract.react(_toLogRecord(breachLog));
@@ -595,7 +524,6 @@ contract M006RecoveryTest is Test {
         assertTrue(borrowingController.pausedByRiskBreach(positionId));
         assertTrue(borrowingController.pausedByAdmin(positionId));
 
-        // Resolution arrives (nonce 2)
         IReactive.LogRecord memory resLog = IReactive.LogRecord({
             chain_id: BASE_SEPOLIA_CHAIN_ID,
             _contract: address(riskController),
@@ -603,7 +531,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 2,
-            data: abi.encode(4000, 8000, block.timestamp + 20),
+            data: _eventData(address(vault), ALICE_SALT, 4000, block.timestamp + 20),
             block_number: 110,
             op_code: 0,
             block_hash: 0,
@@ -616,28 +544,23 @@ contract M006RecoveryTest is Test {
         ISystemContract.CallbackConfiguration_V_1_0 memory cbRes = mockSystem.getLastRequestedCallback();
         callbackProxy.executeCallback(cbRes.recipient, cbRes.payload, cbRes.gasLimit, address(reactiveContract));
 
-        // Risk breach is cleared, but admin pause keeps borrowing paused
         assertFalse(borrowingController.pausedByRiskBreach(positionId));
         assertTrue(borrowingController.pausedByAdmin(positionId));
         assertTrue(borrowingController.isBorrowingPaused(positionId));
 
-        // Only explicit admin resume unpauses
         vm.prank(owner);
         borrowingController.resumeBorrowing(positionId);
         assertFalse(borrowingController.isBorrowingPaused(positionId));
     }
 
-    // ==========================================
-    // 13. Configuration Correction
-    // ==========================================
     function test13_ConfigurationCorrection() public {
-        // Deploy fresh reactive contract with unconfigured destination
         vm.prank(owner);
         CrossGuardReactive unconfiguredReactive = new CrossGuardReactive(
             owner,
             address(mockSystem),
             BASE_SEPOLIA_CHAIN_ID,
             address(riskController),
+            address(vault),
             UNICHAIN_SEPOLIA_CHAIN_ID,
             address(0),
             0
@@ -650,7 +573,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 1,
-            data: abi.encode(8500, 8000, block.timestamp),
+            data: _eventData(address(vault), ALICE_SALT, 8500, block.timestamp),
             block_number: 100,
             op_code: 0,
             block_hash: 0,
@@ -661,9 +584,8 @@ contract M006RecoveryTest is Test {
         uint256 startCount = mockSystem.requestedCallbackCount();
         vm.prank(address(mockSystem));
         unconfiguredReactive.react(log);
-        assertEq(mockSystem.requestedCallbackCount(), startCount, "No callback while unconfigured");
+        assertEq(mockSystem.requestedCallbackCount(), startCount);
 
-        // Check durable storage: pending dispatch created without emitting callback
         (
             uint256 nonce,
             CrossGuardReactive.CallbackType cType,,
@@ -675,34 +597,26 @@ contract M006RecoveryTest is Test {
         assertEq(retries, 0);
         assertEq(uint8(status), uint8(CrossGuardReactive.DispatchStatus.PENDING_DISPATCH));
 
-        // Owner corrects configuration
         vm.prank(owner);
         unconfiguredReactive.setDestinationConfig(
             UNICHAIN_SEPOLIA_CHAIN_ID, address(crossGuardCallback), CALLBACK_GAS_LIMIT
         );
 
-        // Now owner dispatches pending callback
         vm.prank(owner);
         unconfiguredReactive.dispatchPendingCallback(positionId, 1);
-        assertEq(mockSystem.requestedCallbackCount(), startCount + 1, "Callback succeeds after dispatchPendingCallback");
+        assertEq(mockSystem.requestedCallbackCount(), startCount + 1);
 
         (,,,, CrossGuardReactive.DispatchStatus statusAfter) = unconfiguredReactive.getLatestCallback(positionId);
         assertEq(uint8(statusAfter), uint8(CrossGuardReactive.DispatchStatus.REQUESTED));
 
-        // Attempting to react same log again is rejected as duplicate
         vm.prank(address(mockSystem));
         unconfiguredReactive.react(log);
-        assertEq(mockSystem.requestedCallbackCount(), startCount + 1, "Duplicate origin event must be rejected");
+        assertEq(mockSystem.requestedCallbackCount(), startCount + 1);
     }
 
-    // ==========================================
-    // 14. Insufficient Funding / Debt Diagnosis
-    // ==========================================
     function test14_InsufficientFundingDebtDiagnosis() public {
-        // Verify mock system debt is inspectable
         assertEq(mockSystem.debt(address(reactiveContract)), 0);
 
-        // Ensure retry does not perform unauthorized state mutations or auto-funding
         Vm.Log memory breachLog = _triggerOriginBreach();
         vm.prank(address(mockSystem));
         reactiveContract.react(_toLogRecord(breachLog));
@@ -710,14 +624,10 @@ contract M006RecoveryTest is Test {
         uint256 balBefore = address(reactiveContract).balance;
         vm.prank(owner);
         reactiveContract.retryFailedCallback(positionId, 1, bytes32("RECOVERY_CHECK_DEBT"));
-        assertEq(address(reactiveContract).balance, balBefore, "Retry must not spend or fund reactive contract balance");
+        assertEq(address(reactiveContract).balance, balBefore);
     }
 
-    // ==========================================
-    // 15. Fuzz / Property Tests
-    // ==========================================
     function test15_FuzzRecoveryInvariants(uint8 extraRetries, uint16 fuzzLtv) public {
-        // Bound inputs
         uint256 validBreachLtv = bound(uint256(fuzzLtv), 8000, 10000);
         uint8 retriesToAttempt = uint8(bound(uint256(extraRetries), 1, 3));
 
@@ -728,7 +638,7 @@ contract M006RecoveryTest is Test {
             topic_1: uint256(positionId),
             topic_2: uint256(uint160(alice)),
             topic_3: 1,
-            data: abi.encode(validBreachLtv, 8000, block.timestamp),
+            data: _eventData(address(vault), ALICE_SALT, validBreachLtv, block.timestamp),
             block_number: 100,
             op_code: 0,
             block_hash: 0,
@@ -752,7 +662,7 @@ contract M006RecoveryTest is Test {
         assertEq(storedNonce, 1);
         assertEq(uint8(cType), uint8(CrossGuardReactive.CallbackType.BREACH));
         assertEq(count, retriesToAttempt);
-        assertTrue(count <= 3, "Retry count must never exceed 3");
+        assertTrue(count <= 3);
 
         bytes4 selector;
         assembly {
@@ -768,6 +678,7 @@ contract M006RecoveryTest is Test {
             address(mockSystem),
             BASE_SEPOLIA_CHAIN_ID,
             address(riskController),
+            address(vault),
             UNICHAIN_SEPOLIA_CHAIN_ID,
             address(0),
             0
@@ -777,16 +688,13 @@ contract M006RecoveryTest is Test {
         vm.prank(address(mockSystem));
         unconf.react(_toLogRecord(breachLog));
 
-        // Configure destination
         vm.prank(owner);
         unconf.setDestinationConfig(UNICHAIN_SEPOLIA_CHAIN_ID, address(crossGuardCallback), CALLBACK_GAS_LIMIT);
 
-        // retryFailedCallback reverts because status is PENDING_DISPATCH (not REQUESTED)
         vm.prank(owner);
         vm.expectRevert(CrossGuardReactive.CallbackNotRequested.selector);
         unconf.retryFailedCallback(positionId, 1, bytes32("WRONG_PATH"));
 
-        // dispatchPendingCallback succeeds with 0 retryCount consumed
         vm.prank(owner);
         unconf.dispatchPendingCallback(positionId, 1);
         (,,, uint8 retries, CrossGuardReactive.DispatchStatus st) = unconf.getLatestCallback(positionId);
@@ -795,9 +703,6 @@ contract M006RecoveryTest is Test {
     }
 
     function test17_OnChainConfigDriftTargetsNewCallbackOnRetry() public {
-        // Demonstrates on-chain why M006.2 off-chain preflight MUST enforce 3-way callback equality:
-        // If initial callback failed against callbackA and owner updates destinationCallback to callbackB,
-        // retryFailedCallback dispatches the retry to callbackB.
         Vm.Log memory breachLog = _triggerOriginBreach();
         vm.prank(address(mockSystem));
         reactiveContract.react(_toLogRecord(breachLog));
@@ -819,6 +724,7 @@ contract M006RecoveryTest is Test {
             address(mockSystem),
             BASE_SEPOLIA_CHAIN_ID,
             address(riskController),
+            address(vault),
             UNICHAIN_SEPOLIA_CHAIN_ID,
             address(0),
             0
@@ -831,16 +737,13 @@ contract M006RecoveryTest is Test {
         vm.prank(owner);
         unconf.setDestinationConfig(UNICHAIN_SEPOLIA_CHAIN_ID, address(crossGuardCallback), CALLBACK_GAS_LIMIT);
 
-        // Stranger cannot dispatchPendingCallback
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
         unconf.dispatchPendingCallback(positionId, 1);
 
-        // Owner dispatches valid pending event
         vm.prank(owner);
         unconf.dispatchPendingCallback(positionId, 1);
 
-        // Emergency pause + risk resolution cannot bypass admin pause during recovery
         vm.prank(owner);
         borrowingController.emergencyPauseBorrowing(positionId);
 
@@ -865,10 +768,12 @@ contract M006RecoveryHandler is Test {
 
     address public owner;
     address public vaultAddr;
-    bytes32 public posA = keccak256("inv-position-A");
-    bytes32 public posB = keccak256("inv-position-B");
     address public userA = address(0xA11C);
     address public userB = address(0xB0B0);
+    bytes32 public constant saltA = keccak256("inv-salt-A");
+    bytes32 public constant saltB = keccak256("inv-salt-B");
+    bytes32 public posA;
+    bytes32 public posB;
 
     uint256 constant BASE_CHAIN = 84532;
     uint256 constant DEST_CHAIN = 1301;
@@ -907,18 +812,22 @@ contract M006RecoveryHandler is Test {
         crossGuardCallback = _crossGuardCallback;
         deferredCallback = _deferredCallback;
         borrowingController = _borrowingController;
+
+        posA = CrossGuardIdentity.computePositionId(BASE_CHAIN, address(riskController), vaultAddr, userA, saltA);
+        posB = CrossGuardIdentity.computePositionId(BASE_CHAIN, address(riskController), vaultAddr, userB, saltB);
     }
 
-    function _pos(uint256 idx) internal view returns (bytes32, address) {
-        if (idx % 2 == 0) return (posA, userA);
-        return (posB, userB);
+    function _pos(uint256 idx) internal view returns (bytes32, address, bytes32) {
+        if (idx % 2 == 0) return (posA, userA, saltA);
+        return (posB, userB, saltB);
     }
 
     function deliverOriginTransition(uint256 posIdx, bool breach) external {
+        vm.chainId(BASE_CHAIN);
         uint256 idx = posIdx % 2;
-        (bytes32 pos, address usr) = _pos(idx);
+        (bytes32 pos, address usr, bytes32 slt) = _pos(idx);
         uint256 otherIdx = 1 - idx;
-        (bytes32 otherPos,) = _pos(otherIdx);
+        (bytes32 otherPos,,) = _pos(otherIdx);
 
         uint256 otherOriginBefore = reactiveContract.latestOriginNonce(otherPos);
         uint256 otherDestBefore = borrowingController.lastProcessedNonce(otherPos);
@@ -942,7 +851,14 @@ contract M006RecoveryHandler is Test {
                 topic_1: uint256(pos),
                 topic_2: uint256(uint160(usr)),
                 topic_3: originNonce,
-                data: abi.encode(ltvBps, riskController.riskThresholdBps(), block.timestamp),
+                data: abi.encode(
+                    CrossGuardIdentity.IDENTITY_VERSION,
+                    vaultAddr,
+                    slt,
+                    ltvBps,
+                    riskController.riskThresholdBps(),
+                    block.timestamp
+                ),
                 block_number: block.number,
                 op_code: 0,
                 block_hash: 0,
@@ -958,7 +874,6 @@ contract M006RecoveryHandler is Test {
             recordedPayload[pos] = mockSystem.getLastRequestedCallback().payload;
             recordedPayloadNonce[pos] = originNonce;
         } else if (originNonce > 0 && posIdx % 5 == 0) {
-            // Re-submit duplicate/stale origin log directly to reactive to exercise idempotency guard
             bytes32 staleTopic =
                 isBreached ? reactiveContract.RISK_BREACH_TOPIC_0() : reactiveContract.RISK_RESOLVED_TOPIC_0();
             IReactive.LogRecord memory staleRec = IReactive.LogRecord({
@@ -968,7 +883,14 @@ contract M006RecoveryHandler is Test {
                 topic_1: uint256(pos),
                 topic_2: uint256(uint160(usr)),
                 topic_3: originNonce,
-                data: abi.encode(ltvBps, riskController.riskThresholdBps(), block.timestamp),
+                data: abi.encode(
+                    CrossGuardIdentity.IDENTITY_VERSION,
+                    vaultAddr,
+                    slt,
+                    ltvBps,
+                    riskController.riskThresholdBps(),
+                    block.timestamp
+                ),
                 block_number: block.number,
                 op_code: 0,
                 block_hash: 0,
@@ -993,12 +915,11 @@ contract M006RecoveryHandler is Test {
 
     function exerciseDeferredContract(uint256 posIdx, bool configureAndDispatch) external {
         uint256 idx = posIdx % 2;
-        (bytes32 pos,) = _pos(idx);
+        (bytes32 pos,,) = _pos(idx);
         (uint256 dNonce,,,, CrossGuardReactive.DispatchStatus dStatus) = deferredReactive.getLatestCallback(pos);
         if (dNonce == 0) return;
 
         if (dStatus == CrossGuardReactive.DispatchStatus.PENDING_DISPATCH) {
-            // Attempting retryFailedCallback while PENDING_DISPATCH must ALWAYS revert!
             vm.prank(owner);
             try deferredReactive.retryFailedCallback(pos, dNonce, bytes32("BAD_RETRY_WHILE_PENDING")) {
                 ghostConfusedPendingRetrySucceeded = true;
@@ -1017,8 +938,8 @@ contract M006RecoveryHandler is Test {
 
     function executeStoredCallback(uint256 posIdx, bool sufficientGas) external {
         uint256 idx = posIdx % 2;
-        (bytes32 pos,) = _pos(idx);
-        (bytes32 otherPos,) = _pos(1 - idx);
+        (bytes32 pos,,) = _pos(idx);
+        (bytes32 otherPos,,) = _pos(1 - idx);
 
         (uint256 nonce,, bytes memory payload,, CrossGuardReactive.DispatchStatus status) =
             reactiveContract.getLatestCallback(pos);
@@ -1038,7 +959,6 @@ contract M006RecoveryHandler is Test {
                 ghostUnexpectedSuccessCount++;
             }
         } else {
-            // Reverting callback must never advance dest nonce
             if (borrowingController.lastProcessedNonce(pos) != prevDestNonce) {
                 ghostUnexpectedSuccessCount++;
             }
@@ -1059,7 +979,7 @@ contract M006RecoveryHandler is Test {
 
     function tryRetryLatestCallback(uint256 posIdx) external {
         uint256 idx = posIdx % 2;
-        (bytes32 pos,) = _pos(idx);
+        (bytes32 pos,,) = _pos(idx);
         (uint256 nonce,,,, CrossGuardReactive.DispatchStatus status) = reactiveContract.getLatestCallback(pos);
         if (nonce == 0) return;
 
@@ -1073,7 +993,7 @@ contract M006RecoveryHandler is Test {
 
     function tryReplayOldPayload(uint256 posIdx) external {
         uint256 idx = posIdx % 2;
-        (bytes32 pos,) = _pos(idx);
+        (bytes32 pos,,) = _pos(idx);
         bytes memory oldPayload = recordedPayload[pos];
         uint256 oldNonce = recordedPayloadNonce[pos];
         if (oldPayload.length == 0) return;
@@ -1107,22 +1027,24 @@ contract M006RecoveryInvariantTest is Test {
     address vaultAddr = address(0x5555);
 
     function setUp() public {
+        vm.chainId(84532);
         vm.startPrank(owner);
         riskController = new RiskController(owner, 8000);
         riskController.setAuthorizedVault(vaultAddr, true);
 
         mockSystem = new MockOmniSystemContract();
         address predictedReactive = vm.computeCreateAddress(owner, vm.getNonce(owner));
-        reactiveContract =
-            new CrossGuardReactive(owner, address(mockSystem), 84532, address(riskController), 1301, address(0), 0);
+        reactiveContract = new CrossGuardReactive(
+            owner, address(mockSystem), 84532, address(riskController), vaultAddr, 1301, address(0), 0
+        );
         assertEq(address(reactiveContract), predictedReactive);
 
-        // Second Stage-1 unconfigured reactive instance to genuinely exercise PENDING_DISPATCH transitions
-        deferredReactive =
-            new CrossGuardReactive(owner, address(mockSystem), 84532, address(riskController), 0, address(0), 0);
+        deferredReactive = new CrossGuardReactive(
+            owner, address(mockSystem), 84532, address(riskController), vaultAddr, 0, address(0), 0
+        );
 
         callbackProxy = new MockCallbackProxy();
-        borrowingController = new BorrowingController(owner);
+        borrowingController = new BorrowingController(owner, 84532, address(riskController), vaultAddr);
         crossGuardCallback = new CrossGuardCallback(
             owner, address(callbackProxy), address(borrowingController), address(reactiveContract)
         );
@@ -1146,10 +1068,15 @@ contract M006RecoveryInvariantTest is Test {
             borrowingController
         );
 
+        vm.startPrank(vaultAddr);
+        riskController.registerPositionIdentity(handler.posA(), handler.userA(), handler.saltA());
+        riskController.registerPositionIdentity(handler.posB(), handler.userB(), handler.saltB());
+        vm.stopPrank();
+
         vm.prank(handler.userA());
-        borrowingController.registerPosition(handler.posA());
+        borrowingController.registerPosition(handler.saltA());
         vm.prank(handler.userB());
-        borrowingController.registerPosition(handler.posB());
+        borrowingController.registerPosition(handler.saltB());
 
         targetContract(address(handler));
     }
